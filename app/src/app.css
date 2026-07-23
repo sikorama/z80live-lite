@@ -1,0 +1,2 @@
+/* Styles globaux minimaux ; l'essentiel est dans App.svelte (scoped). */
+* { box-sizing: border-box; }

@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>z80live — démo : éditer · assembler · exécuter (100% navigateur)</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background:#181a1b; color:#e3e3e3; }
+  header { padding: .6rem 1rem; background:#111; border-bottom:1px solid #333; display:flex; gap:1rem; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:1rem; margin:0; font-weight:600; }
+  header .grow { flex:1; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:.75rem; padding:.75rem; height: calc(100vh - 52px); }
+  .col { display:flex; flex-direction:column; min-width:0; gap:.5rem; }
+  textarea { flex:1; width:100%; resize:none; font-family:ui-monospace,monospace; font-size:12.5px;
+             background:#0d0f10; color:#cfe3ff; border:1px solid #333; border-radius:6px; padding:8px; }
+  select, input, button { font:inherit; background:#22262a; color:#eee; border:1px solid #444; border-radius:5px; padding:.35rem .5rem; }
+  button.primary { background:#2d6; color:#052; border-color:#2d6; font-weight:700; cursor:pointer; }
+  button.primary:disabled { opacity:.5; cursor:wait; }
+  .controls { display:flex; gap:.4rem; align-items:center; flex-wrap:wrap; }
+  label { font-size:12px; color:#9aa; }
+  iframe { flex:1; width:100%; border:1px solid #333; border-radius:6px; background:#000; }
+  #meta { background:#0d0f10; border:1px solid #333; border-radius:6px; padding:6px 8px; font-size:12px; display:none; }
+  #meta.show { display:block; }
+  #meta .t { font-weight:700; color:#cfe3ff; }
+  #meta .by { color:#7cf; }
+  #meta .d { color:#bcd; margin-top:2px; }
+  #meta .tags { color:#89a; margin-top:2px; font-size:11px; }
+  pre#log { height:130px; overflow:auto; margin:0; background:#0d0f10; border:1px solid #333; border-radius:6px; padding:6px; font-size:11.5px; white-space:pre-wrap; }
+  .ok{color:#7f7}.err{color:#f88}.muted{color:#89a}
+  a#dl{ color:#7cf; }
+</style>
+</head>
+<body>
+<header>
+  <h1>z80live · démo serverless</h1>
+  <span class="muted">édition → assemblage WASM → émulateur, sans serveur de build</span>
+  <span class="grow"></span>
+  <label>Source :</label>
+  <select id="picker" style="max-width:260px"><option value="">— charger depuis la base —</option></select>
+</header>
+<main>
+  <section class="col">
+    <div class="controls">
+      <label>Assembleur</label>
+      <select id="asm"><option value="">auto (défaut rasm)</option><option>rasm</option><option>sjasmplus</option></select>
+      <label>Mode</label>
+      <select id="mode"><option>sna</option><option>sna_cpc6128</option><option>sna_cpc464</option></select>
+      <label>Entrée</label>
+      <input id="entry" size="7" placeholder="#8000" value="#8000">
+      <button id="run" class="primary">▶ Assembler &amp; exécuter</button>
+      <a id="dl" style="display:none">⬇ .sna</a>
+    </div>
+    <div id="meta"></div>
+    <textarea id="src" spellcheck="false">; Petit exemple CPC — bordure qui change de couleur
+  org #8000
+start:
+  ld b,#7f          ; port Gate Array
+.loop:
+  ld a,%01000000    ; sélection couleur bordure
+  out (c),a
+  inc a
+  and %00011111
+  or  %01000000
+  ld  d,a
+  ld  hl,#3000      ; petite tempo
+.wait:
+  dec hl
+  ld  a,h
+  or  l
+  jr  nz,.wait
+  ld  a,d
+  out (c),a
+  jr  .loop
+</textarea>
+    <pre id="log">Prêt.</pre>
+  </section>
+  <section class="col">
+    <iframe id="emu" title="émulateur" allow="autoplay; gamepad"></iframe>
+  </section>
+</main>
+
+<script type="module">
+import { assemble, parseDirectives, upsertDirectives } from '/wasm/assemble.mjs';
+import { openStore } from '/client/store.mjs';
+
+const $ = (id) => document.getElementById(id);
+const log = $('log');
+const say = (m, cls='') => { log.innerHTML += `\n<span class="${cls}">${m}</span>`; log.scrollTop = 1e9; };
+
+// Factories WASM : on réinstancie un Module neuf à chaque assemblage (rasm/sjasmplus appellent exit()).
+const factories = {
+  createRasm: async (o) => (await import('/wasm/rasm.mjs')).default(o),
+  createSjasm: async (o) => (await import('/wasm/sjasmplus.mjs')).default(o),
+};
+
+// --- Mode lite : charge sql.js + la base SQLite gzippée embarquée ---
+async function loadLocalDb() {
+  await new Promise((ok, ko) => {           // sql.js s'expose en global via un <script> classique
+    const s = document.createElement('script');
+    s.src = '/vendor/sqljs/sql-wasm.js'; s.onload = ok; s.onerror = ko;
+    document.head.appendChild(s);
+  });
+  const SQL = await window.initSqlJs({ locateFile: (f) => '/vendor/sqljs/' + f });
+  const gz = await (await fetch('/db/z80live.sqlite.gz')).arrayBuffer();
+  const buf = await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer();
+  return { db: new SQL.Database(new Uint8Array(buf)), hasFts: false }; // sql.js CDN sans fts5 -> recherche LIKE
+}
+
+// --- Service Worker : sert le binaire assemblé à /build/<name>.<ext> (émulateur sans serveur) ---
+let swReg = null;
+async function initSW() {
+  if (!('serviceWorker' in navigator)) return null;
+  try { swReg = await navigator.serviceWorker.register('/emu-sw.js'); await navigator.serviceWorker.ready; return swReg; }
+  catch { return null; }
+}
+function feedEmulator(bytes, ext) {
+  return new Promise((resolve) => {
+    const name = 'b' + Date.now() + '.' + ext;
+    const ctrl = navigator.serviceWorker.controller;
+    if (!ctrl) { resolve(null); return; }
+    const onMsg = (e) => {
+      if (e.data?.type === 'build-ready' && e.data.name === name) {
+        navigator.serviceWorker.removeEventListener('message', onMsg);
+        resolve('/build/' + name);
+      }
+    };
+    navigator.serviceWorker.addEventListener('message', onMsg);
+    ctrl.postMessage({ type: 'put-build', name, bytes });
+  });
+}
+
+let store = null, lastBlobUrl = null;
+
+async function boot() {
+  await initSW();
+  store = await openStore({ base: '', loadLocalDb });
+  say(`Base : mode ${store.mode} — ${await store.count()} sources.`, 'muted');
+  const items = (await store.list({ buildmode: 'sna', limit: 500 })).sort((a,b)=>a.name.localeCompare(b.name));
+  for (const it of items) {
+    const o = document.createElement('option');
+    o.value = it.id;
+    o.textContent = (it.build_status==='ok'?'✅ ':it.build_status==='external-dep'?'📦 ':'· ') + it.name;
+    $('picker').appendChild(o);
+  }
+}
+
+const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c]));
+const fmtDate = (ms) => ms ? new Date(Number(ms)).toISOString().slice(0, 10) : '';
+
+function showMeta(s) {
+  const tags = [];
+  if (s.category) tags.push('cat: ' + esc(s.category));
+  if (s.group_name) tags.push('groupe: ' + esc(s.group_name));
+  if (s.updated_at) tags.push('maj: ' + fmtDate(s.updated_at));
+  if (s.assembler) tags.push('asm: ' + esc(s.assembler));
+  const by = s.author ? `<span class="by">par ${esc(s.author)}</span>` : '<span class="by">auteur inconnu</span>';
+  const owner = s.owner && s.owner !== s.author ? ` <span class="tags">(owner: ${esc(s.owner)})</span>` : '';
+  $('meta').innerHTML =
+    `<span class="t">${esc(s.name)}</span> ${by}${owner}` +
+    (s.description ? `<div class="d">${esc(s.description)}</div>` : '') +
+    (tags.length ? `<div class="tags">${tags.join(' · ')}</div>` : '');
+  $('meta').classList.add('show');
+}
+
+$('picker').onchange = async (e) => {
+  const id = e.target.value; if (!id || !store) return;
+  const s = await store.get(id);
+  $('src').value = s.code || '';
+  const d = parseDirectives(s.code || ''); // directives ;z80: prioritaires, sinon champs stockés
+  $('asm').value = d.assembler || s.assembler || '';
+  const bm = d.buildmode || s.buildmode || 'sna';
+  $('mode').value = bm.startsWith('sna') ? (bm === 'sna' ? 'sna' : bm) : 'sna';
+  $('entry').value = d.entryPoint || s.entry_point || '';
+  showMeta(s);
+  say(`Chargé : ${s.name} (assembleur=${$('asm').value||'défaut'}, statut=${s.build_status||'?'})`, 'muted');
+};
+
+$('run').onclick = async () => {
+  const btn = $('run'); btn.disabled = true;
+  log.textContent = ''; say('Assemblage en cours…');
+  const cfg = { assembler: $('asm').value || undefined, buildmode: $('mode').value, entryPoint: $('entry').value || undefined };
+  $('src').value = upsertDirectives($('src').value, cfg); // l'éditeur maintient la ligne ;z80:
+  const opts = { code: $('src').value, ...cfg };
+  try {
+    const t0 = performance.now();
+    const res = await assemble(opts, factories);
+    const dt = (performance.now() - t0).toFixed(0);
+    for (const l of res.log.slice(-12)) say('  ' + l.replace(/\x1b\[[0-9;]*m/g,''), 'muted');
+    if (res.error) say('  ⚠ ' + res.error, 'err');
+    if (!res.ok || !res.output) { say(`❌ Échec (${res.assembler}) — ${dt} ms`, 'err'); btn.disabled=false; return; }
+    say(`✔ ${res.assembler} → .${res.ext} ${res.output.length} o en ${dt} ms`, 'ok');
+
+    if (lastBlobUrl) URL.revokeObjectURL(lastBlobUrl);
+    lastBlobUrl = URL.createObjectURL(new Blob([res.output], { type: 'application/octet-stream' }));
+    const dl = $('dl'); dl.href = lastBlobUrl; dl.download = 'build.' + res.ext; dl.style.display = 'inline';
+
+    // Émulateur via Service Worker (URL avec extension, sans serveur).
+    const url = await feedEmulator(res.output, res.ext);
+    if (url) { $('emu').src = `/emu/tiny8bit/cpc.html?file=${encodeURIComponent(url)}`; say(`→ émulateur (${url})`, 'ok'); }
+    else say('→ Service Worker indisponible : téléchargez le .sna et glissez-le sur l\'émulateur.', 'err');
+  } catch (e) {
+    say('Erreur: ' + (e && e.message || e), 'err');
+  }
+  btn.disabled = false;
+};
+
+boot();
+</script>
+</body>
+</html>

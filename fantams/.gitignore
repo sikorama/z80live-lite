@@ -1,0 +1,19 @@
+# Binaires de test / CLI compilés
+z80_test
+pp_test
+parser_test
+asm_test
+sna_test
+ppdump
+rasmlite
+
+# Build CMake
+build/
+
+# Sorties générées par les exemples
+examples/*.bin
+examples/*.sna
+
+# Artefacts WASM (générés localement, publiés dans ../wasm/)
+*.o
+*.wasm.js
