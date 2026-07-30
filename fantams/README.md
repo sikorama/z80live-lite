@@ -1,10 +1,7 @@
-# rasm-lite — assembleur Z80 léger (source WASM)
+# fantams — assembleur Z80 léger (source WASM)
 
-Version allégée de rasm, autonome et portable, **source-of-truth C++** compilée
-vers WebAssembly pour tourner côté client (comme `wasm/rasm.*` et `wasm/sjasmplus.*`).
-
-Périmètre : un **préprocesseur complet** (macros, `REPEAT`/`WHILE`, `IF`, `STRUCT`,
-scope auto-local, includes) + un **assembleur 2 passes** + export **`.sna`**.
+Initiallement un fork simplifié de rasm, compilé vers WebAssembly pour tourner côté client (comme `wasm/rasm.*` et `wasm/sjasmplus.*`).
+A évolué vers un périmètre éloigné, puisque l'assembleur est en 2 passes, et focalise sur l'export SNA. Il est doté d'un **préprocesseur complet** (macros, `REPEAT`/`WHILE`, `IF`, `STRUCT`, scope auto-local, includes)
 
 ## Structure
 
@@ -34,10 +31,9 @@ Passe par l'image `emscripten/emsdk` (podman/docker) — pas besoin d'emcc local
 node test-wasm.mjs       # test d'intégration via wasm/assemble.mjs
 ```
 
-Flags notables : `-fexceptions` (le code s'appuie sur `try/catch` dans `expr::eval` ;
-sans lui, tout `throw` devient `abort()` en WASM), `-sSTACK_SIZE=8388608` (parseur
-récursif), format ES6 `MODULARIZE` (`export default createRasmLite`) identique à
-`wasm/rasm.mjs`.
+Flags notables : 
+ * `-fexceptions` - sans lui, tout `throw` devient `abort()` en WASM,
+ * `-sSTACK_SIZE=8388608` (parseur récursif), 
 
 ## Intégration app
 
