@@ -1,4 +1,4 @@
-// z80.cpp - Encodeur Z80 data-driven pour rasm-lite (voir z80.h)
+// z80.cpp - Encodeur Z80 data-driven pour fantams (voir z80.h)
 //
 // Principe : les opérandes sont d'abord *normalisés* (IX/IY -> préfixe DD/FD +
 // slot HL ; (IX+d) -> préfixe + (HL) + déplacement). Après normalisation, les

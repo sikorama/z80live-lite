@@ -3,6 +3,11 @@ import { EditorView, basicSetup } from 'codemirror';
 import { EditorState } from '@codemirror/state';
 import { StreamLanguage } from '@codemirror/language';
 import { z80 } from '@codemirror/legacy-modes/mode/z80';
+import { keymap } from '@codemirror/view';
+import { insertTab, indentLess } from '@codemirror/commands';
+
+// basicSetup ne lie pas Tab : on l'ajoute pour insérer une tabulation (au lieu de sortir du focus).
+const tabKeymap = keymap.of([{ key: 'Tab', run: insertTab }, { key: 'Shift-Tab', run: indentLess }]);
 
 const dark = EditorView.theme({
   '&': { color: '#cfe3ff', backgroundColor: '#0d0f10', height: '100%' },
@@ -20,6 +25,7 @@ export function makeEditor(parent, doc, onChange) {
     doc: doc || '',
     extensions: [
       basicSetup,
+      tabKeymap,
       StreamLanguage.define(z80),
       dark,
       EditorView.updateListener.of((u) => { if (u.docChanged && onChange) onChange(view.state.doc.toString()); }),

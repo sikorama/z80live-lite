@@ -28,8 +28,8 @@ add_executable(ppdump pp_main.cpp)
 target_link_libraries(ppdump PRIVATE pp)
 
 # CLI bout-en-bout : .asm -> .bin
-add_executable(rasmlite asm_main.cpp)
-target_link_libraries(rasmlite PRIVATE asmlib)
+add_executable(fantams asm_main.cpp)
+target_link_libraries(fantams PRIVATE asmlib)
 
 # Tests
 add_executable(z80_test z80_test.cpp)

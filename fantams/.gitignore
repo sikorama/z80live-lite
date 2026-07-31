@@ -5,7 +5,7 @@ parser_test
 asm_test
 sna_test
 ppdump
-rasmlite
+fantams
 
 # Build CMake
 build/

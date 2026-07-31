@@ -1,4 +1,4 @@
-// z80_test.cpp - Tests d'encodage de l'encodeur Z80 (rasm-lite)
+// z80_test.cpp - Tests d'encodage de l'encodeur Z80 (fantams)
 //
 // Contexte factice : capture les octets, évalue une expression = simple nombre
 // (décimal, 0x.. ou $..), fournit un PC fixe pour l'adressage relatif.

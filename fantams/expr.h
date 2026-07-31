@@ -1,4 +1,4 @@
-// expr.h - Évaluateur d'expressions entières réutilisable (rasm-lite)
+// expr.h - Évaluateur d'expressions entières réutilisable (fantams)
 //
 // Autonome, sans état global. Le resolver de symboles est injecté : le
 // préprocesseur l'utilise avec les seules variables PP ; l'assembleur le

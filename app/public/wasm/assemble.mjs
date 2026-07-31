@@ -100,6 +100,14 @@ export function wrapSjasm(code, opts = {}, outPath = OUT + '.sna') {
 // Nettoie les accents comme le faisait le serveur (rasm -utf8 gère l'UTF-8, mais on reste prudent).
 const stripAccents = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '');
 
+// Nombre de lignes injectées par le wrapper avant le code utilisateur (en-tête invisible dans
+// l'éditeur). Sert à recaler les numéros de ligne rapportés par l'assembleur sur la source affichée.
+function headerLineCount(wrapped, code) {
+  const idx = wrapped.indexOf(code);
+  if (idx < 0) return 0;
+  return wrapped.slice(0, idx).split('\n').length - 1;
+}
+
 // Récupère le binaire produit : chemin attendu, sinon 1er fichier binaire présent dans MEMFS /.
 function readOutput(FS, expected) {
   try { return { data: FS.readFile(expected), ext: expected.split('.').pop() }; } catch {}
@@ -148,19 +156,19 @@ export async function assemble(source, factories) {
     const r = await runModule(factories.createSjasm, ['--nologo', '/in.asm'], wrapped, OUT + '.sna');
     const errs = /Errors:\s*(\d+)/.exec(r.log.join('\n'));
     const ok = !!r.data && (!errs || errs[1] === '0');
-    return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped };
+    return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
   }
 
   if (assembler === 'fantams') {
     const wrapped = wrapFantams(code, opts);
     const r = await runModule(factories.createFantams, ['/in.asm', '-o', OUT + '.sna'], wrapped, OUT + '.sna');
     const ok = r.exitCode === 0 && !!r.data;
-    return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped };
+    return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
   }
 
   // rasm (+ uz80 traité comme rasm en attendant)
   const wrapped = wrapRasm(code, opts);
   const r = await runModule(factories.createRasm, ['/in.asm', '-oa', '-eo', '-utf8', '-o', OUT], wrapped, OUT + '.sna');
   const ok = r.exitCode === 0 && !!r.data;
-  return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped };
+  return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
 }

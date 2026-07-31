@@ -1,4 +1,4 @@
-; Démo rasm-lite : macros, REPEAT, IF, scope auto-local + export SNA
+; Démo fantams : macros, REPEAT, IF, scope auto-local + export SNA
 LET DEBUG = 1
 LET COUNT = 4
         org 0x8000

@@ -1,6 +1,6 @@
 // asm_main.cpp - CLI bout-en-bout : source .asm -> préprocesseur -> assembleur -> .bin
 //
-//   rasmlite fichier.asm [-o sortie.bin] [-s]
+//   fantams fichier.asm [-o sortie.bin] [-s]
 //     -o : fichier binaire de sortie (défaut : <source>.bin)
 //     -s : affiche la table des symboles
 #include "asm.h"
@@ -30,7 +30,7 @@ int main(int argc, char **argv) {
         else if (a == "-s") showSyms = true;
         else path = a;
     }
-    if (path.empty()) { fprintf(stderr, "usage: rasmlite fichier.asm [-o sortie.bin] [-s]\n"); return 2; }
+    if (path.empty()) { fprintf(stderr, "usage: fantams fichier.asm [-o sortie.bin] [-s]\n"); return 2; }
     if (outPath.empty()) {
         size_t dot = path.find_last_of('.');
         outPath = (dot == std::string::npos ? path : path.substr(0, dot)) + ".bin";

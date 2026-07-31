@@ -1,4 +1,4 @@
-// asm.h - Assembleur 2 passes (rasm-lite)
+// asm.h - Assembleur 2 passes (fantams)
 //
 // Entrée : lignes de source DÉJÀ préprocessées (plates : ni macros ni includes).
 // Passe 1 : calcule les adresses (ORG) et collecte tous les symboles.

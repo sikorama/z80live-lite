@@ -1,4 +1,4 @@
-// z80.h - Encodeur Z80 data-driven pour rasm-lite
+// z80.h - Encodeur Z80 data-driven pour fantams
 //
 // Ce module est autonome : il ne dépend d'AUCUN autre morceau de rasm.
 // Il encode une instruction Z80 (mnémonique + opérandes) en octets, via une

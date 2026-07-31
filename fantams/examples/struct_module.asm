@@ -1,4 +1,4 @@
-; Démo STRUCT + MODULE (rasm-lite)
+; Démo STRUCT + MODULE (fantams)
         org 0x8000
         run main
 

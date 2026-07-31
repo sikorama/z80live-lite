@@ -1,4 +1,4 @@
-// pp.cpp - Préprocesseur rasm-lite (voir pp.h)
+// pp.cpp - Préprocesseur fantams (voir pp.h)
 #include "pp.h"
 #include "expr.h"
 

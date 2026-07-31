@@ -1,4 +1,4 @@
-# Makefile rasm-lite — build simple sans dépendance (cmake optionnel, cf. CMakeLists.txt)
+# Makefile fantams — build simple sans dépendance (cmake optionnel, cf. CMakeLists.txt)
 CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
 
@@ -6,7 +6,7 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
 
 CORE = z80.cpp expr.cpp parser.cpp pp.cpp asm.cpp sna.cpp
 
-all: z80_test pp_test parser_test asm_test sna_test ppdump rasmlite
+all: z80_test pp_test parser_test asm_test sna_test ppdump fantams
 
 z80_test: z80.cpp z80_test.cpp z80.h
 	$(CXX) $(CXXFLAGS) z80.cpp z80_test.cpp -o $@
@@ -26,7 +26,7 @@ sna_test: sna.cpp sna_test.cpp sna.h
 ppdump: pp.cpp expr.cpp pp_main.cpp pp.h expr.h
 	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp pp_main.cpp -o $@
 
-rasmlite: $(CORE) asm_main.cpp asm.h pp.h
+fantams: $(CORE) asm_main.cpp asm.h pp.h
 	$(CXX) $(CXXFLAGS) $(CORE) asm_main.cpp -o $@
 
 test: z80_test pp_test parser_test asm_test sna_test
@@ -37,5 +37,5 @@ test: z80_test pp_test parser_test asm_test sna_test
 	./sna_test
 
 clean:
-	rm -f z80_test pp_test parser_test asm_test sna_test ppdump rasmlite
+	rm -f z80_test pp_test parser_test asm_test sna_test ppdump fantams
 	rm -rf build

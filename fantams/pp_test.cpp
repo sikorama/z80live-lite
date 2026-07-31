@@ -1,4 +1,4 @@
-// pp_test.cpp - Tests du préprocesseur rasm-lite
+// pp_test.cpp - Tests du préprocesseur fantams
 #include "pp.h"
 
 #include <cstdio>

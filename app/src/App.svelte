@@ -3,6 +3,7 @@
   import { openStore } from '../../client/store.mjs';
   import { assemble, parseDirectives, upsertDirectives } from '../../wasm/assemble.mjs';
   import { makeEditor, makeViewer } from './lib/editor.js';
+  import { ping as pingAmspirit, injectSna } from './lib/amspirit.js';
 
   let store = $state(null);
   let mode = $state('…');
@@ -18,6 +19,7 @@
   let dlUrl = $state('');
   let dlExt = $state('sna');
   let editor, editorEl;
+  let showList = $state(true);         // panneau latéral (liste des sources) affiché/masqué
   let listEl;                         // <aside class="list"> — seul conteneur défilant des vignettes
   let savedListScroll = 0;            // position de défilement à préserver pendant un lancement
   // Restaure la position des vignettes : le chargement de l'émulateur (focus du canvas dans
@@ -69,12 +71,49 @@
     }
   }
 
+  // Réglages globaux de l'app : émulateur wasm intégré (défaut) vs AMSpiriT externe piloté
+  // par son API HTTP locale. Quand AMSpiriT est joignable, le panel wasm se masque et
+  // l'exécution passe par injection RAM + PC via l'API au lieu du service worker.
+  const SETTINGS_KEY = 'z80live.settings';
+  let showAppSettings = $state(false);
+  let amspiritEnabled = $state(false);
+  let amspiritUrl = $state('http://127.0.0.1:8765');
+  let amspiritConnected = $state(false);
+  let amspiritTimer;
+
+  function loadSettings() {
+    try {
+      const s = JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}');
+      amspiritEnabled = !!s.amspiritEnabled;
+      amspiritUrl = s.amspiritUrl || amspiritUrl;
+    } catch {}
+  }
+  function saveSettings() {
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify({ amspiritEnabled, amspiritUrl })); } catch {}
+  }
+  // Sonde périodique de connectivité (uniquement si AMSpiriT est activé dans les réglages).
+  function syncAmspiritPolling() {
+    clearInterval(amspiritTimer); amspiritTimer = null;
+    if (!amspiritEnabled) { amspiritConnected = false; return; }
+    const check = async () => { amspiritConnected = await pingAmspirit(amspiritUrl); };
+    check();
+    amspiritTimer = setInterval(check, 3000);
+  }
+  const openAppSettings = () => { showAppSettings = true; };
+  function closeAppSettings() { showAppSettings = false; saveSettings(); syncAmspiritPolling(); }
+
   // Réassemblage automatique à chaque modification (debounce 500 ms).
   let auto = $state(false);
+  let dirty = $state(false);          // modifs non sauvegardées depuis le dernier load/save
   let autoTimer, suppressEdit = false;
   // Écriture programmatique de l'éditeur qui ne doit PAS relancer l'auto-assemblage (sinon boucle).
   const setCode = (v) => { suppressEdit = true; editor.value = v; suppressEdit = false; };
-  function onEdit() { if (suppressEdit || !auto) return; clearTimeout(autoTimer); autoTimer = setTimeout(() => { if (!busy) run(); }, 500); }
+  function onEdit() {
+    if (suppressEdit) return;
+    dirty = true;
+    if (!auto) return;
+    clearTimeout(autoTimer); autoTimer = setTimeout(() => { if (!busy) run(); }, 500);
+  }
   function onAutoToggle() { if (auto && !busy) run(); }
 
   // Réinstancie un Module WASM neuf à chaque assemblage (rasm/sjasmplus appellent exit()).
@@ -145,6 +184,7 @@
     const s = await store.get(id);
     selected = s;
     setCode(s.code || '');
+    dirty = false;
     const d = parseDirectives(s.code || '');
     asm = d.assembler || s.assembler || '';
     const bm = d.buildmode || s.buildmode || 'sna';
@@ -156,6 +196,7 @@
   function newSource() {
     selected = { name: 'nouveau', author: null, description: null };
     setCode('; z80: assembler=rasm buildmode=sna entry=#8000\n  org #8000\nstart:\n  ret\n');
+    dirty = false;
     asm = 'rasm'; buildmode = 'sna'; entry = '#8000';
   }
 
@@ -180,11 +221,20 @@
       if (dlUrl) URL.revokeObjectURL(dlUrl);
       dlExt = res.ext || 'sna';
       dlUrl = URL.createObjectURL(new Blob([res.output], { type: 'application/octet-stream' }));
-      console.log('🔧 [diag] avant feedEmulator');
-      const url = await feedEmulator(res.output, res.ext);
-      console.log('🔧 [diag] après feedEmulator, url =', url);
-      if (url) { emuUrl = `/emu/tiny8bit/cpc.html?file=${encodeURIComponent(url)}`; console.log('🔧 [diag] emuUrl posé =', emuUrl); }
-      else log('Service Worker indisponible — utilisez le téléchargement.', 'err');
+      if (amspiritEnabled && amspiritConnected && res.ext === 'sna') {
+        try {
+          const name = (selected?.name || 'z80next').replace(/[^\w.-]+/g, '_') + '.sna';
+          await injectSna(amspiritUrl, res.output, { name, onLog: (m) => log('AMSpiriT: ' + m, 'muted') });
+          log('✔ injecté dans AMSpiriT', 'ok');
+        } catch (e) {
+          amspiritConnected = false; // la sonde périodique retentera la connexion
+          log('⚠ injection AMSpiriT échouée : ' + (e?.message || e), 'err');
+        }
+      } else {
+        const url = await feedEmulator(res.output, res.ext);
+        if (url) emuUrl = `/emu/tiny8bit/cpc.html?file=${encodeURIComponent(url)}`;
+        else log('Service Worker indisponible — utilisez le téléchargement.', 'err');
+      }
     } catch (e) { log('Erreur: ' + (e?.message || e), 'err'); }
     busy = false;
     await tick(); restoreListScroll(); // rétablit la position des vignettes après le rendu du panneau/iframe
@@ -194,11 +244,11 @@
     const data = { name: selected?.name || 'untitled', code: editor.value, assembler: asm || null,
       buildmode, entry_point: entry || null, author: selected?.author || null, description: selected?.description || null };
     const saved = selected?.id ? await store.update(selected.id, data) : await store.create(data);
-    selected = saved; await refreshList(); log('💾 sauvegardé : ' + saved.name, 'ok');
+    selected = saved; dirty = false; await refreshList(); log('💾 sauvegardé : ' + saved.name, 'ok');
   }
   async function fork() {
     if (!selected?.id) return;
-    const f = await store.fork(selected.id, {}); selected = f; await refreshList(); log('⑂ fork : ' + f.name, 'ok');
+    const f = await store.fork(selected.id, {}); selected = f; dirty = false; await refreshList(); log('⑂ fork : ' + f.name, 'ok');
   }
 
   // Met à jour l'indicateur d'assemblage (✅/❌) après un build, sans attendre un re-classify.
@@ -232,18 +282,31 @@
     // --- fin diagnostic ---
     editor = makeEditor(editorEl, '', onEdit);
     await initSW();
+    loadSettings();
+    syncAmspiritPolling();
     store = await openStore({ base: '', loadLocalDb });
     mode = store.mode; count = await store.count();
     await refreshList();
     log(`Base : mode ${mode} — ${count} sources.`, 'muted');
-    return () => editor?.destroy();
+    return () => { editor?.destroy(); clearInterval(amspiritTimer); };
   });
 
   const badge = (s) => s.build_status === 'ok' ? '✅' : s.build_status === 'external-dep' ? '📦' : '·';
   const fmtDate = (ms) => ms ? new Date(Number(ms)).toISOString().slice(0, 10) : '';
 </script>
 
-<svelte:window onkeydown={(e) => { if (e.key === 'Escape') { if (showPre) closePre(); else if (showSettings) applySettings(); } }} />
+<svelte:window onkeydown={(e) => {
+  if (e.key === 'Escape') { if (showPre) closePre(); else if (showSettings) applySettings(); return; }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'r' || e.key === 'R')) {
+    e.preventDefault(); // pas de rechargement de page : on réassemble à la place
+    if (!busy) run();
+    return;
+  }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
+    e.preventDefault(); // pas d'enregistrement de la page : on sauvegarde la source à la place
+    if (canWrite && !busy) save();
+  }
+}} />
 
 <header>
   <strong>z80live</strong>
@@ -260,10 +323,19 @@
     </select>
   </label>
   <span class="grow"></span>
+  {#if amspiritEnabled}
+    <span class="amsp" class:on={amspiritConnected} title={amspiritConnected ? 'AMSpiriT connecté : ' + amspiritUrl : 'AMSpiriT activé mais non joignable — repli sur le wasm intégré'}>
+      ● AMSpiriT
+    </span>
+  {/if}
+  <button class="ico" onclick={openAppSettings} title="Réglages de l'application">⚙️</button>
   {#if canWrite}<button onclick={newSource}>+ Nouveau</button>{/if}
 </header>
 
-<main>
+<main class:no-list={!showList} class:no-emu={amspiritEnabled && amspiritConnected}>
+  <button class="listtoggle" onclick={() => showList = !showList}
+    title={showList ? 'Masquer la liste des sources' : 'Afficher la liste des sources'}>{showList ? '⟨' : '⟩'}</button>
+  {#if showList}
   <aside class="list" bind:this={listEl}>
     {#each groups as g (g.key)}
       {#if g.key !== null}
@@ -286,6 +358,7 @@
       <div class="empty">Aucune source.</div>
     {/each}
   </aside>
+  {/if}
 
   <section class="mid">
     <div class="controls">
@@ -296,7 +369,7 @@
       </label>
       <span class="sep"></span>
       {#if canWrite}
-        <button class="ico" onclick={save} title="Sauvegarder">💾</button>
+        <button class="ico" class:dirty onclick={save} title={dirty ? 'Sauvegarder (modifications non enregistrées)' : 'Sauvegarder'}>💾</button>
         {#if selected?.id}<button class="ico" onclick={fork} title="Forker">⑂</button>{/if}
       {/if}
       {#if preText}<button class="ico" onclick={openPre} title="Code après préprocesseur">⧉</button>{/if}
@@ -325,10 +398,12 @@
     <pre class="log">{#each logLines as l}<span class={l.cls} class:goto={l.line != null} onclick={() => l.line != null && editor.gotoLine(l.line)}>{l.m}</span>{'\n'}{/each}</pre>
   </section>
 
+  {#if !(amspiritEnabled && amspiritConnected)}
   <section class="emu">
     {#if emuUrl}<iframe title="émulateur" src={emuUrl} allow="autoplay; gamepad" onload={restoreListScroll}></iframe>
     {:else}<div class="ph">L'émulateur s'affichera ici après l'assemblage.</div>{/if}
   </section>
+  {/if}
 </main>
 
 {#if showSettings && selected}
@@ -354,6 +429,28 @@
         </select>
       </label>
       {#if !canWrite}<div class="note wide">Mode lecture seule : l'assembleur / type / entrée s'appliquent à cette session ; le nom, l'auteur, la description et le genre ne sont pas sauvegardés.</div>{/if}
+    </div>
+  </div>
+</div>
+{/if}
+
+{#if showAppSettings}
+<div class="modal" onclick={closeAppSettings} role="presentation">
+  <div class="dialog small" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dhead"><span>Réglages</span><span class="grow"></span><button onclick={closeAppSettings}>OK ✕</button></div>
+    <div class="form">
+      <label class="wide chk">
+        <input type="checkbox" bind:checked={amspiritEnabled} onchange={syncAmspiritPolling} />
+        Piloter AMSpiriT (émulateur externe) au lieu du wasm intégré
+      </label>
+      <label class="wide">URL du serveur AMSpiriT
+        <input bind:value={amspiritUrl} placeholder="http://127.0.0.1:8765" disabled={!amspiritEnabled} onchange={syncAmspiritPolling} />
+      </label>
+      <div class="wide note">
+        {#if !amspiritEnabled}Émulateur wasm intégré (défaut).
+        {:else if amspiritConnected}✅ connecté — le panel wasm est masqué, l'exécution passe par injection RAM + PC via l'API AMSpiriT.
+        {:else}⏳ non joignable pour l'instant — repli sur l'émulateur wasm intégré tant que la connexion n'est pas établie.{/if}
+      </div>
     </div>
   </div>
 </div>
@@ -385,9 +482,17 @@
   button, select, input, a.dl { font: inherit; background: #22262a; color: #eee; border: 1px solid #444; border-radius: 5px; padding: .3rem .5rem; cursor: pointer; text-decoration: none; }
   button.primary { background: #2d6; color: #052; border-color: #2d6; font-weight: 700; }
   button:disabled { opacity: .5; cursor: wait; }
-  main { display: grid; grid-template-columns: 240px 1fr 1fr; gap: .5rem; padding: .5rem; height: calc(100vh - 49px); box-sizing: border-box; overflow: hidden; }
+  main { position: relative; display: grid; grid-template-columns: 240px 1fr 1fr; gap: .5rem; padding: .5rem; height: calc(100vh - 49px); box-sizing: border-box; overflow: hidden; }
+  main.no-list { grid-template-columns: 1fr 1fr; }
+  main.no-emu { grid-template-columns: 240px 1fr; }
+  main.no-list.no-emu { grid-template-columns: 1fr; }
+  .amsp { font-size: 11px; padding: .1rem .5rem; border: 1px solid #833; color: #e88; border-radius: 4px; }
+  .amsp.on { border-color: #375; color: #7d9; }
   /* Les cellules doivent pouvoir rétrécir sous leur contenu (sinon débordement -> scroll de page). */
   .list, .mid, .emu { min-width: 0; min-height: 0; }
+  .listtoggle { position: absolute; z-index: 5; top: .5rem; left: calc(.5rem + 240px); transform: translateX(-50%);
+    width: 26px; height: 34px; padding: 0; font-size: 15px; line-height: 1; color: #9aa; }
+  main.no-list .listtoggle { left: .5rem; transform: none; }
   .list { overflow: auto; border: 1px solid #333; border-radius: 6px; background: #0d0f10; }
   .ghead { position: sticky; top: 0; z-index: 1; display: flex; gap: .35rem; align-items: center; width: 100%; text-align: left; padding: .3rem .5rem; background: #171a1d; border: none; border-bottom: 1px solid #2a2f34; border-radius: 0; color: #9cf; font-weight: 600; }
   .ghead .caret { width: .8em; color: #678; }
@@ -409,11 +514,13 @@
   .controls label { font-size: 12px; color: #9aa; display: flex; gap: .3rem; align-items: center; }
   .ico { padding: .3rem .5rem; font-size: 14px; line-height: 1; }
   .ico.primary { background: #2d6; color: #052; border-color: #2d6; }
+  .ico.dirty { background: #c33; color: #fff; border-color: #c33; }
   .auto { font-size: 12px; color: #9aa; }
   .sep { width: 1px; align-self: stretch; background: #333; margin: 0 .2rem; }
   .form { padding: .8rem; display: grid; grid-template-columns: 1fr 1fr; gap: .6rem .8rem; overflow: auto; }
   .form label { display: flex; flex-direction: column; gap: .2rem; font-size: 12px; color: #9aa; }
   .form label.wide, .form .note.wide { grid-column: 1 / -1; }
+  .form label.chk { flex-direction: row; align-items: center; gap: .4rem; }
   .form input, .form select { font: inherit; background: #22262a; color: #eee; border: 1px solid #444; border-radius: 5px; padding: .35rem .5rem; }
   .form .note { font-size: 11px; color: #a76; }
   .meta { background: #0d0f10; border: 1px solid #333; border-radius: 6px; padding: .4rem .6rem; font-size: 12px; }

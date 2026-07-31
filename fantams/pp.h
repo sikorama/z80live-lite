@@ -1,4 +1,4 @@
-// pp.h - Préprocesseur rasm-lite (texte -> texte)
+// pp.h - Préprocesseur fantams (texte -> texte)
 //
 // Étape SÉPARÉE de l'assembleur : expanse includes, macros, REPEAT/WHILE et
 // résout le scope par renommage. Produit un texte plat, ré-assemblable, et
