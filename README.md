@@ -1,117 +1,123 @@
-# z80next — architecture serverless de z80live
+# z80next — serverless architecture for z80live
 
-Refonte de z80live vers une architecture simple et portable :
+Rework of z80live into a simple, portable architecture:
 
-- **Compilation côté client** : les assembleurs (rasm, sjasmplus) tournent en **WebAssembly** dans le navigateur. Plus de serveur de build (`z80live_node` supprimé).
-- **Émulation côté client** : tiny8bit / RVMPlayer / crocods en WASM, alimentés directement par le `.sna` via blob (aucune URL serveur).
-- **Serveur = simple base de données** : un fichier **SQLite portable** + une API CRUD tout-JS. Pas de MongoDB, pas de Meteor.
-- **Front** : **SPA Vite + Svelte 5** (`app/`), client only, build statique. Éditeur CodeMirror 6 (mode Z80).
+- **Client-side compilation**: assemblers (rasm, sjasmplus) run in **WebAssembly** in the browser. No more build server (`z80live_node` removed).
+- **Client-side emulation**: tiny8bit / RVMPlayer / crocods in WASM, fed directly from the `.sna` via a blob (no server URL involved).
+- **Server = simple database**: a portable **SQLite** file + an all-JS CRUD API. No MongoDB, no Meteor.
+- **Frontend**: **Vite + Svelte 5 SPA** (`app/`), client only, static build. CodeMirror 6 editor (Z80 mode).
 
-Périmètre fonctionnel retenu : **édition / fork en ligne**. Abandonnés : comptes/login, notes/votes, groupes/permissions. Lecture publique, écriture ouverte (protégeable via `Z80_WRITE_TOKEN`).
+Functional scope kept: **online editing / forking**. Dropped: accounts/login, notes/votes, groups/permissions. Public reads, open writes (protectable via `Z80_WRITE_TOKEN`).
 
-> Guide pratique (dev local, déploiement, export en masse des `.sna`) : **[QUICKSTART.md](QUICKSTART.md)**.
+> Practical guide (local dev, deployment, bulk `.sna` export): **[QUICKSTART.md](QUICKSTART.md)**.
 
 ## Structure
 
 ```
 z80next/
-├── db/          schema.sql · import.mjs · classify.mjs · z80live.sqlite (généré, ~39 Mo)
-├── server/      api.mjs  — REST CRUD/fork + sert la SPA (node:http + node:sqlite, 0 dépendance)
-├── wasm/        rasm.mjs+.wasm · sjasmplus.mjs+.wasm · assemble.mjs (module isomorphe)
-├── client/      store.mjs  — couche d'accès unifiée (API ou SQLite locale/sql.js)
-├── emu/         tiny8bit/  — émulateur CPC (WASM)
-├── emu-sw.js    Service Worker : sert le .sna assemblé à /build/<name>.sna (sans serveur)
-├── vendor/      sqljs/     — SQLite WASM pour la lecture navigateur (mode lite)
-├── app/         SPA Vite + Svelte (UI) — build -> app/dist/
-└── scripts/     export-lite.mjs  — génère le bundle statique distribuable
+├── db/          schema.sql · import.mjs · classify.mjs · z80live.sqlite (generated, ~39 MB)
+├── server/      api.mjs  — REST CRUD/fork + serves the SPA (node:http + node:sqlite, 0 dependencies)
+├── wasm/        rasm.mjs+.wasm · sjasmplus.mjs+.wasm · assemble.mjs (isomorphic module)
+├── client/      store.mjs  — unified access layer (API or local SQLite/sql.js)
+├── emu/         tiny8bit/  — CPC emulator (WASM)
+├── emu-sw.js    Service Worker: serves the assembled .sna at /build/<name>.sna (no server needed)
+├── vendor/      sqljs/     — SQLite WASM for browser reads (lite mode)
+├── app/         Vite + Svelte SPA (UI) — builds -> app/dist/
+└── scripts/     export-lite.mjs  — generates the distributable static bundle
 ```
 
-## Utilisation (mode complet : édition)
+## Usage (full mode: editing)
 
-Requiert Node ≥ 22.5 (`node:sqlite`). Compatible Bun (`bun:sqlite`).
+Requires Node ≥ 22.5 (`node:sqlite`). Compatible with Bun (`bun:sqlite`).
 
 ```bash
-npm run import              # (ré)génère db/z80live.sqlite depuis ../export_full.json
-(cd app && npm install && npm run build)   # compile la SPA -> app/dist
-npm run serve               # API + SPA sur http://localhost:3000
+npm run import              # (re)generates db/z80live.sqlite from ../export_full.json
+(cd app && npm install && npm run build)   # builds the SPA -> app/dist
+npm run serve               # API + SPA on http://localhost:3000
 ```
 
-Le serveur sert `app/dist` si présent (SPA), sinon `demo/` (démo brute, sans build).
+The server serves `app/dist` if present (SPA), otherwise `demo/` (raw demo, no build).
 
-Variables d'env : `PORT`, `DB` (chemin du .sqlite), `Z80_WRITE_TOKEN` (si défini, écriture via `Authorization: Bearer <token>`).
+Env vars: `PORT`, `DB` (path to the .sqlite file), `Z80_WRITE_TOKEN` (if set, writes require `Authorization: Bearer <token>`).
 
 ## API
 
-| Méthode | Route | Rôle |
+| Method | Route | Purpose |
 |---|---|---|
-| GET | `/api/sources?q=&buildmode=&limit=&offset=` | liste / recherche FTS (sans le code) |
-| GET | `/api/sources/:id` | source complète (avec code) |
-| POST | `/api/sources` | créer |
-| PUT | `/api/sources/:id` | modifier |
-| POST | `/api/sources/:id/fork` | forker (lignée via `fork_parent`) |
-| DELETE | `/api/sources/:id` | supprimer |
-| GET | `/api/health` | état |
+| GET | `/api/sources?q=&buildmode=&limit=&offset=` | list / FTS search (without code) |
+| GET | `/api/sources/:id` | full source (with code) |
+| POST | `/api/sources` | create |
+| PUT | `/api/sources/:id` | update |
+| POST | `/api/sources/:id/fork` | fork (lineage via `fork_parent`) |
+| DELETE | `/api/sources/:id` | delete |
+| GET | `/api/includes` | library sources (`is_include=1`), with their code — injected into the wasm FS at assemble time |
+| GET | `/api/health` | health check |
 
-## Démo — la boucle complète (éditer → assembler → exécuter)
-
-```bash
-npm run serve            # API + fichiers statiques (démo, wasm, émulateur) sur une seule origine
-# puis ouvrir http://localhost:3000/  dans un navigateur
-```
-
-`demo/index.html` relie toute la chaîne **sans serveur de build** : sélection d'une source (API) →
-éditeur → assemblage `rasm`/`sjasmplus` en WASM (`wasm/assemble.mjs`) → le `.sna` (Uint8Array) est
-passé en **blob** à l'émulateur tiny8bit (`emu/tiny8bit/cpc.html?file=<blob>`), même origine.
-
-- `wasm/rasm.mjs` + `rasm.wasm` — rasm en WASM (sortie byte-correcte ; écart mémoire mineur documenté).
-- `wasm/sjasmplus.mjs` + `sjasmplus.wasm` — sjasmplus en WASM (sortie identique au natif).
-- `wasm/assemble.mjs` — module isomorphe : header/footer selon buildOptions, défaut rasm, fallback sjasmplus.
-- `emu/tiny8bit/` — émulateur CPC (floooh/tiny8bit), args `file`/`input`/`joystick`/`type`.
-
-> ⚠️ La validation *visuelle* de l'émulateur se fait dans un navigateur (non testable en headless).
-> Note dev : les assembleurs sont buildés avec `-sSTACK_SIZE=8388608` (8 Mo). Le défaut Emscripten
-> (64 Ko) provoquait un débordement de pile du parseur récursif de rasm → trap `table index out of
-> bounds` (y compris navigateur). `assemble.mjs` remonte l'erreur via `res.error`.
-
-## Version lite (statique, distribuable, lecture seule)
-
-La base SQLite peut être **embarquée dans le client** et lue en local (sql.js) : plus aucun serveur.
-La version complète (avec API) sert d'instance d'édition ; on en **exporte** un instantané statique.
+## Demo — the full loop (edit → assemble → run)
 
 ```bash
-(cd app && npm run build)   # SPA à jour
-npm run export:lite         # génère ../dist-lite/  (~7,4 Mo : SPA + assembleurs + émulateur + base gzippée)
-cd ../dist-lite && npx serve   # ou tout hébergeur statique / CDN
+npm run serve            # API + static files (demo, wasm, emulator) on a single origin
+# then open http://localhost:3000/  in a browser
 ```
 
-- **La même SPA** sert les deux modes : `client/store.mjs#openStore` détecte l'API ; à défaut,
-  elle charge `db/z80live.sqlite.gz` (base allégée sans FTS ni `legacy_json`, gzippée ~4,8 Mo) via **sql.js**.
-  La build sql.js du CDN n'a pas FTS5 → la recherche lite utilise un repli **LIKE**.
-- **Émulateur sans serveur** : `emu-sw.js` (Service Worker) sert le `.sna` assemblé à `/build/<name>.sna`
-  (URL avec extension → détection de type par l'émulateur). Fonctionne aussi en mode complet.
-- Lecture seule : pas de sauvegarde de sources (édition/exécution éphémères uniquement).
+`demo/index.html` wires up the whole chain **without a build server**: select a source (API) →
+editor → `rasm`/`sjasmplus` assembly in WASM (`wasm/assemble.mjs`) → the `.sna` (Uint8Array) is
+passed as a **blob** to the tiny8bit emulator (`emu/tiny8bit/cpc.html?file=<blob>`), same origin.
 
-## Export en masse des .sna
+- `wasm/rasm.mjs` + `rasm.wasm` — rasm in WASM (byte-correct output; minor documented memory discrepancy).
+- `wasm/sjasmplus.mjs` + `sjasmplus.wasm` — sjasmplus in WASM (output identical to native).
+- `wasm/assemble.mjs` — isomorphic module: header/footer per buildOptions, defaults to rasm, falls back to sjasmplus.
+- **Library / include sources**: a source can be flagged `is_include=1` (no entry point) to act as a
+  library. Before assembling, `wasm/assemble.mjs` writes every such source's code into the wasm
+  virtual filesystem under a path derived from its `filename` column (default: slugified name +
+  `.asm`), so the main source's `INCLUDE`/`READ`/`INCBIN` directives can resolve it. The list of
+  library sources is fetched via `store.listIncludes()` / `GET /api/includes`.
+- `emu/tiny8bit/` — CPC emulator (floooh/tiny8bit), args `file`/`input`/`joystick`/`type`.
 
-Génère les `.sna` de toutes les sources SNA qui compilent (rejoue rasm/sjasmplus en WASM côté Node,
-même logique que `db/classify.mjs`), dans un dossier ou dans une archive zip unique.
-Guide pas à pas (et déploiement) : [QUICKSTART.md](QUICKSTART.md).
+> ⚠️ *Visual* validation of the emulator happens in a browser (not testable headless).
+> Dev note: the assemblers are built with `-sSTACK_SIZE=8388608` (8 MB). The Emscripten default
+> (64 KB) caused a stack overflow in rasm's recursive-descent parser → `table index out of
+> bounds` trap (including in the browser). `assemble.mjs` surfaces the error via `res.error`.
+
+## Lite version (static, distributable, read-only)
+
+The SQLite database can be **embedded in the client** and read locally (sql.js): no server at all.
+The full version (with API) serves as the editing instance; a static snapshot is **exported** from it.
 
 ```bash
-npm run export:sna              # -> ../sna-export/ (un .sna par source)
-npm run export:sna:zip          # -> ../sna-export.zip (archive unique)
-# ou avec une destination explicite :
-node --experimental-sqlite scripts/export-sna.mjs mon-dossier
-node --experimental-sqlite scripts/export-sna.mjs --zip mon-archive.zip
+(cd app && npm run build)   # up-to-date SPA
+npm run export:lite         # generates ../dist-lite/  (~7.4 MB: SPA + assemblers + emulator + gzipped database)
+cd ../dist-lite && npx serve   # or any static host / CDN
 ```
 
-Les sources qui échouent à l'assemblage (dépendances externes `incbin`/`include`, erreurs de
-syntaxe) sont ignorées ; le résumé (`OK`/`échecs`) s'affiche en fin d'exécution.
+- **The same SPA** serves both modes: `client/store.mjs#openStore` detects the API; otherwise
+  it loads `db/z80live.sqlite.gz` (a lightened database without FTS or `legacy_json`, gzipped ~4.8 MB) via **sql.js**.
+  The CDN build of sql.js lacks FTS5 → lite search falls back to **LIKE**.
+- **Serverless emulator**: `emu-sw.js` (Service Worker) serves the assembled `.sna` at `/build/<name>.sna`
+  (URL with extension → type detection by the emulator). Also works in full mode.
+- Read-only: no source saving (editing/running are ephemeral only).
 
-## Reste à faire
+## Bulk .sna export
 
-- Coloration dédiée de la ligne de directives `;z80:` dans l'éditeur.
-- Corriger l'écart mémoire de rasm (dépendance à un malloc zéroé) pour un déterminisme byte-parfait.
-- Build sjasmplus **avec Lua** (`USE_LUA=1`) pour ~6 sources qui scriptent en Lua.
-- Fallback `.sna` pré-compilé pour les ~15 sources à dépendances externes (`incbin`/`include`).
-- Prise en charge des DSK (repoussée).
+Generates the `.sna` for every SNA source that compiles (replays rasm/sjasmplus in WASM on the Node
+side, same logic as `db/classify.mjs`), into a folder or a single zip archive.
+Step-by-step guide (and deployment): [QUICKSTART.md](QUICKSTART.md).
+
+```bash
+npm run export:sna              # -> ../sna-export/ (one .sna per source)
+npm run export:sna:zip          # -> ../sna-export.zip (single archive)
+# or with an explicit destination:
+node --experimental-sqlite scripts/export-sna.mjs my-folder
+node --experimental-sqlite scripts/export-sna.mjs --zip my-archive.zip
+```
+
+Sources that fail to assemble (external `incbin`/`include` dependencies, syntax errors) are
+skipped; a summary (`OK`/failures) is printed at the end of the run.
+
+## TODO
+
+- Dedicated syntax highlighting for the `;z80:` directive line in the editor.
+- Fix rasm's memory discrepancy (dependency on zeroed malloc) for byte-perfect determinism.
+- Build sjasmplus **with Lua** (`USE_LUA=1`) for the ~6 sources that script in Lua.
+- Pre-compiled `.sna` fallback for the ~15 sources with external dependencies (`incbin`/`include`).
+- DSK support (deferred).

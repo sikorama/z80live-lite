@@ -25,8 +25,13 @@ CREATE TABLE IF NOT EXISTS sources (
   start_point   TEXT,
   end_point     TEXT,
   command       TEXT,                      -- pour DSK (run"...)
-  filename      TEXT,
+  filename      TEXT,                      -- pour is_include=1 : nom/chemin virtuel (ex. 'lib/toolbox.asm')
+                                            -- sous lequel ce fichier est injecté dans le FS wasm à l'assemblage
   output_type   TEXT,
+
+  -- 1 = librairie/fichier à inclure (pas de point d'entrée) : injecté automatiquement dans le
+  -- répertoire de travail wasm de chaque assemblage, sous le nom `filename` (défaut: slug(name)+'.asm').
+  is_include    INTEGER,
 
   -- Résultat de classification (rempli par classify.mjs) : aide au tri / masquage.
   build_status  TEXT,                      -- 'ok' | 'fail' | 'external-dep' | NULL
@@ -46,6 +51,7 @@ CREATE INDEX IF NOT EXISTS idx_sources_name      ON sources(name);
 CREATE INDEX IF NOT EXISTS idx_sources_buildmode ON sources(buildmode);
 CREATE INDEX IF NOT EXISTS idx_sources_updated   ON sources(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sources_fork       ON sources(fork_parent);
+CREATE INDEX IF NOT EXISTS idx_sources_include     ON sources(is_include);
 
 -- Recherche plein-texte (nom / auteur / description / code).
 CREATE VIRTUAL TABLE IF NOT EXISTS sources_fts USING fts5(

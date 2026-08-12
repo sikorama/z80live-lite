@@ -122,7 +122,26 @@ function readOutput(FS, expected) {
   return { data: null, ext: null };
 }
 
-async function runModule(factory, args, sourceText, expectedOut) {
+// Nom/chemin virtuel sous lequel une lib (is_include=1) est injectée dans le FS wasm :
+// `filename` fait autorité (ex. 'lib/toolbox.asm'), sinon slug(name)+'.asm' par défaut.
+function includePath(inc) {
+  let p = String(inc.filename || inc.name || 'lib').trim().replace(/^\/+/, '');
+  if (!/\.[A-Za-z0-9]+$/.test(p)) p += '.asm';
+  return '/' + p;
+}
+
+// Copie les sources marquées "include" (librairies, sans point d'entrée) dans le FS virtuel
+// wasm avant l'assemblage, pour que les directives INCLUDE/READ/INCBIN du fichier principal résolvent.
+function writeIncludes(FS, includes = []) {
+  for (const inc of includes) {
+    const path = includePath(inc);
+    const dir = path.slice(0, path.lastIndexOf('/'));
+    if (dir) { try { FS.mkdirTree(dir); } catch {} }
+    try { FS.writeFile(path, inc.code || ''); } catch {}
+  }
+}
+
+async function runModule(factory, args, sourceText, expectedOut, includes) {
   const log = [];
   let error = null;
   let Module;
@@ -131,6 +150,7 @@ async function runModule(factory, args, sourceText, expectedOut) {
   } catch (e) {
     return { log, data: null, ext: null, exitCode: -1, error: 'init WASM: ' + (e?.message || e) };
   }
+  writeIncludes(Module.FS, includes);
   Module.FS.writeFile('/in.asm', sourceText);
   let exitCode = 0;
   try {
@@ -150,10 +170,11 @@ export async function assemble(source, factories) {
   // Les directives `;z80:` en tête de source font autorité sur les opts fournis.
   const opts = { ...raw, ...parseDirectives(code) };
   const assembler = resolveAssembler(opts);
+  const includes = raw.includes || [];
 
   if (assembler === 'sjasmplus') {
     const wrapped = wrapSjasm(code, opts, OUT + '.sna');
-    const r = await runModule(factories.createSjasm, ['--nologo', '/in.asm'], wrapped, OUT + '.sna');
+    const r = await runModule(factories.createSjasm, ['--nologo', '/in.asm'], wrapped, OUT + '.sna', includes);
     const errs = /Errors:\s*(\d+)/.exec(r.log.join('\n'));
     const ok = !!r.data && (!errs || errs[1] === '0');
     return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
@@ -161,14 +182,14 @@ export async function assemble(source, factories) {
 
   if (assembler === 'fantams') {
     const wrapped = wrapFantams(code, opts);
-    const r = await runModule(factories.createFantams, ['/in.asm', '-o', OUT + '.sna'], wrapped, OUT + '.sna');
+    const r = await runModule(factories.createFantams, ['/in.asm', '-o', OUT + '.sna'], wrapped, OUT + '.sna', includes);
     const ok = r.exitCode === 0 && !!r.data;
     return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
   }
 
   // rasm (+ uz80 traité comme rasm en attendant)
   const wrapped = wrapRasm(code, opts);
-  const r = await runModule(factories.createRasm, ['/in.asm', '-oa', '-eo', '-utf8', '-o', OUT], wrapped, OUT + '.sna');
+  const r = await runModule(factories.createRasm, ['/in.asm', '-oa', '-eo', '-utf8', '-o', OUT], wrapped, OUT + '.sna', includes);
   const ok = r.exitCode === 0 && !!r.data;
   return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
 }

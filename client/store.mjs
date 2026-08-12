@@ -5,7 +5,7 @@
 // L'UI ne dépend que de cette interface.
 
 const LIST_COLS = `id, name, slugname, author, owner, description, category, genre, group_name,
-  assembler, buildmode, entry_point, start_point, end_point, command,
+  assembler, buildmode, entry_point, start_point, end_point, command, filename, is_include,
   build_status, compilable, fork_parent, created_at, updated_at`;
 const LIST_COLS_S = LIST_COLS.replace(/\b(\w+)\b/g, 's.$1');
 
@@ -29,6 +29,7 @@ export function createApiStore(base = '..', { token } = {}) {
       return (await j('/api/sources?' + p)).items;
     },
     get(id) { return j('/api/sources/' + encodeURIComponent(id)); },
+    async listIncludes() { return (await j('/api/includes')).items; },
     create(data) { return send('POST', '/api/sources', data); },
     update(id, data) { return send('PUT', '/api/sources/' + encodeURIComponent(id), data); },
     fork(id, overrides = {}) { return send('POST', '/api/sources/' + encodeURIComponent(id) + '/fork', overrides); },
@@ -72,6 +73,7 @@ export function createLocalStore(db, { hasFts = true } = {}) {
         { $l: limit, $o: offset });
     },
     get(id) { return one(`SELECT ${LIST_COLS}, code FROM sources WHERE id = $id`, { $id: id }); },
+    listIncludes() { return rows(`SELECT id, name, filename, code FROM sources WHERE is_include = 1 ORDER BY name`); },
   };
 }
 

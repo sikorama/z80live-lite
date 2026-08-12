@@ -20,7 +20,7 @@ db.exec('PRAGMA foreign_keys = ON;');
 
 // Colonnes exposées en liste (léger, sans le code).
 const LIST_COLS = `id, name, slugname, author, owner, description, category, genre, group_name,
-  assembler, buildmode, entry_point, start_point, end_point, command,
+  assembler, buildmode, entry_point, start_point, end_point, command, filename, is_include,
   build_status, compilable, fork_parent, created_at, updated_at`;
 const FULL_COLS = `${LIST_COLS}, code`;
 const LIST_COLS_S = LIST_COLS.replace(/\b(\w+)\b/g, 's.$1'); // colonnes qualifiées pour les jointures FTS
@@ -32,6 +32,7 @@ const q = {
       JOIN sources_fts f ON f.rowid = s.rowid
       WHERE sources_fts MATCH $q ORDER BY rank LIMIT $limit OFFSET $offset`),
   get: db.prepare(`SELECT ${FULL_COLS} FROM sources WHERE id = $id`),
+  includes: db.prepare(`SELECT id, name, filename, code FROM sources WHERE is_include = 1 ORDER BY name`),
   count: db.prepare(`SELECT COUNT(*) c FROM sources`),
   del: db.prepare(`DELETE FROM sources WHERE id = $id`),
 };
@@ -39,7 +40,7 @@ const q = {
 // Champs modifiables par l'API.
 const WRITABLE = ['name', 'slugname', 'author', 'owner', 'description', 'category', 'genre',
   'group_name', 'code', 'assembler', 'buildmode', 'entry_point', 'start_point',
-  'end_point', 'command', 'filename', 'output_type', 'build_status', 'compilable'];
+  'end_point', 'command', 'filename', 'output_type', 'is_include', 'build_status', 'compilable'];
 
 function insertSource(data, { fork_parent = null } = {}) {
   const id = randomUUID();
@@ -190,6 +191,9 @@ const server = createServer(async (req, res) => {
         'Content-Disposition': `attachment; filename="${sc[1]}"` });
       return res.end(buf);
     }
+
+    // GET /api/includes  (fichiers librairie is_include=1, avec leur code : injectés dans le FS wasm à l'assemblage)
+    if (m === 'GET' && p === '/api/includes') return json(res, 200, { items: q.includes.all() });
 
     if (m === 'GET' && p === '/api/health') return json(res, 200, { status: 'ok', db: DB_PATH, sources: q.count.get().c });
 

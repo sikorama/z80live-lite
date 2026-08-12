@@ -12,6 +12,8 @@
   let query = $state('');
   let selected = $state(null);
   let asm = $state(''), buildmode = $state('sna'), entry = $state('');
+  let isInclude = $state(false), incFilename = $state(''); // fichier librairie (sans point d'entrée), injecté dans le FS wasm des autres sources
+  let includeCache = null; // liste des sources is_include=1 ({id,name,filename,code}), rafraîchie à chaque run()
   let logLines = $state([]);
   let lineOffset = 0; // nb de lignes d'en-tête injectées avant le code utilisateur par le dernier build
   let emuUrl = $state('');
@@ -60,12 +62,16 @@
   async function applySettings() {
     showSettings = false;
     const it = selected?.id ? sources.find((s) => s.id === selected.id) : null;
-    if (it && selected) { it.name = selected.name; it.author = selected.author; it.genre = selected.genre; it.assembler = asm || null; it.buildmode = buildmode; }
+    if (it && selected) {
+      it.name = selected.name; it.author = selected.author; it.genre = selected.genre;
+      it.assembler = asm || null; it.buildmode = buildmode; it.is_include = isInclude ? 1 : 0;
+    }
     if (canWrite && selected?.id) {
       try {
         await store.update(selected.id, {
           name: selected.name, author: selected.author, description: selected.description,
           genre: selected.genre, assembler: asm || null, buildmode, entry_point: entry || null,
+          is_include: isInclude ? 1 : null, filename: isInclude ? (incFilename || null) : null,
         });
       } catch {}
     }
@@ -190,6 +196,7 @@
     const bm = d.buildmode || s.buildmode || 'sna';
     buildmode = bm.startsWith('sna') ? (bm === 'sna' ? 'sna' : bm) : 'sna';
     entry = d.entryPoint || s.entry_point || '';
+    isInclude = !!s.is_include; incFilename = s.filename || '';
     await run(); // charge -> assemble -> envoie à l'émulateur en un clic
   }
 
@@ -198,6 +205,7 @@
     setCode('; z80: assembler=rasm buildmode=sna entry=#8000\n  org #8000\nstart:\n  ret\n');
     dirty = false;
     asm = 'rasm'; buildmode = 'sna'; entry = '#8000';
+    isInclude = false; incFilename = '';
   }
 
   async function run() {
@@ -207,8 +215,12 @@
     const up = upsertDirectives(editor.value, cfg);  // maintien de la ligne ;z80:
     if (up !== editor.value) setCode(up);            // n'écrit que si ça change (évite la boucle auto)
     try {
+      // Injecte toutes les sources marquées "librairie" (is_include) dans le FS wasm, sauf la source
+      // en cours (déjà écrite comme /in.asm — s'auto-inclure ne servirait à rien).
+      try { includeCache = await store.listIncludes(); } catch { includeCache = includeCache || []; }
+      const includes = (includeCache || []).filter((i) => i.id !== selected?.id);
       const t0 = performance.now();
-      const res = await assemble({ code: editor.value, ...cfg }, factories);
+      const res = await assemble({ code: editor.value, ...cfg, includes }, factories);
       const dt = (performance.now() - t0).toFixed(0);
       preText = res.preprocessed || ''; // dispo même en cas d'échec (pour debug)
       lineOffset = res.lineOffset || 0;
@@ -242,7 +254,8 @@
 
   async function save() {
     const data = { name: selected?.name || 'untitled', code: editor.value, assembler: asm || null,
-      buildmode, entry_point: entry || null, author: selected?.author || null, description: selected?.description || null };
+      buildmode, entry_point: entry || null, author: selected?.author || null, description: selected?.description || null,
+      is_include: isInclude ? 1 : null, filename: isInclude ? (incFilename || null) : null };
     const saved = selected?.id ? await store.update(selected.id, data) : await store.create(data);
     selected = saved; dirty = false; await refreshList(); log('💾 sauvegardé : ' + saved.name, 'ok');
   }
@@ -252,7 +265,10 @@
   }
 
   // Met à jour l'indicateur d'assemblage (✅/❌) après un build, sans attendre un re-classify.
+  // Une librairie (is_include) n'a pas de point d'entrée : l'assembler seule échoue normalement,
+  // ce n'est pas un statut à retenir.
   function applyStatus(ok) {
+    if (isInclude) return;
     const status = ok ? 'ok' : 'fail';
     const prev = selected?.build_status;
     if (selected) selected.build_status = status;
@@ -291,7 +307,7 @@
     return () => { editor?.destroy(); clearInterval(amspiritTimer); };
   });
 
-  const badge = (s) => s.build_status === 'ok' ? '✅' : s.build_status === 'external-dep' ? '📦' : '·';
+  const badge = (s) => s.is_include ? '🧩' : s.build_status === 'ok' ? '✅' : s.build_status === 'external-dep' ? '📦' : '·';
   const fmtDate = (ms) => ms ? new Date(Number(ms)).toISOString().slice(0, 10) : '';
 </script>
 
@@ -379,7 +395,7 @@
     {#if selected}
       <div class="meta">
         <span class="st" class:ok={selected.build_status === 'ok'} class:ko={selected.build_status === 'fail'}
-          title="État d'assemblage">{selected.build_status === 'ok' ? '✅ assemble' : selected.build_status === 'fail' ? '❌ échoue' : selected.build_status === 'external-dep' ? '📦 dépend. externe' : '— non testé'}</span>
+          title="État d'assemblage">{isInclude ? '🧩 librairie (incluse par les autres sources)' : selected.build_status === 'ok' ? '✅ assemble' : selected.build_status === 'fail' ? '❌ échoue' : selected.build_status === 'external-dep' ? '📦 dépend. externe' : '— non testé'}</span>
         <span class="t">{selected.name}</span>
         <span class="by">{selected.author ? 'par ' + selected.author : 'auteur inconnu'}</span>
         {#if selected.owner && selected.owner !== selected.author}<span class="tags">(owner: {selected.owner})</span>{/if}
@@ -420,7 +436,17 @@
       <label>Type de sortie
         <select bind:value={buildmode}><option>sna</option><option>sna_cpc6128</option><option>sna_cpc464</option></select>
       </label>
-      <label>Point d'entrée <input bind:value={entry} placeholder="#8000" /></label>
+      <label class="wide chk">
+        <input type="checkbox" bind:checked={isInclude} />
+        🧩 Librairie / fichier à inclure (pas de point d'entrée — injecté dans le FS wasm des autres sources)
+      </label>
+      {#if isInclude}
+        <label class="wide">Nom du fichier (pour include/incbin depuis un autre fichier)
+          <input bind:value={incFilename} placeholder={(selected.name || 'lib').replace(/[^\w.-]+/g, '_') + '.asm'} />
+        </label>
+      {:else}
+        <label>Point d'entrée <input bind:value={entry} placeholder="#8000" /></label>
+      {/if}
       <label>Genre
         <select bind:value={selected.genre} disabled={!canWrite}>
           <option value={null}>(non classé)</option>
