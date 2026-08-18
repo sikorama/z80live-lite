@@ -1,8 +1,8 @@
-// asm_main.cpp - CLI bout-en-bout : source .asm -> préprocesseur -> assembleur -> .bin
+// asm_main.cpp - end-to-end CLI: .asm source -> preprocessor -> assembler -> .bin
 //
-//   fantams fichier.asm [-o sortie.bin] [-s]
-//     -o : fichier binaire de sortie (défaut : <source>.bin)
-//     -s : affiche la table des symboles
+//   fantams file.asm [-o output.bin] [-s]
+//     -o : output binary file (default: <source>.bin)
+//     -s : print the symbol table
 #include "asm.h"
 #include "pp.h"
 #include "sna.h"
@@ -30,34 +30,34 @@ int main(int argc, char **argv) {
         else if (a == "-s") showSyms = true;
         else path = a;
     }
-    if (path.empty()) { fprintf(stderr, "usage: fantams fichier.asm [-o sortie.bin] [-s]\n"); return 2; }
+    if (path.empty()) { fprintf(stderr, "usage: fantams file.asm [-o output.bin] [-s]\n"); return 2; }
     if (outPath.empty()) {
         size_t dot = path.find_last_of('.');
         outPath = (dot == std::string::npos ? path : path.substr(0, dot)) + ".bin";
     }
 
     std::string content;
-    if (!readFile(path, content)) { fprintf(stderr, "erreur: fichier introuvable: %s\n", path.c_str()); return 2; }
+    if (!readFile(path, content)) { fprintf(stderr, "error: file not found: %s\n", path.c_str()); return 2; }
 
-    // 1) préprocesseur
+    // 1) preprocessor
     pp::Result pre = pp::preprocess(content, path, readFile);
-    for (auto &w : pre.warnings) fprintf(stderr, "%s:%d: avertissement: %s\n", w.file.c_str(), w.line, w.message.c_str());
+    for (auto &w : pre.warnings) fprintf(stderr, "%s:%d: warning: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!pre.ok) {
-        for (auto &e : pre.errors) fprintf(stderr, "%s:%d: erreur (préproc): %s\n", e.file.c_str(), e.line, e.message.c_str());
+        for (auto &e : pre.errors) fprintf(stderr, "%s:%d: error (preproc): %s\n", e.file.c_str(), e.line, e.message.c_str());
         return 1;
     }
 
-    // 2) assembleur (2 passes) sur le texte plat
+    // 2) assembler (2 passes) on the flat text
     std::vector<asmb::SourceLine> lines;
     for (auto &l : pre.lines) lines.push_back({l.text, l.file, l.line, l.col0});
     asmb::Output out = asmb::assemble(lines);
-    for (auto &w : out.warnings) fprintf(stderr, "%s:%d: avertissement: %s\n", w.file.c_str(), w.line, w.message.c_str());
+    for (auto &w : out.warnings) fprintf(stderr, "%s:%d: warning: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!out.ok) {
-        for (auto &e : out.errors) fprintf(stderr, "%s:%d: erreur: %s\n", e.file.c_str(), e.line, e.message.c_str());
+        for (auto &e : out.errors) fprintf(stderr, "%s:%d: error: %s\n", e.file.c_str(), e.line, e.message.c_str());
         return 1;
     }
 
-    // 3) écriture : .sna -> snapshot ; sinon binaire brut
+    // 3) write out : .sna -> snapshot ; otherwise raw binary
     bool asSna = outPath.size() >= 4 && outPath.substr(outPath.size() - 4) == ".sna";
     std::vector<uint8_t> data;
     if (asSna) {
@@ -67,12 +67,12 @@ int main(int argc, char **argv) {
         data = out.bin;
     }
     std::ofstream f(outPath, std::ios::binary);
-    if (!f) { fprintf(stderr, "erreur: écriture impossible: %s\n", outPath.c_str()); return 2; }
+    if (!f) { fprintf(stderr, "error: cannot write: %s\n", outPath.c_str()); return 2; }
     f.write((const char *)data.data(), (std::streamsize)data.size());
     if (asSna)
-        fprintf(stderr, "%s : snapshot (%zu o), PC=0x%04X\n", outPath.c_str(), data.size(), out.runAddress);
+        fprintf(stderr, "%s: snapshot (%zu bytes), PC=0x%04X\n", outPath.c_str(), data.size(), out.runAddress);
     else
-        fprintf(stderr, "%s : %zu octets @ 0x%04X\n", outPath.c_str(), data.size(), out.loadAddress);
+        fprintf(stderr, "%s: %zu bytes @ 0x%04X\n", outPath.c_str(), data.size(), out.loadAddress);
 
     if (showSyms)
         for (auto &s : out.symbols)

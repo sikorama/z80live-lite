@@ -205,8 +205,8 @@ private:
             // avertit plutôt que d'échouer silencieusement sur une simple différence de casse.
             auto cit = ciIndex_.find(upper(qn));
             if (cit != ciIndex_.end()) {
-                warn("symbole '" + qn + "' non trouvé exactement, utilisation de '" + cit->second +
-                     "' (différence de casse — bonne pratique : utiliser la casse exacte)");
+                warn("symbol '" + qn + "' not found exactly, using '" + cit->second +
+                     "' (case mismatch — best practice: match case exactly)");
                 o = symbols_[cit->second];
                 return true;
             }
@@ -218,12 +218,12 @@ private:
 
     void defineLabel(const std::string &n) {
         std::string qn = qualify(n);
-        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("symbole déjà défini : " + qn); return; } }
+        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
         setSymbol(qn, pc_ & 0xFFFF);
     }
     void defineSymbol(const std::string &n, int64_t v) {
         std::string qn = qualify(n);
-        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("symbole déjà défini : " + qn); return; } }
+        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
         setSymbol(qn, v);
     }
 
@@ -243,9 +243,9 @@ private:
     }
     void emitDS(const std::string &ops) {
         auto parts = splitTopLevel(ops, ',');
-        if (parts.empty()) { structErr("DS : taille manquante"); return; }
+        if (parts.empty()) { structErr("DS: missing size"); return; }
         int64_t n = evalExpr(parts[0]);
-        if (!evalOk_) { structErr("DS : taille non résoluble en passe 1"); return; }
+        if (!evalOk_) { structErr("DS: size not resolvable in pass 1"); return; }
         int64_t fill = parts.size() > 1 ? evalExpr(parts[1]) : 0;
         for (int64_t k = 0; k < n; ++k) emit((uint8_t)(fill & 0xFF));
     }
@@ -258,7 +258,7 @@ private:
         std::string label, rest; bool labelHasColon = true;
         peelLabel(code, label, rest, &labelHasColon);
         if (!label.empty() && !labelHasColon)
-            warn("label sans ':' : '" + label + "' (bonne pratique : écrire '" + label + ":')");
+            warn("label without ':': '" + label + "' (best practice: write '" + label + ":')");
         // contexte de qualification pour les labels locaux ".nom" sur les lignes suivantes
         // (un label local ne change pas le contexte : qualify() ne modifie que ceux en '.').
         if (!label.empty() && label[0] != '.') currentGlobal_ = label;
@@ -267,7 +267,7 @@ private:
         if (pr.isInstruction) {
             if (!label.empty()) defineLabel(label);
             else if (cur_.col0)
-                warn("instruction '" + pr.mnemonic + "' en colonne 1 : bonne pratique = indenter les instructions (seuls les labels/symboles commencent en colonne 1)");
+                warn("instruction '" + pr.mnemonic + "' in column 1 (best practice: indent instructions — only labels/symbols should start in column 1)");
             z80::encode(*this, pr.instr);
             return;
         }
@@ -301,7 +301,7 @@ private:
 
         // définition de symbole : "name: EQU v" / "name EQU v" / "name = v"
         if (W0 == "EQU") {
-            if (label.empty()) { structErr("EQU sans nom"); return; }
+            if (label.empty()) { structErr("EQU without a name"); return; }
             defineSymbol(label, evalExpr(after0));
             if (pass_ == 1) equDefs_.push_back({qualify(label), after0});
             return;
@@ -317,14 +317,14 @@ private:
             std::string lhs = trim(rest.substr(0, eq));
             std::string rhs = trim(rest.substr(eq + 1));
             std::string name = lhs.empty() ? label : lhs;
-            if (name.empty()) { structErr("assignation sans nom"); return; }
+            if (name.empty()) { structErr("assignment without a name"); return; }
             defineSymbol(name, evalExpr(rhs));
             if (pass_ == 1) equDefs_.push_back({qualify(name), rhs});
             return;
         }
 
         if (!label.empty()) defineLabel(label);
-        structErr("directive/mnémonique inconnu : " + w0);
+        structErr("unknown directive/mnemonic: '" + w0 + "'");
     }
 };
 

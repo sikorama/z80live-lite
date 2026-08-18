@@ -18,7 +18,7 @@ MODULE gfx
 main:
         ld a,(hero.x)      ; accès à un champ d'instance
         ld hl,Sprite       ; Sprite = sizeof (=4)
-        call clear         ; réf locale au module -> gfx_clear
+        call clear         ; réf locale au module -> gfx.clear
         ret
 clear:
         xor a

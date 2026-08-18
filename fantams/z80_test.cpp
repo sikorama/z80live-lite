@@ -188,6 +188,7 @@ int main() {
     chk("IN B,(C)",   I(Mnemo::IN, R(Reg::B), RI(Reg::C)),   {0xED, 0x40});
     chk("OUT (n),A",  I(Mnemo::OUT, M("0xFE"), R(Reg::A)),   {0xD3, 0xFE});
     chk("OUT (C),D",  I(Mnemo::OUT, RI(Reg::C), R(Reg::D)),  {0xED, 0x51});
+    chk("OUT (C),0 (non documenté)", I(Mnemo::OUT, RI(Reg::C), N("0")), {0xED, 0x71});
 
     // --- non documentés fréquents ---
     chk("SLL B",      I(Mnemo::SLL, R(Reg::B)),   {0xCB, 0x30});

@@ -155,7 +155,7 @@ Reg regIndFromUpper(const std::string &u) {
 bool parseOperand(const std::string &text, bool allowCondition,
                   Operand &out, std::string &err) {
     std::string t = trim(text);
-    if (t.empty()) { err = "opérande vide"; return false; }
+    if (t.empty()) { err = "empty operand"; return false; }
     std::string u = upper(t);
 
     // condition (uniquement en position autorisée)
@@ -216,7 +216,7 @@ Result parseLine(const std::string &line) {
     }
 
     std::vector<std::string> ops = splitTopLevel(r.operandsText, ',');
-    if (ops.size() > 2) { r.error = "trop d'opérandes"; return r; }
+    if (ops.size() > 2) { r.error = "too many operands"; return r; }
 
     // désambiguïsation de `C` : position condition ?
     bool condOp1 = false;

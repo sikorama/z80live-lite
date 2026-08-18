@@ -29,10 +29,10 @@ int main(int argc, char **argv) {
         if (a == "-m") withMap = true;
         else path = argv[i];
     }
-    if (!path) { fprintf(stderr, "usage: ppdump [-m] fichier.asm\n"); return 2; }
+    if (!path) { fprintf(stderr, "usage: ppdump [-m] file.asm\n"); return 2; }
 
     std::string content;
-    if (!readFile(path, content)) { fprintf(stderr, "erreur: fichier introuvable: %s\n", path); return 2; }
+    if (!readFile(path, content)) { fprintf(stderr, "error: file not found: %s\n", path); return 2; }
 
     pp::Result r = pp::preprocess(content, path, readFile);
 
@@ -42,10 +42,10 @@ int main(int argc, char **argv) {
         fputs(r.dump().c_str(), stdout);
 
     for (const auto &w : r.warnings)
-        fprintf(stderr, "%s:%d: avertissement: %s\n", w.file.c_str(), w.line, w.message.c_str());
+        fprintf(stderr, "%s:%d: warning: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!r.ok) {
         for (const auto &e : r.errors)
-            fprintf(stderr, "%s:%d: erreur: %s\n", e.file.c_str(), e.line, e.message.c_str());
+            fprintf(stderr, "%s:%d: error: %s\n", e.file.c_str(), e.line, e.message.c_str());
         return 1;
     }
     return 0;

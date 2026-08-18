@@ -52,6 +52,11 @@ int main() {
     // passe-plat + suppression commentaires/vides
     chk("passthrough", "  ld a,1  ; commentaire\n\n  ret\n", "ld a,1\nret\n");
 
+    // commentaires bloc /* ... */ (comme rasm), y compris multi-lignes et sur une ligne de code
+    chk("commentaire bloc simple", "/* commentaire */\n  ld a,1\n", "ld a,1\n");
+    chk("commentaire bloc multi-lignes", "/* ligne1\nligne2\nligne3 */\n  ld a,1\n", "ld a,1\n");
+    chk("commentaire bloc + code sur la même ligne", "/* c */ ld a,1\n", "ld a,1\n");
+
     // variable PP + substitution
     chk("LET + subst", "LET N = 3\n  ld a,{N}\n", "ld a,3\n");
     chk("subst expr", "LET N = 3\n  ld a,{=N*2+1}\n", "ld a,7\n");
@@ -118,20 +123,32 @@ int main() {
     chk("label + REPEAT",
         "start: REPEAT 2\n nop\nREND\n", "start:\nnop\nnop\n");
 
-    // MODULE : préfixe les labels définis, laisse les globaux (fallback)
+    // MODULE : préfixe les labels définis avec '.' (PAS '_' comme rasm — délibérément
+    // incompatible : '_' est un caractère d'identifiant ordinaire donc ambigu, alors que
+    // '.' est déjà le séparateur des labels locaux ; ça permet de chaîner "module.label.local"
+    // sans mécanisme séparé). Laisse les globaux non définis dans le module en fallback.
     chk("MODULE prefix",
-        "MODULE vid\nclear: ld hl,buf\n  ret\nbuf: db 0\nENDMODULE\n  call vid_clear\n",
-        "vid_clear: ld hl,vid_buf\nret\nvid_buf: db 0\ncall vid_clear\n");
+        "MODULE vid\nclear: ld hl,buf\n  ret\nbuf: db 0\nENDMODULE\n  call vid.clear\n",
+        "vid.clear: ld hl,vid.buf\nret\nvid.buf: db 0\ncall vid.clear\n");
     chk("MODULE fallback global",
         "MODULE m\nfoo: call ext\nENDMODULE\n",
-        "m_foo: call ext\n");
-    // rasm ne cumule PAS les MODULE : "MODULE b" remplace "MODULE a" (pas de préfixe a_b_).
+        "m.foo: call ext\n");
+    // rasm ne cumule PAS les MODULE : "MODULE b" remplace "MODULE a" (pas de préfixe a.b.).
     chk("MODULE switch (pas de nesting)",
         "MODULE a\nz: nop\nMODULE b\nx: nop\nENDMODULE\ny: jp x\n",
-        "a_z: nop\nb_x: nop\ny: jp x\n"); // y est hors module -> x (non renommé) reste global
+        "a.z: nop\nb.x: nop\ny: jp x\n"); // y est hors module -> x (non renommé) reste global
     chk("MODULE OFF",
         "MODULE a\nz: nop\nMODULE OFF\ny: nop\n",
-        "a_z: nop\ny: nop\n");
+        "a.z: nop\ny: nop\n");
+    // label sans ':' dans un MODULE (comme un vrai bout de source rasm réel)
+    chk("MODULE label sans ':'",
+        "MODULE icons\ndisplay\n  ret\nMODULE OFF\n  call icons.display\n",
+        "icons.display\nret\ncall icons.display\n");
+    // label local ".nom" dans un MODULE : pas renommé par MODULE lui-même (laissé à
+    // asm.cpp), mais le préprocesseur ne doit pas le casser -> passe-plat tel quel ici.
+    chk("MODULE + label local (préprocesseur : passe-plat)",
+        "MODULE icons\ndisplay:\n.loop:\n  djnz .loop\n  ret\nMODULE OFF\n",
+        "icons.display:\n.loop:\ndjnz .loop\nret\n");
 
     // STRUCT : déclaration -> offsets + sizeof (EQU portables)
     chk("STRUCT decl",

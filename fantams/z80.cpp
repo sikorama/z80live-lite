@@ -177,7 +177,7 @@ bool encodeAlu(IAsmContext &ctx, int idx, const Operand &src) {
         return true;
     }
     R8 s = asR8(src);
-    if (!s.ok) { ctx.error("opérande ALU 8 bits invalide"); return false; }
+    if (!s.ok) { ctx.error("invalid 8-bit ALU operand"); return false; }
     e.prefix(s.prefix);
     e.op((uint8_t)(0x80 + idx * 8 + s.code));
     if (s.indexed) e.disp(ctx.eval(s.disp));
@@ -188,7 +188,7 @@ bool encodeAlu(IAsmContext &ctx, int idx, const Operand &src) {
 bool encodeRot(IAsmContext &ctx, int idx, const Operand &tgt) {
     Emitter e{ctx};
     R8 t = asR8(tgt);
-    if (!t.ok) { ctx.error("cible de rotation/décalage invalide"); return false; }
+    if (!t.ok) { ctx.error("invalid rotate/shift target"); return false; }
     e.prefix(t.prefix);
     e.op(0xCB);
     if (t.indexed) e.disp(ctx.eval(t.disp)); // DD CB d op
@@ -199,11 +199,11 @@ bool encodeRot(IAsmContext &ctx, int idx, const Operand &tgt) {
 // BIT/RES/SET b,r : base 0x40/0x80/0xC0
 bool encodeBit(IAsmContext &ctx, uint8_t base, const Operand &nb, const Operand &tgt) {
     Emitter e{ctx};
-    if (nb.kind != Operand::Kind::Imm) { ctx.error("numéro de bit attendu"); return false; }
+    if (nb.kind != Operand::Kind::Imm) { ctx.error("expected bit number"); return false; }
     int64_t b = ctx.eval(nb.expr);
-    if (b < 0 || b > 7) ctx.error("numéro de bit hors [0..7]"); // émet quand même (taille stable)
+    if (b < 0 || b > 7) ctx.error("bit number out of range [0..7]"); // émet quand même (taille stable)
     R8 t = asR8(tgt);
-    if (!t.ok) { ctx.error("cible d'opération sur bit invalide"); return false; }
+    if (!t.ok) { ctx.error("invalid bit-operation target"); return false; }
     e.prefix(t.prefix);
     e.op(0xCB);
     if (t.indexed) e.disp(ctx.eval(t.disp));
@@ -220,14 +220,14 @@ bool encodeLD(IAsmContext &ctx, const Operand &A, const Operand &B) {
 
     // LD r,r'
     if (da.ok && sb.ok) {
-        if (da.code == 6 && sb.code == 6) { ctx.error("LD (HL),(HL) invalide (= HALT)"); return false; }
-        if (da.indexed && sb.indexed) { ctx.error("deux opérandes indexés impossibles"); return false; }
+        if (da.code == 6 && sb.code == 6) { ctx.error("invalid LD (HL),(HL) (= HALT)"); return false; }
+        if (da.indexed && sb.indexed) { ctx.error("two indexed operands not allowed"); return false; }
         // si un opérande est (IX+d), l'autre doit être un r8 SANS préfixe (A/B/C/D/E/H/L réels)
         if ((da.indexed && sb.prefix) || (sb.indexed && da.prefix)) {
-            ctx.error("(IX+d) incompatible avec IXH/IXL/IYH/IYL"); return false;
+            ctx.error("(IX+d) incompatible with IXH/IXL/IYH/IYL"); return false;
         }
         uint8_t pfx;
-        if (!mergePrefix(da.prefix, sb.prefix, pfx)) { ctx.error("mélange de préfixes DD/FD"); return false; }
+        if (!mergePrefix(da.prefix, sb.prefix, pfx)) { ctx.error("mixed DD/FD prefixes"); return false; }
         e.prefix(pfx);
         e.op((uint8_t)(0x40 + da.code * 8 + sb.code));
         if (da.indexed) e.disp(ctx.eval(da.disp));
@@ -268,7 +268,7 @@ bool encodeLD(IAsmContext &ctx, const Operand &A, const Operand &B) {
     // LD rr,nn  et  LD rr,(nn) / LD (nn),rr
     if (A.kind == Operand::Kind::Reg && is16bit(A.reg) && A.reg != Reg::AF) {
         uint8_t p = 0; int rr = reg16code(A.reg, p);
-        if (rr < 0) { ctx.error("registre 16 bits invalide"); return false; }
+        if (rr < 0) { ctx.error("invalid 16-bit register"); return false; }
         if (B.kind == Operand::Kind::Imm) { // LD rr,nn
             e.prefix(p); e.op((uint8_t)(0x01 + rr * 16)); e.imm16(ctx.eval(B.expr)); return true;
         }
@@ -285,7 +285,7 @@ bool encodeLD(IAsmContext &ctx, const Operand &A, const Operand &B) {
         else { e.op(0xED); e.op((uint8_t)(0x43 + rr * 16)); }
         e.imm16(ctx.eval(A.expr)); return true;
     }
-    ctx.error("forme de LD non reconnue");
+    ctx.error("unrecognized LD form");
     return false;
 }
 
@@ -301,7 +301,7 @@ bool encodeIncDec(IAsmContext &ctx, Mnemo m, const Operand &A) {
         return true;
     }
     R8 t = asR8(A);
-    if (!t.ok) { ctx.error("opérande INC/DEC invalide"); return false; }
+    if (!t.ok) { ctx.error("invalid INC/DEC operand"); return false; }
     e.prefix(t.prefix);
     e.op((uint8_t)((m == Mnemo::INC ? 0x04 : 0x05) + t.code * 8));
     if (t.indexed) e.disp(ctx.eval(t.disp));
@@ -311,7 +311,7 @@ bool encodeIncDec(IAsmContext &ctx, Mnemo m, const Operand &A) {
 // ADD/ADC/SBC 16 bits
 bool encode16Add(IAsmContext &ctx, Mnemo m, const Operand &A, const Operand &B) {
     Emitter e{ctx};
-    if (B.kind != Operand::Kind::Reg) { ctx.error("ADD/ADC/SBC 16 bits : 2e opérande invalide"); return false; }
+    if (B.kind != Operand::Kind::Reg) { ctx.error("16-bit ADD/ADC/SBC: invalid 2nd operand"); return false; }
     uint8_t aprefix = 0;
     if (A.reg == Reg::IX) aprefix = 0xDD; else if (A.reg == Reg::IY) aprefix = 0xFD;
     // code du registre source (slot rr)
@@ -320,16 +320,16 @@ bool encode16Add(IAsmContext &ctx, Mnemo m, const Operand &A, const Operand &B) 
         case Reg::BC: rr = 0; break;
         case Reg::DE: rr = 1; break;
         case Reg::SP: rr = 3; break;
-        case Reg::HL: if (A.reg != Reg::HL) { ctx.error("appariement 16 bits invalide"); return false; } rr = 2; break;
-        case Reg::IX: if (A.reg != Reg::IX) { ctx.error("appariement 16 bits invalide"); return false; } rr = 2; break;
-        case Reg::IY: if (A.reg != Reg::IY) { ctx.error("appariement 16 bits invalide"); return false; } rr = 2; break;
-        default: ctx.error("registre 16 bits invalide"); return false;
+        case Reg::HL: if (A.reg != Reg::HL) { ctx.error("invalid 16-bit register pairing"); return false; } rr = 2; break;
+        case Reg::IX: if (A.reg != Reg::IX) { ctx.error("invalid 16-bit register pairing"); return false; } rr = 2; break;
+        case Reg::IY: if (A.reg != Reg::IY) { ctx.error("invalid 16-bit register pairing"); return false; } rr = 2; break;
+        default: ctx.error("invalid 16-bit register"); return false;
     }
     if (m == Mnemo::ADD) {
         e.prefix(aprefix); e.op((uint8_t)(0x09 + rr * 16)); return true;
     }
     // ADC/SBC HL,rr : seulement HL, préfixe ED
-    if (A.reg != Reg::HL) { ctx.error("ADC/SBC 16 bits : uniquement HL"); return false; }
+    if (A.reg != Reg::HL) { ctx.error("16-bit ADC/SBC: HL only"); return false; }
     e.op(0xED);
     e.op((uint8_t)((m == Mnemo::ADC ? 0x4A : 0x42) + rr * 16));
     return true;
@@ -359,7 +359,7 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
 
         case Mnemo::PUSH: case Mnemo::POP: {
             uint8_t p = 0; int rr = reg16codeAF(A.reg, p);
-            if (A.kind != Operand::Kind::Reg || rr < 0) { ctx.error("PUSH/POP : registre invalide"); return false; }
+            if (A.kind != Operand::Kind::Reg || rr < 0) { ctx.error("PUSH/POP: invalid register"); return false; }
             e.prefix(p);
             e.op((uint8_t)((in.mnemo == Mnemo::PUSH ? 0xC5 : 0xC1) + rr * 16));
             return true;
@@ -404,7 +404,7 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
                 e.op((uint8_t)(0xC2 + cc * 8)); e.imm16(ctx.eval(B.expr)); return true;
             }
             if (A.kind == Operand::Kind::Imm) { e.op(0xC3); e.imm16(ctx.eval(A.expr)); return true; }
-            ctx.error("forme de JP non reconnue"); return false;
+            ctx.error("unrecognized JP form"); return false;
         }
         case Mnemo::CALL: {
             if (A.kind == Operand::Kind::Cond) {
@@ -412,12 +412,12 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
                 e.op((uint8_t)(0xC4 + cc * 8)); e.imm16(ctx.eval(B.expr)); return true;
             }
             if (A.kind == Operand::Kind::Imm) { e.op(0xCD); e.imm16(ctx.eval(A.expr)); return true; }
-            ctx.error("forme de CALL non reconnue"); return false;
+            ctx.error("unrecognized CALL form"); return false;
         }
         case Mnemo::RET: {
             if (A.kind == Operand::Kind::None) { e.op(0xC9); return true; }
             if (A.kind == Operand::Kind::Cond) { e.op((uint8_t)(0xC0 + condcode(A.cc) * 8)); return true; }
-            ctx.error("forme de RET non reconnue"); return false;
+            ctx.error("unrecognized RET form"); return false;
         }
         case Mnemo::JR: case Mnemo::DJNZ: {
             const Operand *tgt; int base;
@@ -425,29 +425,29 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
             if (in.mnemo == Mnemo::DJNZ) { tgt = &A; base = 0x10; }
             else if (A.kind == Operand::Kind::Cond) {
                 cc = condcode(A.cc);
-                if (cc > 3) { ctx.error("JR : condition non relative (NZ/Z/NC/C uniquement)"); return false; }
+                if (cc > 3) { ctx.error("JR: non-relative condition (NZ/Z/NC/C only)"); return false; }
                 tgt = &B; base = 0x20 + cc * 8;
             } else { tgt = &A; base = 0x18; }
-            if (tgt->kind != Operand::Kind::Imm) { ctx.error("cible relative attendue"); return false; }
+            if (tgt->kind != Operand::Kind::Imm) { ctx.error("expected relative target"); return false; }
             int64_t target = ctx.eval(tgt->expr);
             int64_t disp = target - (int64_t)(pc0 + 2);
             // erreur valeur-dépendante : on émet quand même 2 octets (taille stable en 2 passes)
-            if (disp < -128 || disp > 127) ctx.error("saut relatif hors de portée (-128..127)");
+            if (disp < -128 || disp > 127) ctx.error("relative jump out of range (-128..127)");
             e.op((uint8_t)base); e.disp(disp); return true;
         }
 
         case Mnemo::RST: {
-            if (A.kind != Operand::Kind::Imm) { ctx.error("RST : vecteur attendu"); return false; }
+            if (A.kind != Operand::Kind::Imm) { ctx.error("RST: expected vector"); return false; }
             int64_t n = ctx.eval(A.expr);
-            if (n < 0 || n > 0x38 || (n & 7)) ctx.error("RST : vecteur invalide (00,08,...,38)");
+            if (n < 0 || n > 0x38 || (n & 7)) ctx.error("RST: invalid vector (00,08,...,38)");
             e.op((uint8_t)(0xC7 + (n & 0x38))); return true;
         }
         case Mnemo::IM: {
-            if (A.kind != Operand::Kind::Imm) { ctx.error("IM : mode attendu"); return false; }
+            if (A.kind != Operand::Kind::Imm) { ctx.error("IM: expected mode"); return false; }
             int64_t n = ctx.eval(A.expr);
             uint8_t op = 0x46;
             if (n == 1) op = 0x56; else if (n == 2) op = 0x5E;
-            else if (n != 0) ctx.error("IM : mode invalide (0/1/2)");
+            else if (n != 0) ctx.error("IM: invalid mode (0/1/2)");
             e.op(0xED); e.op(op); return true;
         }
 
@@ -461,7 +461,7 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
                 (B.reg == Reg::HL || B.reg == Reg::IX || B.reg == Reg::IY)) {
                 uint8_t p = 0; reg16code(B.reg, p); e.prefix(p); e.op(0xE3); return true;
             }
-            ctx.error("forme de EX non reconnue"); return false;
+            ctx.error("unrecognized EX form"); return false;
         }
 
         case Mnemo::IN: {
@@ -470,10 +470,10 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
             }
             if (A.kind == Operand::Kind::Reg && B.kind == Operand::Kind::RegInd && B.reg == Reg::C) {
                 int c = reg8code(A.reg);
-                if (c < 0) { ctx.error("IN r,(C) : registre invalide"); return false; }
+                if (c < 0) { ctx.error("IN r,(C): invalid register"); return false; }
                 e.op(0xED); e.op((uint8_t)(0x40 + c * 8)); return true; // IN r,(C)
             }
-            ctx.error("forme de IN non reconnue"); return false;
+            ctx.error("unrecognized IN form"); return false;
         }
         case Mnemo::OUT: {
             if (A.kind == Operand::Kind::MemImm && B.kind == Operand::Kind::Reg && B.reg == Reg::A) {
@@ -481,14 +481,19 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
             }
             if (A.kind == Operand::Kind::RegInd && A.reg == Reg::C && B.kind == Operand::Kind::Reg) {
                 int c = reg8code(B.reg);
-                if (c < 0) { ctx.error("OUT (C),r : registre invalide"); return false; }
+                if (c < 0) { ctx.error("OUT (C),r: invalid register"); return false; }
                 e.op(0xED); e.op((uint8_t)(0x41 + c * 8)); return true; // OUT (C),r
             }
-            ctx.error("forme de OUT non reconnue"); return false;
+            if (A.kind == Operand::Kind::RegInd && A.reg == Reg::C && B.kind == Operand::Kind::Imm) {
+                // OUT (C),0 : opcode non documenté (ED 71), seule forme immédiate encodable.
+                if (ctx.eval(B.expr) != 0) { ctx.error("OUT (C),n: only 0 is encodable (undocumented)"); return false; }
+                e.op(0xED); e.op(0x71); return true;
+            }
+            ctx.error("unrecognized OUT form"); return false;
         }
 
         default:
-            ctx.error("mnémonique non géré");
+            ctx.error("unhandled mnemonic");
             return false;
     }
 }

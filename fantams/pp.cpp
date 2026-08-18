@@ -3,7 +3,9 @@
 #include "expr.h"
 #include "z80.h"
 
+#include <algorithm>
 #include <cctype>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
@@ -34,12 +36,40 @@ bool isIdentifier(const std::string &s) {
 // Mots-clés qui ne peuvent jamais être un label — même liste que parser.cpp/asm.cpp.
 // Sert ici à distinguer "ident:" (label collé, style courant) de "ei:ret" (deux
 // instructions collées sans espace : "ei" est un mnémo connu, pas un label).
+// Retire les commentaires bloc /* ... */ (peuvent s'étendre sur plusieurs lignes),
+// hors chaînes/caractères. Les '\n' à l'intérieur du bloc sont préservés pour ne
+// pas décaler la numérotation des lignes dans les diagnostics.
+std::string stripBlockComments(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    bool inStr = false; char q = 0;
+    for (size_t i = 0; i < s.size(); ) {
+        char c = s[i];
+        if (inStr) { out += c; if (c == q) inStr = false; ++i; continue; }
+        if (c == '"' || c == '\'') { inStr = true; q = c; out += c; ++i; continue; }
+        if (c == '/' && i + 1 < s.size() && s[i + 1] == '*') {
+            size_t j = s.find("*/", i + 2);
+            size_t end = (j == std::string::npos) ? s.size() : j + 2;
+            for (size_t k = i; k < end; ++k) if (s[k] == '\n') out += '\n';
+            i = end;
+            continue;
+        }
+        out += c; ++i;
+    }
+    return out;
+}
 bool isReservedWord(const std::string &upperTok) {
     if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
     static const std::set<std::string> kw = {
         "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
         "DS", "DEFS", "RMB", "EQU",
         "BUILDSNA", "BANKSET", "NOLIST", "LIST",
+        // mots-clés du préprocesseur lui-même (sinon "LET N = 3", "REPEAT 3,i", etc.
+        // sont lus comme un label collé "LET"/"REPEAT" suivi du reste).
+        "LET", "IF", "IFDEF", "IFNDEF", "ELSE", "ELSEIF", "ENDIF",
+        "MACRO", "ENDM", "MEND", "REPEAT", "REND", "WHILE", "WEND",
+        "MODULE", "ENDMODULE", "STRUCT", "ENDSTRUCT", "ENDS",
+        "INCLUDE", "INCBIN", "READ", "@@EXPORT",
     };
     return kw.count(upperTok) != 0;
 }
@@ -64,14 +94,30 @@ std::string restAfterFirst(const std::string &s) {
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
 }
-// Sépare un éventuel label de tête "ident:" du reste.
-void peelLabel(const std::string &code, std::string &label, std::string &rest) {
+// Sépare un éventuel label de tête "ident:" du reste — ou "ident" seul (sans ':')
+// si "ident" n'est pas un mnémo/directive connu (même règle qu'asm.cpp/parser.cpp :
+// nécessaire pour que MACRO/REPEAT/MODULE reconnaissent aussi les labels sans ':').
+// `isMacro` (optionnel) : un nom de macro DÉFINI PAR L'UTILISATEUR (donc inconnu de
+// isReservedWord, statique) doit aussi être exclu — sinon un appel "SETA 42" sans ':'
+// est lu comme un label "SETA" au lieu d'un appel de macro.
+void peelLabel(const std::string &code, std::string &label, std::string &rest,
+              const std::function<bool(const std::string &)> &isMacro = nullptr) {
     size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
     if (p > 0) {
         size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
         if (q < code.size() && code[q] == ':') {
             label = code.substr(0, p);
             rest = trim(code.substr(q + 1));
+            return;
+        }
+        std::string tok = upper(code.substr(0, p));
+        if (!isReservedWord(tok) && !(isMacro && isMacro(tok))) {
+            // exception : "nom MACRO params" (forme alternative de déclaration) — "nom"
+            // n'est pas un label, c'est le macro en cours de définition (son nom n'est pas
+            // encore dans `macros`). Laisse la ligne intacte pour la détection kw/secondUp.
+            if (upper(firstToken(trim(code.substr(p)))) == "MACRO") { label.clear(); rest = code; return; }
+            label = code.substr(0, p);
+            rest = trim(code.substr(p));
             return;
         }
     }
@@ -230,7 +276,8 @@ private:
         result.warnings.push_back({sl.file, sl.line, msg});
     }
 
-    std::vector<SrcLine> splitLines(const std::string &content, const std::string &file) {
+    std::vector<SrcLine> splitLines(const std::string &rawContent, const std::string &file) {
+        std::string content = stripBlockComments(rawContent);
         std::vector<SrcLine> out; std::string cur; int ln = 1;
         for (size_t i = 0; i <= content.size(); ++i) {
             char c = (i < content.size()) ? content[i] : '\n';
@@ -266,9 +313,9 @@ private:
             if (text[i] == '{') {
                 size_t j = i + 1; int d = 1;
                 while (j < text.size() && d) { if (text[j] == '{') ++d; else if (text[j] == '}') --d; if (d) ++j; }
-                if (j >= text.size()) { error(sl, "accolade '{' non fermée"); out += text.substr(i); break; }
+                if (j >= text.size()) { error(sl, "unclosed brace '{'"); out += text.substr(i); break; }
                 std::string inner = trim(text.substr(i + 1, j - i - 1));
-                if (inner.empty()) error(sl, "substitution vide {}");
+                if (inner.empty()) error(sl, "empty substitution '{}'");
                 else if (inner[0] == '=') {
                     auto r = evalPP(trim(inner.substr(1)), env);
                     if (!r.ok) error(sl, r.error); else out += std::to_string(r.value);
@@ -312,8 +359,8 @@ private:
                 first = false;
             }
         for (const auto &ident : glued)
-            warning(src, "'" + ident + ":' collé sans espace : style non canonique (ambigu avec un label) — "
-                         "préférer '" + ident + " : ...' ou '" + ident + " ...' sur sa propre ligne");
+            warning(src, "'" + ident + ":' with no space is non-canonical style (ambiguous with a label) — "
+                         "prefer '" + ident + " : ...' or put '" + ident + "' on its own line");
     }
 
     // Collecte les labels définis (par "ident:") dans un corps, hors @@export.
@@ -342,7 +389,7 @@ private:
                 if (moduleDepth > 0) continue;
             }
             std::string code = trim(stripComment(l.text));
-            std::string label, rest; peelLabel(code, label, rest);
+            std::string label, rest; peelLabel(code, label, rest, [&](const std::string &n) { return macros.count(n) != 0; });
             if (!label.empty() && !exported.count(label) && (!onlyAtPrefixed || label[0] == '@')) {
                 bool seen = false; for (auto &x : locals) if (x == label) seen = true;
                 if (!seen) locals.push_back(label);
@@ -388,11 +435,11 @@ private:
 
     void expandMacro(const Macro &m, const std::string &argstr,
                      const SrcLine &sl, int depth) {
-        if (depth > 200) { error(sl, "profondeur de macro excessive (récursion ?)"); return; }
+        if (depth > 200) { error(sl, "macro nesting too deep (recursive?)"); return; }
         std::vector<std::string> args = splitTopLevel(argstr, ',');
         if (args.size() != m.params.size()) {
-            error(sl, "macro " + m.name + " : " + std::to_string(m.params.size()) +
-                          " paramètre(s) attendu(s), " + std::to_string(args.size()) + " fourni(s)");
+            error(sl, "macro '" + m.name + "': expected " + std::to_string(m.params.size()) +
+                          " argument(s), got " + std::to_string(args.size()));
             return;
         }
         Env ne;
@@ -421,7 +468,7 @@ private:
 
     void defineStruct(const std::string &sname, const std::vector<SrcLine> &body,
                       const Env &env, const SrcLine &raw) {
-        if (structs_.count(upper(sname))) { error(raw, "STRUCT redéfinie : " + sname); return; }
+        if (structs_.count(upper(sname))) { error(raw, "struct redefined: '" + sname + "'"); return; }
         StructDef def; def.name = sname; int off = 0;
         for (const auto &l : body) {
             std::string code = trim(substitute(stripComment(l.text), env, l));
@@ -438,13 +485,13 @@ private:
                     f.size = 2 * n;
                 } else { // DS / DEFS / RMB
                     auto r = ops.empty() ? expr::Result{} : evalPP(ops[0], env);
-                    if (!r.ok) { error(l, "STRUCT : taille de champ DS non résoluble"); f.size = 0; }
+                    if (!r.ok) { error(l, "struct: DS field size not resolvable"); f.size = 0; }
                     else f.size = (int)r.value;
                 }
             } else if (structs_.count(U)) {
                 f.nested = true; f.size = structs_[U].size;
             } else {
-                error(l, "STRUCT : directive de champ inconnue '" + f.directive + "'");
+                error(l, "struct: unknown field directive '" + f.directive + "'");
                 continue;
             }
             f.offset = off; off += f.size;
@@ -473,8 +520,8 @@ private:
         std::string instance = firstToken(aft2);
         std::string overText = restAfterFirst(aft2);
         auto it = structs_.find(upper(type));
-        if (it == structs_.end()) { error(raw, "STRUCT inconnue à instancier : " + type); return; }
-        if (instance.empty()) { error(raw, "instanciation STRUCT sans nom"); return; }
+        if (it == structs_.end()) { error(raw, "unknown struct to instantiate: '" + type + "'"); return; }
+        if (instance.empty()) { error(raw, "struct instantiation without a name"); return; }
         const StructDef &d = it->second;
         auto overrides = splitTopLevel(overText, ',');
         emit(instance + ":", raw);
@@ -507,7 +554,7 @@ private:
             std::string code = trim(sub);
             if (code.empty()) { ++i; continue; }
 
-            std::string label, rest; peelLabel(code, label, rest);
+            std::string label, rest; peelLabel(code, label, rest, [&](const std::string &n) { return macros.count(n) != 0; });
             std::string kw = upper(firstToken(rest));
             std::string secondUp = upper(firstToken(restAfterFirst(rest)));
 
@@ -518,7 +565,7 @@ private:
                 std::string path = parts.empty() ? "" : parts[0];
                 if (path.size() >= 2 && (path[0] == '"' || path[0] == '\'')) path = path.substr(1, path.size() - 2);
                 std::string content;
-                if (!files || !files(path, content)) error(raw, "include introuvable : " + path);
+                if (!files || !files(path, content)) error(raw, "include not found: '" + path + "'");
                 else run(splitLines(content, path), env, depth + 1);
                 ++i; continue;
             }
@@ -531,7 +578,7 @@ private:
                 if (eq != std::string::npos) { name = trim(a.substr(0, eq)); ev = trim(a.substr(eq + 1)); }
                 else { name = firstToken(a); ev = restAfterFirst(a); }
                 auto r = evalPP(ev, env);
-                if (!isIdentifier(name)) error(raw, "LET : nom de variable invalide");
+                if (!isIdentifier(name)) error(raw, "LET: invalid variable name");
                 else if (!r.ok) error(raw, r.error);
                 else ppvars[name] = r.value;
                 ++i; continue;
@@ -540,7 +587,7 @@ private:
             // --- IF / IFDEF / IFNDEF ---
             if (kw == "IF" || kw == "IFDEF" || kw == "IFNDEF") {
                 int endif = findMatching(lines, i, {"IF", "IFDEF", "IFNDEF"}, {"ENDIF"});
-                if (endif < 0) { error(raw, "IF sans ENDIF"); return; }
+                if (endif < 0) { error(raw, "IF without ENDIF"); return; }
                 // bornes des branches (profondeur 0)
                 std::vector<int> bounds = {i};
                 int d = 1;
@@ -574,14 +621,14 @@ private:
             // --- REPEAT count[,var] ... REND ---
             if (kw == "REPEAT") {
                 int rend = findMatching(lines, i, {"REPEAT"}, {"REND"});
-                if (rend < 0) { error(raw, "REPEAT sans REND"); return; }
+                if (rend < 0) { error(raw, "REPEAT without REND"); return; }
                 if (!label.empty()) emit(label + ":", raw);
                 auto parts = splitTopLevel(restAfterFirst(rest), ',');
                 auto r = parts.empty() ? expr::Result{} : evalPP(parts[0], env);
                 std::string var = parts.size() > 1 ? trim(parts[1]) : "";
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + rend);
-                if (!r.ok) error(raw, "REPEAT : " + (parts.empty() ? "compteur manquant" : r.error));
-                else if (r.value < 0 || r.value > 1000000) error(raw, "REPEAT : compteur hors limites");
+                if (!r.ok) error(raw, "REPEAT: " + (parts.empty() ? "missing counter" : r.error));
+                else if (r.value < 0 || r.value > 1000000) error(raw, "REPEAT: counter out of range");
                 // Compteur 1-based (comme rasm) : "index" vaut 1 à la 1re itération, pas 0.
                 else for (int k = 1; k <= r.value; ++k) {
                     Env ne = env; if (!var.empty()) ne.locals[var] = k;
@@ -593,16 +640,16 @@ private:
             // --- WHILE expr ... WEND ---
             if (kw == "WHILE") {
                 int wend = findMatching(lines, i, {"WHILE"}, {"WEND"});
-                if (wend < 0) { error(raw, "WHILE sans WEND"); return; }
+                if (wend < 0) { error(raw, "WHILE without WEND"); return; }
                 if (!label.empty()) emit(label + ":", raw);
                 std::string condRaw = restAfterFirst(rest);
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + wend);
                 long guard = 0;
                 for (;;) {
                     auto r = evalPP(substitute(condRaw, env, raw), env);
-                    if (!r.ok) { error(raw, "WHILE : " + r.error); break; }
+                    if (!r.ok) { error(raw, "WHILE: " + r.error); break; }
                     if (r.value == 0) break;
-                    if (++guard > 1000000) { error(raw, "WHILE : trop d'itérations"); break; }
+                    if (++guard > 1000000) { error(raw, "WHILE: too many iterations"); break; }
                     run(renameLocals(body, ++uid), env, depth);
                 }
                 i = wend + 1; continue;
@@ -611,14 +658,14 @@ private:
             // --- définition de macro : "MACRO name p.." ou "name MACRO p.." ---
             if (kw == "MACRO" || secondUp == "MACRO") {
                 int endm = findMatching(lines, i, {"MACRO"}, {"ENDM", "MEND"});
-                if (endm < 0) { error(raw, "MACRO sans ENDM"); return; }
+                if (endm < 0) { error(raw, "MACRO without ENDM"); return; }
                 Macro m;
                 std::string decl;
                 if (kw == "MACRO") { m.name = firstToken(restAfterFirst(rest)); decl = restAfterFirst(restAfterFirst(rest)); }
                 else { m.name = firstToken(rest); decl = restAfterFirst(restAfterFirst(rest)); }
                 for (auto &p : splitTopLevel(decl, ',')) if (!p.empty()) m.params.push_back(p);
                 for (int j = i + 1; j < endm; ++j) m.body.push_back(lines[j]);
-                if (m.name.empty()) error(raw, "MACRO sans nom");
+                if (m.name.empty()) error(raw, "MACRO without a name");
                 else macros[upper(m.name)] = m;
                 i = endm + 1; continue;
             }
@@ -638,8 +685,15 @@ private:
                     if (kw2 == "MODULE" || kw2 == "ENDMODULE") { endIdx = j; break; }
                 }
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + endIdx);
-                std::string prefix = mname + "_";
+                // Séparateur '.' (pas '_' comme rasm) : cohérent avec le mécanisme des labels
+                // locaux ".nom" (asm.cpp), qui qualifie déjà par le label global précédent —
+                // ici ce "global précédent" devient le nom renommé "module.label", donnant
+                // naturellement "module.label.local" sans traitement spécial. Les labels
+                // locaux (".nom") ne sont donc PAS renommés ici : asm.cpp s'en charge lui-même.
+                std::string prefix = mname + ".";
                 auto names = collectLabels(body, /*skipNestedModule=*/true);
+                names.erase(std::remove_if(names.begin(), names.end(),
+                            [](const std::string &n) { return !n.empty() && n[0] == '.'; }), names.end());
                 auto scoped = renameScope(body, names, [&](const std::string &n) { return prefix + n; });
                 run(scoped, env, depth);
                 i = endIdx; continue; // ne consomme pas la ligne de fin : rejouée (OFF/ENDMODULE ou MODULE suivant)
@@ -649,7 +703,7 @@ private:
             if (kw == "STRUCT") {
                 if (countTokens(restAfterFirst(rest)) == 1) {
                     int ends = findMatching(lines, i, {"STRUCT"}, {"ENDSTRUCT", "ENDS"});
-                    if (ends < 0) { error(raw, "STRUCT sans ENDSTRUCT"); return; }
+                    if (ends < 0) { error(raw, "STRUCT without ENDSTRUCT"); return; }
                     std::string sname = firstToken(restAfterFirst(rest));
                     std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + ends);
                     defineStruct(sname, body, env, raw);
