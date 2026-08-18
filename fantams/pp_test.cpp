@@ -34,6 +34,18 @@ static void chkErr(const char *desc, const std::string &src) {
     else ++g_pass;
 }
 
+// Vérifie le résultat ET la présence (ou non) d'un avertissement.
+static void chkWarn(const char *desc, const std::string &src, const std::string &expected, bool expectWarning) {
+    pp::Result r = pp::preprocess(src, "test.asm", provider);
+    std::string got = r.dump();
+    bool hasWarn = !r.warnings.empty();
+    if (!r.ok || got != expected || hasWarn != expectWarning) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s : ok=%d warnings=%zu (attendu=%d)\n", desc, r.ok, r.warnings.size(), expectWarning);
+        printf("    attendu:\n%s\n    obtenu:\n%s\n", expected.c_str(), got.c_str());
+    } else ++g_pass;
+}
+
 int main() {
     printf("Tests préprocesseur\n");
 
@@ -44,8 +56,8 @@ int main() {
     chk("LET + subst", "LET N = 3\n  ld a,{N}\n", "ld a,3\n");
     chk("subst expr", "LET N = 3\n  ld a,{=N*2+1}\n", "ld a,7\n");
 
-    // REPEAT avec index (0-based)
-    chk("REPEAT", "REPEAT 3, i\n  ld a,{i}\nREND\n", "ld a,0\nld a,1\nld a,2\n");
+    // REPEAT avec index (1-based, comme rasm : {i} vaut 1 à la 1re itération)
+    chk("REPEAT", "REPEAT 3, i\n  ld a,{i}\nREND\n", "ld a,1\nld a,2\nld a,3\n");
     chk("REPEAT expr count", "LET n=2\nREPEAT n\n  nop\nREND\n", "nop\nnop\n");
 
     // IF / ELSE / ELSEIF (PP-strict)
@@ -65,20 +77,28 @@ int main() {
         "ADDXY MACRO x,y\n  ld hl,{=x+y}\nENDM\n  ADDXY 10,20\n",
         "ld hl,30\n");
 
-    // auto-local : le label est unique par invocation
-    chk("MACRO auto-local",
+    // auto-local : seul un label préfixé par '@' est unique par invocation (convention
+    // rasm) ; un label ordinaire n'est PAS renommé (une vraie collision, détectée par
+    // l'assembleur si réutilisé, reste possible — comme chez rasm).
+    chk("MACRO auto-local (@ préfixé)",
+        "MACRO DELAY\n@loop: djnz @loop\nENDM\n  DELAY\n  DELAY\n",
+        "@loop__1: djnz @loop__1\n@loop__2: djnz @loop__2\n");
+    chk("MACRO label ordinaire non renommé",
         "MACRO DELAY\nloop: djnz loop\nENDM\n  DELAY\n  DELAY\n",
-        "loop__1: djnz loop__1\nloop__2: djnz loop__2\n");
+        "loop: djnz loop\nloop: djnz loop\n");
 
-    // @@export : le label reste global
+    // @@export : un label @ reste global malgré le préfixe
     chk("MACRO export",
-        "MACRO M\n@@export total\ntotal: nop\nloc: nop\nENDM\n  M\n",
-        "total: nop\nloc__1: nop\n");
+        "MACRO M\n@@export @total\n@total: nop\n@loc: nop\nENDM\n  M\n",
+        "@total: nop\n@loc__1: nop\n");
 
-    // REPEAT : labels uniques par itération
-    chk("REPEAT auto-local",
+    // REPEAT : seuls les labels @ sont uniques par itération
+    chk("REPEAT auto-local (@ préfixé)",
+        "REPEAT 2\n@lab: nop\nREND\n",
+        "@lab__1: nop\n@lab__2: nop\n");
+    chk("REPEAT label ordinaire non renommé",
         "REPEAT 2\nlab: nop\nREND\n",
-        "lab__1: nop\nlab__2: nop\n");
+        "lab: nop\nlab: nop\n");
 
     // WHILE piloté par variable PP
     chk("WHILE",
@@ -105,9 +125,13 @@ int main() {
     chk("MODULE fallback global",
         "MODULE m\nfoo: call ext\nENDMODULE\n",
         "m_foo: call ext\n");
-    chk("MODULE imbriqué",
-        "MODULE a\nMODULE b\nx: nop\nENDMODULE\ny: jp x\nENDMODULE\n",
-        "a_b_x: nop\na_y: jp x\n"); // x défini dans b, non visible au niveau a -> reste global
+    // rasm ne cumule PAS les MODULE : "MODULE b" remplace "MODULE a" (pas de préfixe a_b_).
+    chk("MODULE switch (pas de nesting)",
+        "MODULE a\nz: nop\nMODULE b\nx: nop\nENDMODULE\ny: jp x\n",
+        "a_z: nop\nb_x: nop\ny: jp x\n"); // y est hors module -> x (non renommé) reste global
+    chk("MODULE OFF",
+        "MODULE a\nz: nop\nMODULE OFF\ny: nop\n",
+        "a_z: nop\ny: nop\n");
 
     // STRUCT : déclaration -> offsets + sizeof (EQU portables)
     chk("STRUCT decl",
@@ -140,6 +164,13 @@ int main() {
     chk("colon mnémo 0-op", "nop : ret\n", "nop\n\tret\n");
     chk("colon dans chaîne protégé", "  db \"a:b\" : nop\n", "db \"a:b\"\n\tnop\n");
     chk("colon dans (ix+d)", "  ld a,(ix+0) : ret\n", "ld a,(ix+0)\n\tret\n");
+
+    // "mnémo:mnémo" collé (style non canonique, mais rasm le découpe quand même en 2
+    // instructions car "ei"/"ret" sont des mnémos connus, pas des labels) -> avertissement.
+    chkWarn("mnémo:mnémo collé", "ei:ret\n", "ei\n\tret\n", true);
+    chkWarn("mnémo: mnémo (espace après)", "ei: ret\n", "ei\n\tret\n", true);
+    chkWarn("mnémo:mnémo inversé", "ret:ei\n", "ret\n\tei\n", true);
+    chkWarn("mnémo : mnémo (espace avant, pas d'avertissement)", "ret : ei\n", "ret\n\tei\n", false);
 
     // push/pop multi-registres -> une instruction par registre
     chk("push multi", "  push af,bc,de\n", "push af\n\tpush bc\n\tpush de\n");

@@ -23,6 +23,7 @@ struct SrcLine {
     std::string text;
     std::string file;
     int line = 0;
+    bool col0 = false;   // true si, dans le fichier source d'origine, la ligne commençait en colonne 1
 };
 
 // Fourniture du contenu d'un fichier inclus (injectée : testable, WASM-friendly).
@@ -39,6 +40,7 @@ struct Result {
     bool ok = true;
     std::vector<SrcLine> lines;       // source expansée, plate
     std::vector<Diagnostic> errors;
+    std::vector<Diagnostic> warnings; // bonnes pratiques (non bloquant), ex: "ei:ret" collé
     std::string dump() const;         // texte pour -E (lignes jointes par \n)
 };
 

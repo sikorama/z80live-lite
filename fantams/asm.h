@@ -20,6 +20,7 @@ struct SourceLine {
     std::string text;
     std::string file;
     int line = 0;
+    bool col0 = false;   // true si, dans la source d'origine, la ligne commençait en colonne 1 (sans indentation)
 };
 
 struct Diagnostic {
@@ -35,6 +36,7 @@ struct Output {
     uint16_t runAddress = 0;                    // point d'entrée (directive RUN, sinon = loadAddress)
     std::map<std::string, int64_t> symbols;
     std::vector<Diagnostic> errors;
+    std::vector<Diagnostic> warnings;          // bonnes pratiques (non bloquant) : label sans ':', instruction en colonne 1...
     std::vector<uint8_t> image;                // image mémoire 64K complète (pour SNA)
 };
 

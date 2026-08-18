@@ -18,6 +18,7 @@ struct Result {
     std::string error;
 
     std::string label;            // label de tête (sans ':'), ou vide
+    bool labelHasColon = true;    // false si `label` a été déduit sans ':' (forme tolérée)
 
     bool isInstruction = false;   // true si mnémonique Z80 reconnu -> `instr` valide
     std::string mnemonic;         // mnémonique/directive en MAJUSCULES

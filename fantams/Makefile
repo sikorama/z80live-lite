@@ -11,8 +11,8 @@ all: z80_test pp_test parser_test asm_test sna_test ppdump fantams
 z80_test: z80.cpp z80_test.cpp z80.h
 	$(CXX) $(CXXFLAGS) z80.cpp z80_test.cpp -o $@
 
-pp_test: pp.cpp expr.cpp pp_test.cpp pp.h expr.h
-	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp pp_test.cpp -o $@
+pp_test: pp.cpp expr.cpp z80.cpp pp_test.cpp pp.h expr.h z80.h
+	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp z80.cpp pp_test.cpp -o $@
 
 parser_test: parser.cpp z80.cpp parser_test.cpp parser.h z80.h
 	$(CXX) $(CXXFLAGS) parser.cpp z80.cpp parser_test.cpp -o $@
@@ -23,8 +23,8 @@ asm_test: asm.cpp parser.cpp z80.cpp expr.cpp asm_test.cpp asm.h
 sna_test: sna.cpp sna_test.cpp sna.h
 	$(CXX) $(CXXFLAGS) sna.cpp sna_test.cpp -o $@
 
-ppdump: pp.cpp expr.cpp pp_main.cpp pp.h expr.h
-	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp pp_main.cpp -o $@
+ppdump: pp.cpp expr.cpp z80.cpp pp_main.cpp pp.h expr.h z80.h
+	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp z80.cpp pp_main.cpp -o $@
 
 fantams: $(CORE) asm_main.cpp asm.h pp.h
 	$(CXX) $(CXXFLAGS) $(CORE) asm_main.cpp -o $@

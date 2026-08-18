@@ -44,6 +44,17 @@ static void chkErr(const char *desc, const std::string &src) {
     else ++g_pass;
 }
 
+// Vérifie qu'un avertissement (bonne pratique) est bien émis, sans bloquer l'assemblage.
+static void chkWarn(const char *desc, const std::string &src, bool expectWarning) {
+    asmb::Output o = asmb::assembleText(src, "t.asm");
+    bool hasWarn = !o.warnings.empty();
+    if (!o.ok || hasWarn != expectWarning) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s : ok=%d warnings=%zu (attendu=%d)\n",
+               desc, o.ok, o.warnings.size(), expectWarning);
+    } else ++g_pass;
+}
+
 int main() {
     printf("Tests assembleur 2 passes\n");
 
@@ -80,6 +91,37 @@ int main() {
     chk("ds fill", "  ds 2,0xFF\n", {0xFF, 0xFF});
     chk("db expr", "  db 2*3+1, 1<<4\n", {0x07, 0x10});
     chk("db char", "  db 'A','Z'\n", {0x41, 0x5A});
+
+    // label sans ':' (toléré, comme rasm) tant que le 1er mot n'est pas un mnémo/directive connu
+    chk("label sans ':'", "start\n  ld a,1\n  jp start\n", {0x3E, 0x01, 0xC3, 0x00, 0x00});
+    chkSym("label sans ':' addr", "  org 0x4000\nstart\n  nop\n", "start", 0x4000);
+    // NOLIST/LIST : no-op (contrôle du listing seulement, comme rasm)
+    chk("nolist no-op", "  nolist\n  ld a,1\n  list\n  ld b,2\n", {0x3E, 0x01, 0x06, 0x02});
+    // BUILDSNA/BANKSET : no-op chez fantams (le split sur ':' est fait par pp.cpp en amont ;
+    // ici chaque statement est déjà sur sa propre ligne, comme le reçoit vraiment asm.cpp).
+    chk("BUILDSNA en-tête rasm (no-op)",
+        "BUILDSNA V2\nBANKSET 0\nORG 0x8000\nRUN $\n  ld a,1\n", {0x3E, 0x01}, 0x8000);
+
+    // avertissements de bonne pratique (non bloquants)
+    chkWarn("warn label sans ':'", "start\n  nop\n", true);
+    chkWarn("pas de warn label avec ':'", "start:\n  nop\n", false);
+    chkWarn("warn instruction en colonne 1", "start:\nnop\n", true);
+    chkWarn("pas de warn instruction indentée", "start:\n  nop\n", false);
+
+    // labels locaux ".nom" : qualifiés par le dernier label global (comme rasm) ->
+    // deux ".loop" sous deux globaux différents ne collisionnent pas.
+    chkSym("label local .nom sous 2 globaux distincts (A)",
+        "blockA:\n.loop:\n  nop\nblockB:\n.loop:\n  nop\n", "blockA.loop", 0);
+    chkSym("label local .nom sous 2 globaux distincts (B)",
+        "blockA:\n.loop:\n  nop\nblockB:\n.loop:\n  nop\n", "blockB.loop", 1);
+    chkErr("label local .nom hors contexte -> non résolu",
+        "blockA:\n.loop:\n  nop\n  ret\nblockB:\n  nop\n  ret\nblockC:\n  jp .loop\n");
+    // référence qualifiée explicite "global.local" depuis un autre contexte
+    chkSym("label local référencé via global.local", "blockA:\n.loop:\n  nop\n  jp blockA.loop\n", "blockA.loop", 0);
+
+    // repli insensible à la casse (rasm ne distingue pas la casse) : résolu + avertissement
+    chkWarn("repli casse : résolu avec avertissement", "Foo: nop\n  jp foo\n", true);
+    chkErr("casse : rien à replier -> erreur si vraiment absent", "  jp doesNotExist\n");
 
     // align
     chk("align",

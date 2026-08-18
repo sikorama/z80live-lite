@@ -42,11 +42,34 @@ std::string restAfterFirst(const std::string &s) {
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
 }
-void peelLabel(const std::string &code, std::string &label, std::string &rest) {
+// Mots-clés qui ne peuvent jamais être un label sans ':' — même liste que parser.cpp
+// (mnémoniques Z80 + directives gérées ici). Permet de tolérer "start" (label,
+// sans ':') sans le confondre avec une instruction/directive.
+bool isReservedWord(const std::string &upperTok) {
+    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
+    static const std::set<std::string> kw = {
+        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
+        "DS", "DEFS", "RMB", "EQU",
+        // directives rasm reconnues mais non implémentées (hors périmètre) : gardées
+        // réservées pour échouer proprement plutôt que d'être lues comme un label.
+        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
+    };
+    return kw.count(upperTok) != 0;
+}
+void peelLabel(const std::string &code, std::string &label, std::string &rest, bool *sawColon = nullptr) {
     size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
     if (p > 0) {
         size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
-        if (q < code.size() && code[q] == ':') { label = code.substr(0, p); rest = trim(code.substr(q + 1)); return; }
+        if (q < code.size() && code[q] == ':') {
+            label = code.substr(0, p); rest = trim(code.substr(q + 1));
+            if (sawColon) *sawColon = true;
+            return;
+        }
+        if (!isReservedWord(upper(code.substr(0, p)))) {
+            label = code.substr(0, p); rest = trim(code.substr(p));
+            if (sawColon) *sawColon = false;
+            return;
+        }
     }
     label.clear(); rest = code;
 }
@@ -93,8 +116,9 @@ public:
     Output run(const std::vector<SourceLine> &lines) {
         image_.assign(65536, 0);
         symbols_.clear();
+        ciIndex_.clear();
 
-        pass_ = 1; pc_ = 0; lo_ = 0x10000; hi_ = 0; definedP1_.clear(); equDefs_.clear();
+        pass_ = 1; pc_ = 0; lo_ = 0x10000; hi_ = 0; definedP1_.clear(); equDefs_.clear(); currentGlobal_.clear();
         for (const auto &l : lines) process(l);
 
         // Les labels sont fixés (adresses indépendantes des valeurs). On réévalue
@@ -105,17 +129,18 @@ public:
             for (const auto &d : equDefs_) {
                 int64_t v = evalExpr(d.second);
                 auto it = symbols_.find(d.first);
-                if (it == symbols_.end() || it->second != v) { symbols_[d.first] = v; changed = true; }
+                if (it == symbols_.end() || it->second != v) { setSymbol(d.first, v); changed = true; }
             }
             if (!changed) break;
         }
 
-        pass_ = 2; pc_ = 0; lo_ = 0x10000; hi_ = 0;
+        pass_ = 2; pc_ = 0; lo_ = 0x10000; hi_ = 0; currentGlobal_.clear();
         for (const auto &l : lines) process(l);
 
         Output o;
         o.symbols = symbols_;
         o.errors = errors_;
+        o.warnings = warnings_;
         o.ok = errors_.empty();
         o.image = image_;
         if (hi_ > lo_) {
@@ -143,24 +168,48 @@ public:
 private:
     std::vector<uint8_t> image_;
     std::map<std::string, int64_t> symbols_;
+    std::map<std::string, std::string> ciIndex_; // MAJUSCULES(nom) -> nom exact, pour le repli insensible à la casse
     std::set<std::string> definedP1_;
     std::vector<std::pair<std::string, std::string>> equDefs_; // (nom, texte expr) pour la résolution
     std::vector<Diagnostic> errors_;
+    std::vector<Diagnostic> warnings_;
     int pass_ = 1, pc_ = 0, lo_ = 0, hi_ = 0;
     int run_ = 0; bool hasRun_ = false;
     SourceLine cur_;
     bool evalOk_ = true;
+    // dernier label "global" (non local) rencontré : contexte de qualification des
+    // labels locaux ".nom" (comme rasm : ".nom" == "<global>.nom" — cf. defineLabel/qualify).
+    std::string currentGlobal_;
 
     void push(const std::string &msg) { errors_.push_back({cur_.file, cur_.line, msg}); }
+    // avertissement de bonne pratique (non bloquant) : émis en passe 2 seulement (pas de doublon).
+    void warn(const std::string &msg) { if (pass_ == 2) warnings_.push_back({cur_.file, cur_.line, msg}); }
     // erreur structurelle (signalée dès la passe 1, ne se reproduit pas en passe 2)
     void structErr(const std::string &msg) { if (pass_ == 1) push(msg); }
+
+    // Un label local ".nom" est qualifié par le dernier label global rencontré
+    // (comme rasm : deux ".loop" sous deux labels globaux différents ne collisionnent pas).
+    std::string qualify(const std::string &n) const {
+        return (!n.empty() && n[0] == '.') ? currentGlobal_ + n : n;
+    }
+    void setSymbol(const std::string &n, int64_t v) { symbols_[n] = v; ciIndex_[upper(n)] = n; }
 
     int64_t evalExpr(const std::string &text) {
         evalOk_ = true;
         auto r = expr::eval(text, [&](const std::string &n, int64_t &o) -> bool {
             if (n == "$") { o = pc_ & 0xFFFF; return true; }
-            auto it = symbols_.find(n);
+            std::string qn = qualify(n);
+            auto it = symbols_.find(qn);
             if (it != symbols_.end()) { o = it->second; return true; }
+            // repli insensible à la casse (rasm ne distingue pas la casse des symboles) : on
+            // avertit plutôt que d'échouer silencieusement sur une simple différence de casse.
+            auto cit = ciIndex_.find(upper(qn));
+            if (cit != ciIndex_.end()) {
+                warn("symbole '" + qn + "' non trouvé exactement, utilisation de '" + cit->second +
+                     "' (différence de casse — bonne pratique : utiliser la casse exacte)");
+                o = symbols_[cit->second];
+                return true;
+            }
             return false;
         });
         if (!r.ok) { evalOk_ = false; if (pass_ == 2) push(r.error); return 0; }
@@ -168,12 +217,14 @@ private:
     }
 
     void defineLabel(const std::string &n) {
-        if (pass_ == 1) { if (!definedP1_.insert(n).second) { structErr("symbole déjà défini : " + n); return; } }
-        symbols_[n] = pc_ & 0xFFFF;
+        std::string qn = qualify(n);
+        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("symbole déjà défini : " + qn); return; } }
+        setSymbol(qn, pc_ & 0xFFFF);
     }
     void defineSymbol(const std::string &n, int64_t v) {
-        if (pass_ == 1) { if (!definedP1_.insert(n).second) { structErr("symbole déjà défini : " + n); return; } }
-        symbols_[n] = v;
+        std::string qn = qualify(n);
+        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("symbole déjà défini : " + qn); return; } }
+        setSymbol(qn, v);
     }
 
     void emitByteOrStr(const std::string &p) {
@@ -204,11 +255,19 @@ private:
         std::string code = trim(stripComment(sl.text));
         if (code.empty()) return;
 
-        std::string label, rest; peelLabel(code, label, rest);
+        std::string label, rest; bool labelHasColon = true;
+        peelLabel(code, label, rest, &labelHasColon);
+        if (!label.empty() && !labelHasColon)
+            warn("label sans ':' : '" + label + "' (bonne pratique : écrire '" + label + ":')");
+        // contexte de qualification pour les labels locaux ".nom" sur les lignes suivantes
+        // (un label local ne change pas le contexte : qualify() ne modifie que ceux en '.').
+        if (!label.empty() && label[0] != '.') currentGlobal_ = label;
 
         parser::Result pr = parser::parseLine(code);
         if (pr.isInstruction) {
             if (!label.empty()) defineLabel(label);
+            else if (cur_.col0)
+                warn("instruction '" + pr.mnemonic + "' en colonne 1 : bonne pratique = indenter les instructions (seuls les labels/symboles commencent en colonne 1)");
             z80::encode(*this, pr.instr);
             return;
         }
@@ -217,6 +276,15 @@ private:
         std::string w0 = firstToken(rest), W0 = upper(w0);
         std::string after0 = restAfterFirst(rest);
         std::string W1 = upper(firstToken(after0));
+
+        // contrôle du listing : aucun effet sur le code généré (no-op, comme chez rasm)
+        if (W0 == "NOLIST" || W0 == "LIST") { if (!label.empty()) defineLabel(label); return; }
+
+        // BUILDSNA / BANKSET : en-tête rasm de génération de snapshot. fantams produit
+        // toujours un .sna à plat (pas de multi-bank) -> no-op, pour accepter les sources
+        // écrites pour rasm sans réécrire leur en-tête. (ORG/RUN sur la même ligne,
+        // séparés par ':', sont déjà traités normalement comme des directives à part.)
+        if (W0 == "BUILDSNA" || W0 == "BANKSET") { if (!label.empty()) defineLabel(label); return; }
 
         // directives d'émission / contrôle
         if (W0 == "ORG") { pc_ = (int)evalExpr(after0); if (!label.empty()) defineLabel(label); return; }
@@ -235,13 +303,13 @@ private:
         if (W0 == "EQU") {
             if (label.empty()) { structErr("EQU sans nom"); return; }
             defineSymbol(label, evalExpr(after0));
-            if (pass_ == 1) equDefs_.push_back({label, after0});
+            if (pass_ == 1) equDefs_.push_back({qualify(label), after0});
             return;
         }
         if (W1 == "EQU") {
             std::string e = restAfterFirst(after0);
             defineSymbol(w0, evalExpr(e));
-            if (pass_ == 1) equDefs_.push_back({w0, e});
+            if (pass_ == 1) equDefs_.push_back({qualify(w0), e});
             return;
         }
         size_t eq = findAssign(rest);
@@ -251,7 +319,7 @@ private:
             std::string name = lhs.empty() ? label : lhs;
             if (name.empty()) { structErr("assignation sans nom"); return; }
             defineSymbol(name, evalExpr(rhs));
-            if (pass_ == 1) equDefs_.push_back({name, rhs});
+            if (pass_ == 1) equDefs_.push_back({qualify(name), rhs});
             return;
         }
 
@@ -272,7 +340,9 @@ Output assembleText(const std::string &source, const std::string &file) {
     std::string cur; int ln = 1;
     for (size_t i = 0; i <= source.size(); ++i) {
         char c = (i < source.size()) ? source[i] : '\n';
-        if (c == '\n') { if (!cur.empty() && cur.back() == '\r') cur.pop_back(); lines.push_back({cur, file, ln++}); cur.clear(); }
+        if (c == '\n') { if (!cur.empty() && cur.back() == '\r') cur.pop_back();
+            bool col0 = !cur.empty() && !std::isspace((unsigned char)cur[0]);
+            lines.push_back({cur, file, ln++, col0}); cur.clear(); }
         else cur += c;
     }
     if (!lines.empty() && lines.back().text.empty()) lines.pop_back();

@@ -1,9 +1,11 @@
 // pp.cpp - Préprocesseur fantams (voir pp.h)
 #include "pp.h"
 #include "expr.h"
+#include "z80.h"
 
 #include <cctype>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -28,6 +30,18 @@ bool isIdentifier(const std::string &s) {
     if (s.empty() || std::isdigit((unsigned char)s[0])) return false;
     for (char c : s) if (!isIdentChar(c)) return false;
     return true;
+}
+// Mots-clés qui ne peuvent jamais être un label — même liste que parser.cpp/asm.cpp.
+// Sert ici à distinguer "ident:" (label collé, style courant) de "ei:ret" (deux
+// instructions collées sans espace : "ei" est un mnémo connu, pas un label).
+bool isReservedWord(const std::string &upperTok) {
+    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
+    static const std::set<std::string> kw = {
+        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
+        "DS", "DEFS", "RMB", "EQU",
+        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
+    };
+    return kw.count(upperTok) != 0;
 }
 // Retire le commentaire ';' (hors chaîne/caractère).
 std::string stripComment(const std::string &s) {
@@ -93,10 +107,11 @@ std::string replaceWord(const std::string &text, const std::string &from, const 
 }
 // Découpe une ligne en instructions sur le séparateur ':' (retour à la ligne),
 // en respectant chaînes/caractères et () [] {}. Le ':' qui termine un label de
-// tête collé ("foo:") est conservé et NE coupe pas ; tout autre ':' sépare.
-// (Choix : pp agnostique de l'assembleur -> heuristique « label collé », pas de
-//  table de mnémoniques ; `nop : ret` fonctionne, `nop:ret` traite nop en label.)
-std::vector<std::string> splitStatements(const std::string &s) {
+// tête collé ("foo:") est conservé et NE coupe pas — SAUF si "foo" est un mnémo/
+// directive connu (ex. "ei:ret") : dans ce cas ':' sépare comme d'habitude, et
+// l'identifiant est ajouté à `warnOut` (style non canonique : ambigu avec un label,
+// même si techniquement accepté — cf. `ei : ret` ou `ei: ret`, sans ambiguïté).
+std::vector<std::string> splitStatements(const std::string &s, std::vector<std::string> *warnOut = nullptr) {
     std::vector<std::string> out;
     std::string cur;
     bool inStr = false; char q = 0; int depth = 0; bool firstColon = true;
@@ -107,10 +122,12 @@ std::vector<std::string> splitStatements(const std::string &s) {
         if (c == '(' || c == '[' || c == '{') { ++depth; cur += c; continue; }
         if (c == ')' || c == ']' || c == '}') { if (depth > 0) --depth; cur += c; continue; }
         if (c == ':' && depth == 0) {
-            // label de tête collé (identifiant immédiatement suivi de ':') -> conservé
-            if (firstColon && !cur.empty() && isIdentChar(cur.back()) && isIdentifier(trim(cur))) {
-                cur += c; firstColon = false; continue;
+            std::string ident = trim(cur);
+            bool glued = firstColon && !cur.empty() && isIdentChar(cur.back()) && isIdentifier(ident);
+            if (glued && !isReservedWord(upper(ident))) {
+                cur += c; firstColon = false; continue; // vrai label collé : conservé
             }
+            if (glued && warnOut) warnOut->push_back(ident); // mnémo/directive collé à ':' -> avertir
             flush(); continue;
         }
         cur += c;
@@ -141,7 +158,6 @@ struct Macro {
 struct Env {
     std::map<std::string, std::string> args;   // arguments de macro (texte brut)
     std::map<std::string, int64_t> locals;      // variables de boucle (REPEAT/WHILE)
-    std::string modulePrefix;                    // préfixe MODULE accumulé (ex "Outer_Inner_")
 };
 
 // Champ / définition de structure
@@ -209,13 +225,18 @@ private:
         result.ok = false;
         result.errors.push_back({sl.file, sl.line, msg});
     }
+    // avertissement de bonne pratique (non bloquant, n'affecte pas result.ok)
+    void warning(const SrcLine &sl, const std::string &msg) {
+        result.warnings.push_back({sl.file, sl.line, msg});
+    }
 
     std::vector<SrcLine> splitLines(const std::string &content, const std::string &file) {
         std::vector<SrcLine> out; std::string cur; int ln = 1;
         for (size_t i = 0; i <= content.size(); ++i) {
             char c = (i < content.size()) ? content[i] : '\n';
             if (c == '\n') { if (!cur.empty() && cur.back() == '\r') cur.pop_back();
-                out.push_back({cur, file, ln++}); cur.clear(); }
+                bool col0 = !cur.empty() && !std::isspace((unsigned char)cur[0]);
+                out.push_back({cur, file, ln++, col0}); cur.clear(); }
             else cur += c;
         }
         if (!out.empty() && out.back().text.empty()) out.pop_back();
@@ -284,17 +305,26 @@ private:
         // ':' -> retour à la ligne ; push/pop multi-registres -> une instruction chacun.
         // Les sous-lignes après la 1re sont indentées (jamais lues comme un label).
         bool first = true;
-        for (const auto &stmt : splitStatements(t))
+        std::vector<std::string> glued;
+        for (const auto &stmt : splitStatements(t, &glued))
             for (const auto &line : expandPushPop(stmt)) {
-                result.lines.push_back({first ? line : "\t" + line, src.file, src.line});
+                result.lines.push_back({first ? line : "\t" + line, src.file, src.line, first && src.col0});
                 first = false;
             }
+        for (const auto &ident : glued)
+            warning(src, "'" + ident + ":' collé sans espace : style non canonique (ambigu avec un label) — "
+                         "préférer '" + ident + " : ...' ou '" + ident + " ...' sur sa propre ligne");
     }
 
     // Collecte les labels définis (par "ident:") dans un corps, hors @@export.
     // skipNestedModule=true : ignore les labels des blocs MODULE imbriqués
     // (ils seront préfixés par le MODULE interne lors de la récursion).
-    std::vector<std::string> collectLabels(const std::vector<SrcLine> &body, bool skipNestedModule) {
+    // onlyAtPrefixed=true : ne retient que les labels préfixés par '@' — c'est la
+    // convention rasm pour l'auto-unicité par expansion (MACRO/REPEAT/WHILE) ; un
+    // label ordinaire réutilisé entre deux expansions doit rester une vraie collision
+    // ("symbole déjà défini"), comme chez rasm. MODULE, lui, renomme tout (onlyAtPrefixed=false).
+    std::vector<std::string> collectLabels(const std::vector<SrcLine> &body, bool skipNestedModule,
+                                           bool onlyAtPrefixed = false) {
         std::vector<std::string> locals;
         std::map<std::string, bool> exported;
         for (const auto &l : body) {
@@ -313,7 +343,7 @@ private:
             }
             std::string code = trim(stripComment(l.text));
             std::string label, rest; peelLabel(code, label, rest);
-            if (!label.empty() && !exported.count(label)) {
+            if (!label.empty() && !exported.count(label) && (!onlyAtPrefixed || label[0] == '@')) {
                 bool seen = false; for (auto &x : locals) if (x == label) seen = true;
                 if (!seen) locals.push_back(label);
             }
@@ -329,13 +359,13 @@ private:
             if (upper(firstToken(trim(stripComment(l.text)))) == "@@EXPORT") continue;
             std::string t = l.text;
             for (const auto &name : names) t = replaceWord(t, name, mangle(name));
-            out.push_back({t, l.file, l.line});
+            out.push_back({t, l.file, l.line, l.col0});
         }
         return out;
     }
     // Renommage auto-local (macros, itérations REPEAT/WHILE) : suffixe __id.
     std::vector<SrcLine> renameLocals(const std::vector<SrcLine> &body, long id) {
-        auto names = collectLabels(body, false);
+        auto names = collectLabels(body, false, /*onlyAtPrefixed=*/true);
         std::string suf = "__" + std::to_string(id);
         return renameScope(body, names, [&](const std::string &n) { return n + suf; });
     }
@@ -552,7 +582,8 @@ private:
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + rend);
                 if (!r.ok) error(raw, "REPEAT : " + (parts.empty() ? "compteur manquant" : r.error));
                 else if (r.value < 0 || r.value > 1000000) error(raw, "REPEAT : compteur hors limites");
-                else for (int k = 0; k < r.value; ++k) {
+                // Compteur 1-based (comme rasm) : "index" vaut 1 à la 1re itération, pas 0.
+                else for (int k = 1; k <= r.value; ++k) {
                     Env ne = env; if (!var.empty()) ne.locals[var] = k;
                     run(renameLocals(body, ++uid), ne, depth);
                 }
@@ -592,18 +623,26 @@ private:
                 i = endm + 1; continue;
             }
 
-            // --- MODULE name ... ENDMODULE (scope par préfixe) ---
-            if (kw == "MODULE") {
-                int endm = findMatching(lines, i, {"MODULE"}, {"ENDMODULE"});
-                if (endm < 0) { error(raw, "MODULE sans ENDMODULE"); return; }
-                std::string mname = firstToken(restAfterFirst(rest));
-                std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + endm);
-                std::string prefix = env.modulePrefix + mname + "_";
+            // --- MODULE name | MODULE [OFF] | ENDMODULE (scope par préfixe) ---
+            // rasm : PAS de nesting. "MODULE x" bascule le module actif (remplace, ne cumule
+            // pas) ; "MODULE", "MODULE OFF" et "ENDMODULE" désactivent le module en cours.
+            if (kw == "MODULE" || kw == "ENDMODULE") {
+                std::string arg = trim(restAfterFirst(rest));
+                if (kw == "ENDMODULE" || arg.empty() || upper(arg) == "OFF") { ++i; continue; }
+                std::string mname = firstToken(arg);
+                // fin de CE module : prochaine ligne MODULE/ENDMODULE (qu'elle ferme ou ouvre
+                // un autre module), sinon fin du bloc courant.
+                int endIdx = (int)lines.size();
+                for (int j = i + 1; j < endIdx; ++j) {
+                    std::string kw2 = classify(lines[j].text);
+                    if (kw2 == "MODULE" || kw2 == "ENDMODULE") { endIdx = j; break; }
+                }
+                std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + endIdx);
+                std::string prefix = mname + "_";
                 auto names = collectLabels(body, /*skipNestedModule=*/true);
                 auto scoped = renameScope(body, names, [&](const std::string &n) { return prefix + n; });
-                Env ne = env; ne.modulePrefix = prefix;
-                run(scoped, ne, depth);
-                i = endm + 1; continue;
+                run(scoped, env, depth);
+                i = endIdx; continue; // ne consomme pas la ligne de fin : rejouée (OFF/ENDMODULE ou MODULE suivant)
             }
 
             // --- STRUCT : déclaration (1 arg) ou instanciation (2+ args) ---
@@ -621,7 +660,8 @@ private:
             }
 
             // --- fermetures orphelines (déjà consommées par les blocs) ---
-            if (kw == "ENDMODULE" || kw == "ENDSTRUCT" || kw == "ENDS") { ++i; continue; }
+            // (ENDMODULE est intercepté plus haut avec MODULE, jamais atteint ici.)
+            if (kw == "ENDSTRUCT" || kw == "ENDS") { ++i; continue; }
 
             // --- @@export hors macro : ignorer ---
             if (kw == "@@EXPORT") { ++i; continue; }

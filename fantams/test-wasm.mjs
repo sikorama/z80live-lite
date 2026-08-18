@@ -29,8 +29,8 @@ const demo = `LET COUNT = 4
         org 0x8000
         run start
 MACRO WAIT n
-wloop: dec {n}
-       jr nz,wloop
+@wloop: dec {n}
+       jr nz,@wloop
 ENDM
 start:
         ld b,{COUNT}

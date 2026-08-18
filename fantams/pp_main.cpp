@@ -41,6 +41,8 @@ int main(int argc, char **argv) {
     else
         fputs(r.dump().c_str(), stdout);
 
+    for (const auto &w : r.warnings)
+        fprintf(stderr, "%s:%d: avertissement: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!r.ok) {
         for (const auto &e : r.errors)
             fprintf(stderr, "%s:%d: erreur: %s\n", e.file.c_str(), e.line, e.message.c_str());

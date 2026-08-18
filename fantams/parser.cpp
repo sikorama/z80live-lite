@@ -2,6 +2,7 @@
 #include "parser.h"
 
 #include <cctype>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -35,13 +36,38 @@ std::string restAfterFirst(const std::string &s) {
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
 }
-void peelLabel(const std::string &code, std::string &label, std::string &rest) {
+// Mots-clés qui ne peuvent jamais être un label sans ':' (mnémoniques Z80 +
+// directives gérées par l'assembleur). Sert à désambiguïser "start" (label,
+// forme tolérée) de "ld a,1" (instruction) quand il n'y a pas de ':'.
+bool isReservedWord(const std::string &upperTok) {
+    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
+    static const std::set<std::string> kw = {
+        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
+        "DS", "DEFS", "RMB", "EQU",
+        // directives rasm reconnues mais non implémentées (hors périmètre) : gardées
+        // réservées pour échouer proprement plutôt que d'être lues comme un label.
+        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
+    };
+    return kw.count(upperTok) != 0;
+}
+
+// label:  -> classique.  label seul (pas de mnémo/directive connu ensuite) ->
+// toléré sans ':' (usage courant chez rasm), mais `sawColon` indique lequel
+// des deux cas s'est produit pour permettre un avertissement en amont.
+void peelLabel(const std::string &code, std::string &label, std::string &rest, bool *sawColon = nullptr) {
     size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
     if (p > 0) {
         size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
         if (q < code.size() && code[q] == ':') {
             label = code.substr(0, p);
             rest = trim(code.substr(q + 1));
+            if (sawColon) *sawColon = true;
+            return;
+        }
+        if (!isReservedWord(upper(code.substr(0, p)))) {
+            label = code.substr(0, p);
+            rest = trim(code.substr(p));
+            if (sawColon) *sawColon = false;
             return;
         }
     }
@@ -175,7 +201,7 @@ Result parseLine(const std::string &line) {
     if (code.empty()) { r.ok = true; return r; }
 
     std::string rest;
-    peelLabel(code, r.label, rest);
+    peelLabel(code, r.label, rest, &r.labelHasColon);
     if (rest.empty()) { r.ok = true; return r; } // ligne label-seul
 
     std::string mnemoTok = firstToken(rest);

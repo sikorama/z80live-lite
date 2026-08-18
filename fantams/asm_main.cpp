@@ -41,6 +41,7 @@ int main(int argc, char **argv) {
 
     // 1) préprocesseur
     pp::Result pre = pp::preprocess(content, path, readFile);
+    for (auto &w : pre.warnings) fprintf(stderr, "%s:%d: avertissement: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!pre.ok) {
         for (auto &e : pre.errors) fprintf(stderr, "%s:%d: erreur (préproc): %s\n", e.file.c_str(), e.line, e.message.c_str());
         return 1;
@@ -48,8 +49,9 @@ int main(int argc, char **argv) {
 
     // 2) assembleur (2 passes) sur le texte plat
     std::vector<asmb::SourceLine> lines;
-    for (auto &l : pre.lines) lines.push_back({l.text, l.file, l.line});
+    for (auto &l : pre.lines) lines.push_back({l.text, l.file, l.line, l.col0});
     asmb::Output out = asmb::assemble(lines);
+    for (auto &w : out.warnings) fprintf(stderr, "%s:%d: avertissement: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!out.ok) {
         for (auto &e : out.errors) fprintf(stderr, "%s:%d: erreur: %s\n", e.file.c_str(), e.line, e.message.c_str());
         return 1;
