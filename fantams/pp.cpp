@@ -331,6 +331,97 @@ private:
         return out;
     }
 
+    // Registres, paires et conditions Z80 : dans une VRAIE instruction, un opérande
+    // qui vaut exactement l'un de ces noms est un registre, pas un symbole — on ne le
+    // substitue donc jamais (sinon "ld a,b" serait détruit dès qu'une variable PP
+    // s'appelle 'b', et 'i'/'c' sont des compteurs de boucle très courants). Dans une
+    // sous-expression ("ld a,(tbl+i)") ou après une directive ("db i"), c'est un symbole.
+    static bool isRegOrCond(const std::string &up) {
+        static const std::set<std::string> names = {
+            "A","B","C","D","E","H","L","I","R","AF","BC","DE","HL","SP","PC",
+            "IX","IY","IXL","IXH","IYL","IYH","LX","LY","HX","HY",
+            "NZ","Z","NC","PO","PE","P","M"};
+        return names.count(up) != 0;
+    }
+
+    // Index du 1er caractère des opérandes dans une ligne déjà trim : saute le label
+    // éventuel puis le mnémonique/directive (ni l'un ni l'autre n'est substituable).
+    size_t operandStart(const std::string &code) {
+        size_t p = 0, q = 0;
+        while (q < code.size() && isIdentChar(code[q])) ++q;
+        if (q > 0) {
+            size_t r = q; while (r < code.size() && std::isspace((unsigned char)code[r])) ++r;
+            std::string tok = upper(code.substr(0, q));
+            if (r < code.size() && code[r] == ':') p = r + 1;
+            else if (!isReservedWord(tok) && !macros.count(tok)) p = q;
+        }
+        while (p < code.size() && std::isspace((unsigned char)code[p])) ++p;
+        while (p < code.size() && isIdentChar(code[p])) ++p; // mnémonique / directive
+        return p;
+    }
+
+    // Remplace, dans les opérandes d'une ligne prête à être émise, les variables du
+    // préprocesseur (LET) et les compteurs de boucle (REPEAT/WHILE) écrits en clair
+    // par leur valeur. rasm les expose comme des symboles ordinaires de l'assembleur ;
+    // ici elles n'existent qu'au préprocesseur, d'où cette substitution textuelle.
+    // Chaînes et littéraux caractère sont recopiés tels quels, et un identifiant collé
+    // à un préfixe numérique (#FF, $1A, %10, 0x1F) n'est pas un symbole.
+    std::string substituteVars(const std::string &code, const Env &env) {
+        if (env.locals.empty() && ppvars.empty()) return code;
+        size_t op = operandStart(code);
+        std::string mnemo = upper(trim(code.substr(0, op)));
+        size_t sp = mnemo.rfind(' ');
+        if (sp != std::string::npos) mnemo = mnemo.substr(sp + 1);
+        bool instr = z80::mnemoFromString(mnemo) != z80::Mnemo::Invalid;
+
+        const std::string text = code.substr(op);
+        std::string out = code.substr(0, op);
+        const size_t base = out.size();
+        size_t i = 0;
+        while (i < text.size()) {
+            char c = text[i];
+            if (c == '"' || c == '\'') {
+                char q = c; out += text[i++];
+                while (i < text.size()) {
+                    if (text[i] == '\\' && i + 1 < text.size()) { out += text[i]; out += text[i + 1]; i += 2; continue; }
+                    out += text[i];
+                    if (text[i++] == q) break;
+                }
+                continue;
+            }
+            char prev = out.size() > base ? out.back() : 0;
+            bool numPrefix = (prev == '#' || prev == '$' || prev == '%' ||
+                              std::isalnum((unsigned char)prev) || prev == '_');
+            // dernier caractère significatif (espaces ignorés) pour le test "opérande entier"
+            char prevSig = 0;
+            for (size_t b = out.size(); b > base; --b)
+                if (!std::isspace((unsigned char)out[b - 1])) { prevSig = out[b - 1]; break; }
+            if (!numPrefix && (std::isalpha((unsigned char)c) || c == '_')) {
+                size_t j = i;
+                while (j < text.size() && isIdentChar(text[j])) ++j;
+                std::string name = text.substr(i, j - i);
+                auto l = env.locals.find(name);
+                const int64_t *val = nullptr;
+                if (l != env.locals.end()) val = &l->second;
+                else { auto p = ppvars.find(name); if (p != ppvars.end()) val = &p->second; }
+                // opérande entier d'une instruction = registre/condition, jamais un symbole
+                bool whole = false;
+                if (instr && isRegOrCond(upper(name))) {
+                    size_t k = j; while (k < text.size() && std::isspace((unsigned char)text[k])) ++k;
+                    char next = k < text.size() ? text[k] : 0;
+                    whole = (prevSig == 0 || prevSig == ',' || prevSig == '(') &&
+                            (next == 0 || next == ',' || next == ')');
+                }
+                if (val && !whole) out += std::to_string(*val);
+                else out += name;
+                i = j;
+                continue;
+            }
+            out += c; ++i;
+        }
+        return out;
+    }
+
     // Classe une ligne brute selon son mot-clé de bloc.
     std::string classify(const std::string &raw) {
         std::string code = trim(stripComment(raw));
@@ -729,7 +820,7 @@ private:
             }
 
             // --- ligne ordinaire : passe-plat ---
-            emit(code, raw);
+            emit(substituteVars(code, env), raw);
             ++i;
         }
     }

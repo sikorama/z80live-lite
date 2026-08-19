@@ -65,6 +65,21 @@ int main() {
     chk("REPEAT", "REPEAT 3, i\n  ld a,{i}\nREND\n", "ld a,1\nld a,2\nld a,3\n");
     chk("REPEAT expr count", "LET n=2\nREPEAT n\n  nop\nREND\n", "nop\nnop\n");
 
+    // Variables PP / compteurs de boucle écrits en clair (sans {}) : rasm les
+    // expose comme des symboles ordinaires, fantams les substitue textuellement.
+    chk("compteur REPEAT en clair", "REPEAT 3, i\n  db i*2\nREND\n", "db 1*2\ndb 2*2\ndb 3*2\n");
+    chk("LET en clair", "LET v=7\n db v+1\n", "db 7+1\n");
+    chk("substitution hors chaînes/caractères",
+        "LET y=3\n db y, \"y\", 'y'\n", "db 3, \"y\", 'y'\n");
+    chk("registres jamais substitués", "LET b=3\n ld a,b\n", "ld a,b\n");
+    chk("registre 1er opérande", "LET a=3\n ld a,#10\n", "ld a,#10\n");
+    chk("registre indirect", "LET hl=3\n ld (hl),a\n", "ld (hl),a\n");
+    chk("condition de saut", "LET z=3\n jr z,#100\n", "jr z,#100\n");
+    chk("registre dans une sous-expression", "LET i=5\n ld a,(tbl+i)\n", "ld a,(tbl+5)\n");
+    chk("registre après directive", "LET i=5\n db i\n", "db 5\n");
+    chk("label jamais substitué", "LET v=1\nv: nop\n", "v: nop\n");
+    chk("pas de substitution dans un nombre hexa", "LET f=1\n db #ff\n", "db #ff\n");
+
     // IF / ELSE / ELSEIF (PP-strict)
     chk("IF vrai", "LET D=1\nIF D\n  ld a,1\nELSE\n  ld a,2\nENDIF\n", "ld a,1\n");
     chk("IF faux", "LET D=0\nIF D\n  ld a,1\nELSE\n  ld a,2\nENDIF\n", "ld a,2\n");
