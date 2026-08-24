@@ -4,6 +4,7 @@ pp_test
 parser_test
 asm_test
 sna_test
+expr_test
 ppdump
 fantams
 
@@ -17,3 +18,6 @@ examples/*.sna
 # Artefacts WASM (générés localement, publiés dans ../wasm/)
 *.o
 *.wasm.js
+
+# Rapport de comparaison (regenere par compare/compare.mjs, ~11 Mo)
+compare/last-report.json
