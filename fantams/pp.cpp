@@ -394,6 +394,24 @@ private:
                 while (j < text.size() && d) { if (text[j] == '{') ++d; else if (text[j] == '}') --d; if (d) ++j; }
                 if (j >= text.size()) { error(sl, "unclosed brace '{'"); out += text.substr(i); break; }
                 std::string inner = trim(text.substr(i + 1, j - i - 1));
+                // rasm surcharge les accolades : « {hex}valeur » y est un format
+                // d'affichage et « {sizeof}type » un opérateur. Dans fantams, {X}
+                // a un seul rôle — évaluer X et substituer. Ces sources doivent
+                // être éditées, autant le dire précisément. Cf. ADR 0011.
+                static const std::map<std::string, std::string> rasmBrace = {
+                    {"SIZEOF", "write sizeof(name) instead"},
+                    {"HEX", "use the print format prefix: print \"x=\", hex expr"},
+                    {"BIN", "use the print format prefix: print \"x=\", bin expr"},
+                    {"CHAR", "use the print format prefix: print \"x=\", char expr"},
+                    {"INT", "use the print format prefix: print \"x=\", int expr"},
+                };
+                auto rb = rasmBrace.find(upper(inner));
+                if (rb != rasmBrace.end()) {
+                    error(sl, "'{" + inner + "}' is a rasm notation that fantams does not accept: "
+                              "here '{X}' only ever means 'evaluate X and substitute' — " + rb->second);
+                    i = j + 1;
+                    continue;
+                }
                 if (inner.empty()) error(sl, "empty substitution '{}'");
                 else if (inner[0] == '=') {
                     auto r = evalPP(trim(inner.substr(1)), env);
@@ -516,8 +534,41 @@ private:
         return k;
     }
 
+    // Remplace sizeof(NOM) par la taille declaree de la structure NOM.
+    // C'est le preprocesseur qui porte cette connaissance : apres l'abaissement
+    // des STRUCT, il n'y a plus de structure, seulement des EQU.
+    //
+    // On n'implemente PAS la notation rasm {sizeof}NOM : dans fantams, {X}
+    // signifie « evalue X et substitue », un seul role grammatical. Cf. ADR 0011.
+    std::string expandSizeof(const std::string &code, const SrcLine &src) {
+        std::string out; size_t i = 0;
+        while (i < code.size()) {
+            bool boundary = (i == 0) || !isIdentChar(code[i - 1]);
+            if (boundary && upper(code.substr(i, 6)) == "SIZEOF") {
+                size_t j = i + 6;
+                while (j < code.size() && std::isspace((unsigned char)code[j])) ++j;
+                if (j < code.size() && code[j] == '(') {
+                    size_t k = code.find(')', j);
+                    if (k != std::string::npos) {
+                        std::string arg = trim(code.substr(j + 1, k - j - 1));
+                        auto it = structs_.find(upper(arg));
+                        if (it == structs_.end())
+                            error(src, "sizeof: unknown struct '" + arg + "'");
+                        else {
+                            out += std::to_string(it->second.size);
+                            i = k + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out += code[i++];
+        }
+        return out;
+    }
+
     void emit(const std::string &code, const SrcLine &src) {
-        std::string t = trim(code);
+        std::string t = trim(expandSizeof(code, src));
         if (t.empty()) return;
         // ':' -> retour à la ligne ; push/pop multi-registres -> une instruction chacun.
         // Les sous-lignes après la 1re sont indentées (jamais lues comme un label).
