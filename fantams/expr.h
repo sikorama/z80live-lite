@@ -12,11 +12,15 @@
 namespace expr {
 
 // Renvoie true et remplit `out` si le symbole est connu, false sinon.
-using Resolver = std::function<bool(const std::string &name, int64_t &out)>;
+// Le résolveur rend un DOUBLE : une constante ou une variable peut valoir un
+// réel, et l'arrondir au passage perdrait l'information avant même que
+// l'expression soit calculée. Cf. ADR 0008 — un seul type, jusqu'au bout.
+using Resolver = std::function<bool(const std::string &name, double &out)>;
 
 struct Result {
     bool ok = false;
-    int64_t value = 0;
+    int64_t value = 0;    // valeur arrondie, pour l'émission d'octets
+    double real = 0;      // valeur exacte, pour un stockage sans perte
     std::string error;
 };
 

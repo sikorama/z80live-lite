@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <set>
@@ -67,6 +68,17 @@ std::string stripBlockComments(const std::string &s) {
         out += c; ++i;
     }
     return out;
+}
+// Formate une valeur numerique pour REINJECTION dans du texte source.
+// Entiere -> forme entiere (« 3 », pas « 3.000000 ») : c'est le cas de tous les
+// compteurs de boucle et de la generation de labels, ou des decimales seraient
+// catastrophiques. Reelle -> forme decimale sans zeros inutiles.
+std::string fmtNum(double v) {
+    if (v == (double)(int64_t)v && std::fabs(v) < 9e15) return std::to_string((int64_t)v);
+    std::string s = std::to_string(v);
+    while (s.size() > 1 && s.back() == '0') s.pop_back();
+    if (!s.empty() && s.back() == '.') s.pop_back();
+    return s;
 }
 bool isReservedWord(const std::string &upperTok) {
     if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
@@ -294,11 +306,11 @@ public:
 
 private:
     FileProvider files;
-    std::map<std::string, int64_t> ppvars;      // variables PP globales (LET)
+    std::map<std::string, double> ppvars;       // variables PP globales (LET)
     // ADR 0003 : constantes EQU et variables '=' lues par le préprocesseur quand
     // leur expression y est résoluble. `asmDeferred` retient celles qui sont bien
     // définies mais dépendent d'un label — connues, mais pas ici.
-    std::map<std::string, int64_t> asmvars;
+    std::map<std::string, double> asmvars;
     std::set<std::string> asmDeferred;
     std::set<std::string> readAtPP;             // noms d'asmvars effectivement lus
     std::set<std::string> seenLabels;           // labels deja rencontres (pour IFDEF)
@@ -353,11 +365,11 @@ private:
 
     expr::Result evalPP(const std::string &text, const Env &env) {
         std::string deferred;
-        auto resolver = [&](const std::string &name, int64_t &out) -> bool {
-            auto l = env.locals.find(name); if (l != env.locals.end()) { out = l->second; return true; }
+        auto resolver = [&](const std::string &name, double &out) -> bool {
+            auto l = env.locals.find(name); if (l != env.locals.end()) { out = (double)l->second; return true; }
             auto p = ppvars.find(name); if (p != ppvars.end()) { out = p->second; return true; }
             auto a = env.args.find(name);
-            if (a != env.args.end()) { auto r = expr::eval(a->second, {}); if (r.ok) { out = r.value; return true; } }
+            if (a != env.args.end()) { auto r = expr::eval(a->second, {}); if (r.ok) { out = r.real; return true; } }
             auto v = asmvars.find(name);
             if (v != asmvars.end()) { readAtPP.insert(name); out = v->second; return true; }
             if (asmDeferred.count(name)) deferred = name;
@@ -387,12 +399,12 @@ private:
         if (readAtPP.count(name)) {
             auto prev = asmvars.find(name);
             warning(raw, "'" + name + "' was already used by the preprocessor" +
-                         (prev != asmvars.end() ? " with value " + std::to_string(prev->second) : "") +
+                         (prev != asmvars.end() ? " with value " + fmtNum(prev->second) : "") +
                          "; redefining it here makes the preprocessor and the assembler disagree");
             readAtPP.erase(name);
         }
         auto r = evalPP(ev, env);
-        if (r.ok) { asmvars[name] = r.value; asmDeferred.erase(name); }
+        if (r.ok) { asmvars[name] = r.real; asmDeferred.erase(name); }
         else { asmvars.erase(name); asmDeferred.insert(name); }
     }
 
@@ -426,12 +438,12 @@ private:
                 if (inner.empty()) error(sl, "empty substitution '{}'");
                 else if (inner[0] == '=') {
                     auto r = evalPP(trim(inner.substr(1)), env);
-                    if (!r.ok) error(sl, r.error); else out += std::to_string(r.value);
+                    if (!r.ok) error(sl, r.error); else out += fmtNum(r.real);
                 } else if (isIdentifier(inner) && env.args.count(inner)) {
                     out += env.args.at(inner);
                 } else {
                     auto r = evalPP(inner, env);
-                    if (!r.ok) error(sl, r.error); else out += std::to_string(r.value);
+                    if (!r.ok) error(sl, r.error); else out += fmtNum(r.real);
                 }
                 i = j + 1;
             } else out += text[i++];
@@ -509,9 +521,9 @@ private:
                 while (j < text.size() && isIdentChar(text[j])) ++j;
                 std::string name = text.substr(i, j - i);
                 auto l = env.locals.find(name);
-                const int64_t *val = nullptr;
-                if (l != env.locals.end()) val = &l->second;
-                else { auto p = ppvars.find(name); if (p != ppvars.end()) val = &p->second; }
+                bool has = false; double val = 0;
+                if (l != env.locals.end()) { val = (double)l->second; has = true; }
+                else { auto p = ppvars.find(name); if (p != ppvars.end()) { val = p->second; has = true; } }
                 // opérande entier d'une instruction = registre/condition, jamais un symbole
                 bool whole = false;
                 if (instr && isRegOrCond(upper(name))) {
@@ -520,7 +532,7 @@ private:
                     whole = (prevSig == 0 || prevSig == ',' || prevSig == '(') &&
                             (next == 0 || next == ',' || next == ')');
                 }
-                if (val && !whole) out += std::to_string(*val);
+                if (has && !whole) out += fmtNum(val);
                 else out += name;
                 i = j;
                 continue;
@@ -813,7 +825,7 @@ private:
                 auto r = evalPP(ev, env);
                 if (!isIdentifier(name)) error(raw, "LET: invalid variable name");
                 else if (!r.ok) error(raw, r.error);
-                else ppvars[name] = r.value;
+                else ppvars[name] = r.real;
                 ++i; continue;
             }
 

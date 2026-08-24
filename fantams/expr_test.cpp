@@ -7,8 +7,8 @@
 
 static int g_pass = 0, g_fail = 0;
 
-static std::map<std::string, int64_t> g_syms;
-static expr::Resolver resolver = [](const std::string &n, int64_t &out) -> bool {
+static std::map<std::string, double> g_syms;
+static expr::Resolver resolver = [](const std::string &n, double &out) -> bool {
     auto it = g_syms.find(n);
     if (it == g_syms.end()) return false;
     out = it->second; return true;

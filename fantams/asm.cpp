@@ -1,5 +1,7 @@
 // asm.cpp - Assembleur 2 passes (voir asm.h)
 #include "asm.h"
+
+#include <cmath>
 #include "expr.h"
 #include "parser.h"
 #include "z80.h"
@@ -129,7 +131,7 @@ public:
         for (int iter = 0; iter < 32; ++iter) {
             bool changed = false;
             for (const auto &d : equDefs_) {
-                int64_t v = evalExpr(d.second);
+                double v = evalExprReal(d.second);
                 auto it = symbols_.find(d.first);
                 if (it == symbols_.end() || it->second != v) { setSymbol(d.first, v); changed = true; }
             }
@@ -140,7 +142,10 @@ public:
         for (const auto &l : lines) process(l);
 
         Output o;
-        o.symbols = symbols_;
+        // Output.symbols reste entier : c'est une table d'ADRESSES destinee aux
+        // outils et aux humains. La precision reelle n'a d'interet qu'a
+        // l'interieur du calcul d'expressions.
+        for (const auto &kv : symbols_) o.symbols[kv.first] = (int64_t)std::llround(kv.second);
         o.errors = errors_;
         o.warnings = warnings_;
         o.ok = errors_.empty();
@@ -169,9 +174,11 @@ public:
 
 private:
     std::vector<uint8_t> image_;
+    double lastReal_ = 0;
+    bool evalRealLast_ = false;
     int instrStart_ = 0;
     bool inInstruction_ = false;
-    std::map<std::string, int64_t> symbols_;
+    std::map<std::string, double> symbols_;   // exact ; arrondi seulement a la sortie
     std::map<std::string, std::string> ciIndex_; // MAJUSCULES(nom) -> nom exact, pour le repli insensible à la casse
     std::set<std::string> definedP1_;
     std::vector<std::pair<std::string, std::string>> equDefs_; // (nom, texte expr) pour la résolution
@@ -196,16 +203,21 @@ private:
     std::string qualify(const std::string &n) const {
         return (!n.empty() && n[0] == '.') ? currentGlobal_ + n : n;
     }
-    void setSymbol(const std::string &n, int64_t v) { symbols_[n] = v; ciIndex_[upper(n)] = n; }
+    void setSymbol(const std::string &n, double v) { symbols_[n] = v; ciIndex_[upper(n)] = n; }
 
+    // Deux lectures d'une même expression : `evalExpr` pour émettre des octets,
+    // `evalExprReal` pour DÉFINIR un symbole. Stocker l'arrondi ferait perdre
+    // l'information avant tout usage — « v = 2.4 » puis « db v*2 » donnait 4 au
+    // lieu de 5, l'écrasement ayant lieu au stockage, pas au calcul.
+    double evalExprReal(const std::string &text) { evalRealLast_ = true; int64_t v = evalExpr(text); (void)v; return lastReal_; }
     int64_t evalExpr(const std::string &text) {
         evalOk_ = true;
-        auto r = expr::eval(text, [&](const std::string &n, int64_t &o) -> bool {
+        auto r = expr::eval(text, [&](const std::string &n, double &o) -> bool {
             // '$' vaut l'adresse de DÉBUT de l'instruction, pas la position
             // courante : pendant l'encodage, les octets d'opcode sont déjà émis
             // et pc_ a avancé (de 1, ou de 2 pour un préfixe DD/FD). Hors
             // instruction (db/dw/equ), pc_ EST la bonne réponse.
-            if (n == "$") { o = (inInstruction_ ? instrStart_ : pc_) & 0xFFFF; return true; }
+            if (n == "$") { o = (double)((inInstruction_ ? instrStart_ : pc_) & 0xFFFF); return true; }
             std::string qn = qualify(n);
             auto it = symbols_.find(qn);
             if (it != symbols_.end()) { o = it->second; return true; }
@@ -221,18 +233,19 @@ private:
             return false;
         });
         if (!r.ok) { evalOk_ = false; if (pass_ == 2) push(r.error); return 0; }
+        lastReal_ = r.real;
         return r.value;
     }
 
     void defineLabel(const std::string &n) {
         std::string qn = qualify(n);
         if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
-        setSymbol(qn, pc_ & 0xFFFF);
+        setSymbol(qn, (double)(pc_ & 0xFFFF));
     }
     // `reassignable` : une VARIABLE ('=') peut être redéfinie, une CONSTANTE
     // ('EQU') non. Cf. ADR 0003 — "angle = i - 1" dans un "repeat 256,i" est
     // idiomatique, et l'interdire rejetait 9 sources du corpus.
-    void defineSymbol(const std::string &n, int64_t v, bool reassignable = false) {
+    void defineSymbol(const std::string &n, double v, bool reassignable = false) {
         std::string qn = qualify(n);
         if (pass_ == 1 && !reassignable) {
             if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; }
@@ -340,13 +353,13 @@ private:
         // définition de symbole : "name: EQU v" / "name EQU v" / "name = v"
         if (W0 == "EQU") {
             if (label.empty()) { structErr("EQU without a name"); return; }
-            defineSymbol(label, evalExpr(after0));
+            defineSymbol(label, evalExprReal(after0));
             if (pass_ == 1) equDefs_.push_back({qualify(label), after0});
             return;
         }
         if (W1 == "EQU") {
             std::string e = restAfterFirst(after0);
-            defineSymbol(w0, evalExpr(e));
+            defineSymbol(w0, evalExprReal(e));
             if (pass_ == 1) equDefs_.push_back({qualify(w0), e});
             return;
         }
@@ -361,7 +374,7 @@ private:
             // equDefs_, dont la résolution à point fixe est le mécanisme des
             // constantes — il écraserait la valeur vue par les usages antérieurs.
             // Corollaire assumé : une variable ne se référence pas en avant.
-            defineSymbol(name, evalExpr(rhs), /*reassignable=*/true);
+            defineSymbol(name, evalExprReal(rhs), /*reassignable=*/true);
             return;
         }
 

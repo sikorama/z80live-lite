@@ -149,8 +149,8 @@ struct Parser {
             // '$' suivi d'un chiffre hexa = nombre ; sinon = symbole (adresse courante)
             if (i + 1 < s.size() && std::isxdigit((unsigned char)s[i + 1])) return parseNumber();
             ++i;
-            int64_t out;
-            if (resolver && resolver("$", out)) return (double)out;
+            double out;
+            if (resolver && resolver("$", out)) return out;
             fail("unknown symbol '$'");
         }
         if (std::isdigit((unsigned char)c) || c == '%' || c == '#')
@@ -243,8 +243,8 @@ struct Parser {
             if (callBuiltin(up, out)) return out;
             i = save; // pas une fonction connue : laisse '(' pour l'appelant (ne devrait pas arriver ici)
         }
-        int64_t out;
-        if (resolver && resolver(name, out)) return (double)out;
+        double out;
+        if (resolver && resolver(name, out)) return out;
         fail("unknown symbol '" + name + "'");
     }
 };
@@ -259,6 +259,7 @@ Result eval(const std::string &text, const Resolver &resolver) {
         p.skip();
         if (p.i < text.size()) { r.ok = false; r.error = "unexpected character: '" + std::string(1, text[p.i]) + "'"; return r; }
         r.value = toInt(v);
+        r.real = v;
         r.ok = true;
     } catch (const EvalError &e) {
         r.ok = false; r.error = e.msg;
