@@ -202,9 +202,9 @@
 
   function newSource() {
     selected = { name: 'nouveau', author: null, description: null };
-    setCode('; z80: assembler=rasm buildmode=sna entry=#8000\n  org #8000\nstart:\n  ret\n');
+    setCode('; z80: assembler=fantams buildmode=sna entry=#8000\n  org #8000\nstart:\n  ret\n');
     dirty = false;
-    asm = 'rasm'; buildmode = 'sna'; entry = '#8000';
+    asm = 'fantams'; buildmode = 'sna'; entry = '#8000';
     isInclude = false; incFilename = '';
   }
 

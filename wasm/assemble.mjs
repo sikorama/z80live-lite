@@ -64,9 +64,17 @@ function detectOrg(code) {
   return m ? m[1] : null;
 }
 
-// Défaut réel côté serveur historique = rasm (pas sjasmplus).
+// Defaut = fantams. Une source qui n'a jamais choisi (« auto », 325 sur 425)
+// passe donc par notre assembleur. Choix delibere : a ce stade fantams couvre
+// ~52 % du corpus rasm au bit pres, et rendre les echecs VISIBLES dans
+// l'editeur est justement ce qu'on veut — sinon il faut ouvrir chaque source,
+// changer le reglage a la main et relancer pour savoir ou ca coince.
+//
+// Les sources qui epinglent explicitement rasm (76) ou sjasmplus (17) ne sont
+// pas concernees. Pour revenir en arriere sur une source : reglage de l'editeur
+// ou directive « ; z80: assembler=rasm » en tete. Globalement : cette ligne.
 export function resolveAssembler(opts = {}) {
-  return opts.assembler || 'rasm';
+  return opts.assembler || 'fantams';
 }
 
 export function wrapRasm(code, opts = {}) {
