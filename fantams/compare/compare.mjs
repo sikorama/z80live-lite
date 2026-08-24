@@ -89,7 +89,11 @@ function runFantamsNative(wrapped) {
   const snaPath = join(tmpDir, 'out.sna');
   writeFileSync(asmPath, wrapped);
   try {
-    execFileSync(FANTAMS_BIN, [asmPath, '-o', snaPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync(FANTAMS_BIN, [asmPath, '-o', snaPath],
+      // maxBuffer relevé : un débordement du tampon par défaut (1 Mo) faisait
+      // remonter une erreur VIDE, indiscernable d'un crash. Un assembleur
+      // bavard ne doit pas se traduire par un diagnostic muet.
+      { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   } catch (e) {
     return { ok: false, error: (e.stderr || e.message || '').toString() };
   }

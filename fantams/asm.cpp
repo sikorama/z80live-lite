@@ -223,9 +223,14 @@ private:
         if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
         setSymbol(qn, pc_ & 0xFFFF);
     }
-    void defineSymbol(const std::string &n, int64_t v) {
+    // `reassignable` : une VARIABLE ('=') peut être redéfinie, une CONSTANTE
+    // ('EQU') non. Cf. ADR 0003 — "angle = i - 1" dans un "repeat 256,i" est
+    // idiomatique, et l'interdire rejetait 9 sources du corpus.
+    void defineSymbol(const std::string &n, int64_t v, bool reassignable = false) {
         std::string qn = qualify(n);
-        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
+        if (pass_ == 1 && !reassignable) {
+            if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; }
+        } else if (pass_ == 1) definedP1_.insert(qn);
         setSymbol(qn, v);
     }
 
@@ -269,7 +274,13 @@ private:
 
         std::string label, rest; bool labelHasColon = true;
         peelLabel(code, label, rest, &labelHasColon);
-        if (!label.empty() && !labelHasColon)
+        // "nom EQU valeur" et "nom = valeur" SONT la forme canonique d'une
+        // définition de constante ou de variable : le ':' n'y a pas cours, et
+        // avertir dessus noierait les vrais cas (un label d'adresse sans ':').
+        const bool isDefinition =
+            upper(firstToken(rest)) == "EQU" ||
+            (findAssign(rest) != std::string::npos && trim(rest.substr(0, findAssign(rest))).empty());
+        if (!label.empty() && !labelHasColon && !isDefinition)
             warn("label without ':': '" + label + "' (best practice: write '" + label + ":')");
         // contexte de qualification pour les labels locaux ".nom" sur les lignes suivantes
         // (un label local ne change pas le contexte : qualify() ne modifie que ceux en '.').
@@ -330,8 +341,12 @@ private:
             std::string rhs = trim(rest.substr(eq + 1));
             std::string name = lhs.empty() ? label : lhs;
             if (name.empty()) { structErr("assignment without a name"); return; }
-            defineSymbol(name, evalExpr(rhs));
-            if (pass_ == 1) equDefs_.push_back({qualify(name), rhs});
+            // Une variable est SÉQUENTIELLE : sa valeur en un point d'usage est celle
+            // de la dernière affectation au-dessus. Elle n'entre donc PAS dans
+            // equDefs_, dont la résolution à point fixe est le mécanisme des
+            // constantes — il écraserait la valeur vue par les usages antérieurs.
+            // Corollaire assumé : une variable ne se référence pas en avant.
+            defineSymbol(name, evalExpr(rhs), /*reassignable=*/true);
             return;
         }
 

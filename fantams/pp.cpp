@@ -135,6 +135,26 @@ void peelLabel(const std::string &code, std::string &label, std::string &rest,
     }
     label.clear(); rest = code;
 }
+// Position d'un '=' d'assignation (pas ==, <=, >=, !=), hors chaîne.
+// Même règle qu'asm.cpp : les deux étages doivent s'accorder sur ce qui est une
+// définition, sans quoi le préprocesseur et l'assembleur liraient des sources
+// différentes. À factoriser dans un en-tête commun le jour où un troisième
+// appelant apparaît.
+size_t findAssign(const std::string &s) {
+    bool inStr = false; char q = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) { if (c == q) inStr = false; continue; }
+        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
+        if (c == '=') {
+            char prev = i > 0 ? s[i - 1] : 0, next = i + 1 < s.size() ? s[i + 1] : 0;
+            if (prev == '<' || prev == '>' || prev == '!' || prev == '=') continue;
+            if (next == '=') continue;
+            return i;
+        }
+    }
+    return std::string::npos;
+}
 // Découpe en respectant () [] {} "" ''.
 std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
     std::vector<std::string> out;
@@ -275,6 +295,12 @@ public:
 private:
     FileProvider files;
     std::map<std::string, int64_t> ppvars;      // variables PP globales (LET)
+    // ADR 0003 : constantes EQU et variables '=' lues par le préprocesseur quand
+    // leur expression y est résoluble. `asmDeferred` retient celles qui sont bien
+    // définies mais dépendent d'un label — connues, mais pas ici.
+    std::map<std::string, int64_t> asmvars;
+    std::set<std::string> asmDeferred;
+    std::set<std::string> readAtPP;             // noms d'asmvars effectivement lus
     std::map<std::string, Macro> macros;         // clé = nom majuscule
     std::map<std::string, StructDef> structs_;    // clé = nom majuscule
     long uid = 0;
@@ -283,8 +309,15 @@ private:
         result.ok = false;
         result.errors.push_back({sl.file, sl.line, msg});
     }
-    // avertissement de bonne pratique (non bloquant, n'affecte pas result.ok)
+    // Avertissement de bonne pratique (non bloquant, n'affecte pas result.ok).
+    // Dédupliqué sur (fichier, ligne, message) : une ligne source à l'intérieur
+    // d'un REPEAT déroulé ou d'une macro appelée N fois produirait sinon N
+    // copies du même message — mesuré à 3,9 Mo sur une source du corpus, assez
+    // pour faire déborder le tampon de l'appelant. Une ligne source ne parle
+    // qu'une fois.
+    std::set<std::string> warnedOnce;
     void warning(const SrcLine &sl, const std::string &msg) {
+        if (!warnedOnce.insert(sl.file + "\x01" + std::to_string(sl.line) + "\x01" + msg).second) return;
         result.warnings.push_back({sl.file, sl.line, msg});
     }
 
@@ -308,14 +341,48 @@ private:
     }
 
     expr::Result evalPP(const std::string &text, const Env &env) {
+        std::string deferred;
         auto resolver = [&](const std::string &name, int64_t &out) -> bool {
             auto l = env.locals.find(name); if (l != env.locals.end()) { out = l->second; return true; }
             auto p = ppvars.find(name); if (p != ppvars.end()) { out = p->second; return true; }
             auto a = env.args.find(name);
             if (a != env.args.end()) { auto r = expr::eval(a->second, {}); if (r.ok) { out = r.value; return true; } }
+            auto v = asmvars.find(name);
+            if (v != asmvars.end()) { readAtPP.insert(name); out = v->second; return true; }
+            if (asmDeferred.count(name)) deferred = name;
             return false;
         };
-        return expr::eval(text, resolver);
+        auto r = expr::eval(text, resolver);
+        // Frontière de l'ADR 0005/0003 : le préprocesseur s'exécute avant qu'aucune
+        // adresse existe. Un nom qui dépend d'un label n'est pas « inconnu » — il est
+        // connu et pas encore calculable. Le dire, plutôt que laisser un
+        // « unknown symbol » trompeur.
+        if (!r.ok && !deferred.empty())
+            r.error = "'" + deferred + "' is defined at assembly time and cannot be resolved here "
+                      "(it depends on a label or on the current address); the preprocessor runs "
+                      "before any address exists";
+        return r;
+    }
+
+    // Enregistre "nom EQU expr" / "nom = expr" SANS consommer la ligne : c'est
+    // l'assembleur qui définit réellement le symbole, le préprocesseur ne fait
+    // que le lire au passage.
+    void noteAsmDefinition(const std::string &name, const std::string &ev,
+                           const Env &env, const SrcLine &raw) {
+        if (!isIdentifier(name)) return;
+        // Ambiguïté réelle : le PP a déjà utilisé cette valeur plus haut et elle
+        // change ici. L'assembleur, lui, résout les EQU/= jusqu'à point fixe et
+        // retiendra la dernière — les deux étages ne verraient pas la même chose.
+        if (readAtPP.count(name)) {
+            auto prev = asmvars.find(name);
+            warning(raw, "'" + name + "' was already used by the preprocessor" +
+                         (prev != asmvars.end() ? " with value " + std::to_string(prev->second) : "") +
+                         "; redefining it here makes the preprocessor and the assembler disagree");
+            readAtPP.erase(name);
+        }
+        auto r = evalPP(ev, env);
+        if (r.ok) { asmvars[name] = r.value; asmDeferred.erase(name); }
+        else { asmvars.erase(name); asmDeferred.insert(name); }
     }
 
     // Substitution {name} / {=expr} / {expr}
@@ -829,6 +896,16 @@ private:
                 if (!label.empty()) emit(label + ":", raw);
                 expandMacro(mit->second, restAfterFirst(rest), raw, depth);
                 ++i; continue;
+            }
+
+            // --- constante EQU / variable '=' : observée, pas consommée ---
+            if (!label.empty()) {
+                if (kw == "EQU") noteAsmDefinition(label, restAfterFirst(rest), env, raw);
+                else {
+                    size_t eq = findAssign(rest);
+                    if (eq != std::string::npos && trim(rest.substr(0, eq)).empty())
+                        noteAsmDefinition(label, trim(rest.substr(eq + 1)), env, raw);
+                }
             }
 
             // --- ligne ordinaire : passe-plat ---
