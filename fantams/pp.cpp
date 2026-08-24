@@ -301,6 +301,7 @@ private:
     std::map<std::string, int64_t> asmvars;
     std::set<std::string> asmDeferred;
     std::set<std::string> readAtPP;             // noms d'asmvars effectivement lus
+    std::set<std::string> seenLabels;           // labels deja rencontres (pour IFDEF)
     std::map<std::string, Macro> macros;         // clé = nom majuscule
     std::map<std::string, StructDef> structs_;    // clé = nom majuscule
     long uid = 0;
@@ -335,9 +336,19 @@ private:
         return out;
     }
 
+    // IFDEF / IFNDEF. Voit tout ce que le préprocesseur a RENCONTRÉ jusqu'ici :
+    // variables LET, macros, locaux et arguments, mais aussi les constantes et
+    // variables d'assemblage (ADR 0003) et les labels déjà définis — « FOO » seul
+    // sur une ligne est un drapeau, idiome rasm courant.
+    //
+    // La limite est celle de la frontière de phase : un symbole défini PLUS BAS
+    // reste invisible, le préprocesseur n'ayant qu'une passe avant. Ce n'est pas
+    // un manque, c'est ce qu'un préprocesseur peut savoir.
     bool isDefined(const std::string &name, const Env &env) {
         return ppvars.count(name) || macros.count(upper(name)) ||
-               env.locals.count(name) || env.args.count(name);
+               env.locals.count(name) || env.args.count(name) ||
+               asmvars.count(name) || asmDeferred.count(name) ||
+               seenLabels.count(name);
     }
 
     expr::Result evalPP(const std::string &text, const Env &env) {
@@ -776,6 +787,7 @@ private:
             if (code.empty()) { ++i; continue; }
 
             std::string label, rest; peelLabel(code, label, rest, [&](const std::string &n) { return macros.count(n) != 0; });
+            if (!label.empty()) seenLabels.insert(label);
             std::string kw = upper(firstToken(rest));
             std::string secondUp = upper(firstToken(restAfterFirst(rest)));
 
@@ -882,10 +894,14 @@ private:
                 if (endm < 0) { error(raw, "MACRO without ENDM"); return; }
                 Macro m;
                 std::string decl;
+                // "macro foo:" — le ':' de fin fait partie du style courant, il
+                // n'appartient pas au nom. Sans ce retrait, la macro s'enregistre
+                // sous "foo:" et l'appel nu ne la trouve jamais.
                 if (kw == "MACRO") { m.name = firstToken(restAfterFirst(rest)); decl = restAfterFirst(restAfterFirst(rest)); }
                 else { m.name = firstToken(rest); decl = restAfterFirst(restAfterFirst(rest)); }
                 for (auto &p : splitTopLevel(decl, ',')) if (!p.empty()) m.params.push_back(p);
                 for (int j = i + 1; j < endm; ++j) m.body.push_back(lines[j]);
+                if (!m.name.empty() && m.name.back() == ':') m.name.pop_back();
                 if (m.name.empty()) error(raw, "MACRO without a name");
                 else macros[upper(m.name)] = m;
                 i = endm + 1; continue;

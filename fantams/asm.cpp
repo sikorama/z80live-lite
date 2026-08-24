@@ -169,6 +169,8 @@ public:
 
 private:
     std::vector<uint8_t> image_;
+    int instrStart_ = 0;
+    bool inInstruction_ = false;
     std::map<std::string, int64_t> symbols_;
     std::map<std::string, std::string> ciIndex_; // MAJUSCULES(nom) -> nom exact, pour le repli insensible à la casse
     std::set<std::string> definedP1_;
@@ -199,7 +201,11 @@ private:
     int64_t evalExpr(const std::string &text) {
         evalOk_ = true;
         auto r = expr::eval(text, [&](const std::string &n, int64_t &o) -> bool {
-            if (n == "$") { o = pc_ & 0xFFFF; return true; }
+            // '$' vaut l'adresse de DÉBUT de l'instruction, pas la position
+            // courante : pendant l'encodage, les octets d'opcode sont déjà émis
+            // et pc_ a avancé (de 1, ou de 2 pour un préfixe DD/FD). Hors
+            // instruction (db/dw/equ), pc_ EST la bonne réponse.
+            if (n == "$") { o = (inInstruction_ ? instrStart_ : pc_) & 0xFFFF; return true; }
             std::string qn = qualify(n);
             auto it = symbols_.find(qn);
             if (it != symbols_.end()) { o = it->second; return true; }
@@ -260,11 +266,17 @@ private:
     }
     void emitDS(const std::string &ops) {
         auto parts = splitTopLevel(ops, ',');
+        dropTrailingEmpty(parts);
         if (parts.empty()) { structErr("DS: missing size"); return; }
-        int64_t n = evalExpr(parts[0]);
-        if (!evalOk_) { structErr("DS: size not resolvable in pass 1"); return; }
-        int64_t fill = parts.size() > 1 ? evalExpr(parts[1]) : 0;
-        for (int64_t k = 0; k < n; ++k) emit((uint8_t)(fill & 0xFF));
+        // Plusieurs paires "compte,valeur" sur une même ligne : "ds 3,1,3,2"
+        // réserve 3 octets à 1 puis 3 à 2. N'honorer que la première faussait la
+        // LONGUEUR autant que le contenu.
+        for (size_t p = 0; p < parts.size(); p += 2) {
+            int64_t n = evalExpr(parts[p]);
+            if (!evalOk_) { structErr("DS: size not resolvable in pass 1"); return; }
+            int64_t fill = (p + 1 < parts.size()) ? evalExpr(parts[p + 1]) : 0;
+            for (int64_t k = 0; k < n; ++k) emit((uint8_t)(fill & 0xFF));
+        }
     }
 
     void process(const SourceLine &sl) {
@@ -291,7 +303,10 @@ private:
             if (!label.empty()) defineLabel(label);
             else if (cur_.col0)
                 warn("instruction '" + pr.mnemonic + "' in column 1 (best practice: indent instructions — only labels/symbols should start in column 1)");
+            instrStart_ = pc_;
+            inInstruction_ = true;
             z80::encode(*this, pr.instr);
+            inInstruction_ = false;
             return;
         }
         if (rest.empty()) { if (!label.empty()) defineLabel(label); return; }
