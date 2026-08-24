@@ -141,7 +141,11 @@ function writeIncludes(FS, includes = []) {
   }
 }
 
-async function runModule(factory, args, sourceText, expectedOut, includes) {
+// `dump` (optionnel) : { args, path } — une SECONDE invocation dans la MÊME
+// instance WASM, dont le fichier produit est renvoyé en texte. Sert à obtenir la
+// source déroulée (fantams -E) sans réinstancier le module, l'instanciation
+// étant de loin la partie coûteuse.
+async function runModule(factory, args, sourceText, expectedOut, includes, dump) {
   const log = [];
   let error = null;
   let Module;
@@ -161,7 +165,18 @@ async function runModule(factory, args, sourceText, expectedOut, includes) {
     else { exitCode = -1; error = e?.message || String(e); }
   }
   const { data, ext } = readOutput(Module.FS, expectedOut);
-  return { log, data, ext, exitCode, error };
+
+  let dumped = null;
+  if (dump) {
+    try {
+      Module.callMain(dump.args);
+    } catch (e) {
+      if (typeof e?.status !== 'number') dumped = null; // trap : on renonce, sans masquer l'assemblage
+    }
+    try { dumped = new TextDecoder().decode(Module.FS.readFile(dump.path)); } catch { dumped = null; }
+  }
+
+  return { log, data, ext, exitCode, error, dumped };
 }
 
 export async function assemble(source, factories) {
@@ -182,9 +197,15 @@ export async function assemble(source, factories) {
 
   if (assembler === 'fantams') {
     const wrapped = wrapFantams(code, opts);
-    const r = await runModule(factories.createFantams, ['/in.asm', '-o', OUT + '.sna'], wrapped, OUT + '.sna', includes);
+    // fantams a un vrai preprocesseur : `preprocessed` porte la SOURCE DEROULEE
+    // (macros expansees, boucles deroulees, includes inseres), pas la source
+    // d'entree. Pour rasm et sjasmplus, faute d'equivalent, elle reste l'entree.
+    const r = await runModule(
+      factories.createFantams, ['/in.asm', '-o', OUT + '.sna'], wrapped, OUT + '.sna', includes,
+      { args: ['/in.asm', '-E', '-o', '/out.pp'], path: '/out.pp' });
     const ok = r.exitCode === 0 && !!r.data;
-    return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error, preprocessed: wrapped, lineOffset: headerLineCount(wrapped, code) };
+    return { ok, assembler, ext: r.ext, output: ok ? r.data : null, log: r.log, error: r.error,
+             preprocessed: r.dumped ?? wrapped, lineOffset: headerLineCount(wrapped, code) };
   }
 
   // rasm (+ uz80 traité comme rasm en attendant)

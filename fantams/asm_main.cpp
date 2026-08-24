@@ -1,8 +1,12 @@
 // asm_main.cpp - end-to-end CLI: .asm source -> preprocessor -> assembler -> .bin
 //
-//   fantams file.asm [-o output.bin] [-s]
+//   fantams file.asm [-o output.bin] [-s] [-E]
 //     -o : output binary file (default: <source>.bin)
 //     -s : print the symbol table
+//     -E : write the UNROLLED source to -o instead of assembling (macros
+//          expanded, loops unrolled, includes inserted, scopes renamed).
+//          C'est un livrable de premier plan, pas un artefact de debogage :
+//          c'est lui qui rend verifiable ce que le preprocesseur a compris.
 #include "asm.h"
 #include "pp.h"
 #include "sna.h"
@@ -24,10 +28,12 @@ static bool readFile(const std::string &path, std::string &out) {
 int main(int argc, char **argv) {
     std::string path, outPath;
     bool showSyms = false;
+    bool dumpOnly = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) outPath = argv[++i];
         else if (a == "-s") showSyms = true;
+        else if (a == "-E") dumpOnly = true;
         else path = a;
     }
     if (path.empty()) { fprintf(stderr, "usage: fantams file.asm [-o output.bin] [-s]\n"); return 2; }
@@ -45,6 +51,16 @@ int main(int argc, char **argv) {
     if (!pre.ok) {
         for (auto &e : pre.errors) fprintf(stderr, "%s:%d: error (preproc): %s\n", e.file.c_str(), e.line, e.message.c_str());
         return 1;
+    }
+
+    // -E : la source deroulee est le resultat demande, on s'arrete la.
+    if (dumpOnly) {
+        std::string text = pre.dump();
+        std::ofstream f(outPath, std::ios::binary);
+        if (!f) { fprintf(stderr, "error: cannot write: %s\n", outPath.c_str()); return 2; }
+        f.write(text.data(), (std::streamsize)text.size());
+        fprintf(stderr, "%s: unrolled source (%zu lines)\n", outPath.c_str(), pre.lines.size());
+        return 0;
     }
 
     // 2) assembler (2 passes) on the flat text

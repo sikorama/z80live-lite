@@ -945,7 +945,13 @@ private:
             auto mit = macros.find(upper(firstToken(rest)));
             if (mit != macros.end()) {
                 if (!label.empty()) emit(label + ":", raw);
-                expandMacro(mit->second, restAfterFirst(rest), raw, depth);
+                // Les arguments sont evalues dans la portee de l'APPELANT : sans ce
+                // substituteVars, un compteur de REPEAT passe a une macro
+                // ("repeat 3,k / poke k*2") traversait l'expansion tel quel et
+                // echouait plus tard en "unknown symbol 'k'". Le nom de la macro
+                // n'etant pas un mnemonique Z80, la protection des noms de
+                // registres ne s'applique pas ici — c'est le comportement voulu.
+                expandMacro(mit->second, restAfterFirst(substituteVars(rest, env)), raw, depth);
                 ++i; continue;
             }
 
