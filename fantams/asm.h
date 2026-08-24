@@ -37,6 +37,7 @@ struct Output {
     std::map<std::string, int64_t> symbols;
     std::vector<Diagnostic> errors;
     std::vector<Diagnostic> warnings;          // bonnes pratiques (non bloquant) : label sans ':', instruction en colonne 1...
+    std::vector<Diagnostic> prints;            // sorties de PRINT (diagnostic de build, ni erreur ni avertissement)
     std::vector<uint8_t> image;                // image mémoire 64K complète (pour SNA)
 };
 

@@ -57,6 +57,11 @@ bool isReservedWord(const std::string &upperTok) {
         // directives rasm reconnues mais non implémentées (hors périmètre) : gardées
         // réservées pour échouer proprement plutôt que d'être lues comme un label.
         "BUILDSNA", "BANKSET", "NOLIST", "LIST",
+        // Directives reconnues OU explicitement refusees : dans les deux cas
+        // elles ne sont pas des labels. Sans ca, « BANK 4 » est lu comme un
+        // label « BANK » suivi d'une directive « 4 », et le diagnostic parle
+        // d'un token que personne n'a ecrit.
+        "ASSERT", "PRINT", "BANK", "SNASET", "SETCPC", "TICKER", "STR",
     };
     return kw.count(upperTok) != 0;
 }
@@ -108,10 +113,28 @@ size_t findAssign(const std::string &s) {
     }
     return std::string::npos;
 }
+// Retire les guillemets englobants et deshabille les echappements.
+std::string unquote(const std::string &s) {
+    if (s.size() >= 2 && (s[0] == '"' || s[0] == '\'') && s.back() == s[0])
+        return s.substr(1, s.size() - 2);
+    return s;
+}
 char unescape(char c) {
     switch (c) { case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
         case '0': return '\0'; case '\\': return '\\'; case '"': return '"'; case '\'': return '\''; }
     return c;
+}
+
+// Rendu d'une valeur pour PRINT, selon le mot-cle de format (ADR 0011).
+std::string formatValue(int64_t v, const std::string &fmt) {
+    if (fmt == "CHAR") return std::string(1, (char)(v & 0xFF));
+    if (fmt == "HEX") { char b[32]; snprintf(b, sizeof b, "#%llX", (unsigned long long)(v & 0xFFFFFFFF)); return b; }
+    if (fmt == "BIN") {
+        uint64_t u = (uint64_t)v; int hi = 63; while (hi > 0 && !((u >> hi) & 1)) --hi;
+        std::string s = "%"; for (int k = hi; k >= 0; --k) s += ((u >> k) & 1) ? '1' : '0';
+        return s;
+    }
+    return std::to_string(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +171,7 @@ public:
         for (const auto &kv : symbols_) o.symbols[kv.first] = (int64_t)std::llround(kv.second);
         o.errors = errors_;
         o.warnings = warnings_;
+        o.prints = prints_;
         o.ok = errors_.empty();
         o.image = image_;
         if (hi_ > lo_) {
@@ -174,6 +198,7 @@ public:
 
 private:
     std::vector<uint8_t> image_;
+    std::vector<Diagnostic> prints_;
     double lastReal_ = 0;
     bool evalRealLast_ = false;
     int instrStart_ = 0;
@@ -349,6 +374,53 @@ private:
         if (W0 == "DB" || W0 == "DEFB" || W0 == "DM" || W0 == "DEFM") { if (!label.empty()) defineLabel(label); emitDB(after0); return; }
         if (W0 == "DW" || W0 == "DEFW") { if (!label.empty()) defineLabel(label); emitDW(after0); return; }
         if (W0 == "DS" || W0 == "DEFS" || W0 == "RMB") { if (!label.empty()) defineLabel(label); emitDS(after0); return; }
+
+        // --- ASSERT / PRINT : verifier et inspecter -------------------------
+        // Evalues en passe 2 uniquement : les labels y sont resolus, et PRINT ne
+        // doit parler qu'une fois. Ce sont des outils de DIAGNOSTIC DE BUILD, la
+        // meme famille que la source deroulee — ils disent ce que l'assembleur a
+        // compris, ils ne decrivent pas la machine cible.
+        if (W0 == "ASSERT") {
+            if (!label.empty()) defineLabel(label);
+            if (pass_ != 2) return;
+            auto parts = splitTopLevel(after0, ',');
+            if (parts.empty()) { structErr("ASSERT: missing condition"); return; }
+            if (evalExpr(parts[0]) == 0) {
+                std::string msg = "assertion failed: " + trim(parts[0]);
+                if (parts.size() > 1) msg += " — " + unquote(trim(parts[1]));
+                // push() et non structErr() : ce dernier ne rapporte qu'en passe 1
+                // pour eviter les doublons, or ASSERT ne s'evalue qu'en passe 2,
+                // quand les labels sont resolus. Son erreur y etait avalee.
+                push(msg);
+            }
+            return;
+        }
+        if (W0 == "PRINT") {
+            if (!label.empty()) defineLabel(label);
+            if (pass_ != 2) return;
+            std::string out;
+            for (auto &p : splitTopLevel(after0, ',')) {
+                std::string a = trim(p);
+                if (a.empty()) continue;
+                if (a[0] == '"' || a[0] == '\'') { out += unquote(a); continue; }
+                // Prefixe de format en MOT NU (ADR 0011) : « print "a=", hex v ».
+                // Pas d'accolades : dans fantams « {X} » ne veut dire qu'une chose,
+                // evaluer X et substituer.
+                std::string fmt = upper(firstToken(a));
+                if (fmt == "HEX" || fmt == "BIN" || fmt == "CHAR" || fmt == "INT") a = restAfterFirst(a);
+                else fmt = "INT";
+                out += formatValue(evalExpr(a), fmt);
+            }
+            prints_.push_back({cur_.file, cur_.line, out});
+            return;
+        }
+        // Refusees ou differees : le diagnostic nomme le remplacant plutot que de
+        // laisser croire a un oubli. Cf. ADR 0004 (formats hors du source),
+        // ADR 0005 (banques) et round 4 (TICKER).
+        if (W0 == "BANK") { structErr("BANK is not supported: write 'org b" + trim(after0) + ":<address>' instead (the bank and the address belong on the same line)"); return; }
+        if (W0 == "SNASET" || W0 == "SETCPC") { structErr(w0 + " describes the OUTPUT format, not the program: pass it at invocation instead of in the source"); return; }
+        if (W0 == "TICKER") { structErr("TICKER is not supported: cycle counting is a control-flow analysis, not a directive (it cannot account for conditional jumps)"); return; }
+        if (W0 == "STR") { structErr("STR is not implemented yet: use 'db' (STR emits the string with bit 7 set on the last character)"); return; }
 
         // définition de symbole : "name: EQU v" / "name EQU v" / "name = v"
         if (W0 == "EQU") {

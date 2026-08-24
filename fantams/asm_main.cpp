@@ -67,6 +67,10 @@ int main(int argc, char **argv) {
     std::vector<asmb::SourceLine> lines;
     for (auto &l : pre.lines) lines.push_back({l.text, l.file, l.line, l.col0});
     asmb::Output out = asmb::assemble(lines);
+    // PRINT n'est ni une erreur ni un avertissement : c'est ce que la source a
+    // demande d'afficher. Sur stderr comme le reste, pour que stdout reste libre
+    // (l'option -E y ecrit la source deroulee).
+    for (auto &p : out.prints) fprintf(stderr, "%s:%d: %s\n", p.file.c_str(), p.line, p.message.c_str());
     for (auto &w : out.warnings) fprintf(stderr, "%s:%d: warning: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!out.ok) {
         for (auto &e : out.errors) fprintf(stderr, "%s:%d: error: %s\n", e.file.c_str(), e.line, e.message.c_str());

@@ -86,6 +86,11 @@ bool isReservedWord(const std::string &upperTok) {
         "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
         "DS", "DEFS", "RMB", "EQU",
         "BUILDSNA", "BANKSET", "NOLIST", "LIST",
+        // Directives reconnues OU explicitement refusees : dans les deux cas
+        // elles ne sont pas des labels. Sans ca, « BANK 4 » est lu comme un
+        // label « BANK » suivi d'une directive « 4 », et le diagnostic parle
+        // d'un token que personne n'a ecrit.
+        "ASSERT", "PRINT", "BANK", "SNASET", "SETCPC", "TICKER", "STR",
         // mots-clés du préprocesseur lui-même (sinon "LET N = 3", "REPEAT 3,i", etc.
         // sont lus comme un label collé "LET"/"REPEAT" suivi du reste).
         "LET", "IF", "IFDEF", "IFNDEF", "ELSE", "ELSEIF", "ENDIF",
