@@ -46,6 +46,16 @@ std::string stripBlockComments(const std::string &s) {
     for (size_t i = 0; i < s.size(); ) {
         char c = s[i];
         if (inStr) { out += c; if (c == q) inStr = false; ++i; continue; }
+        // Commentaire de ligne (';' ou '//') : recopié tel quel jusqu'au saut de
+        // ligne, SANS interpréter les quotes. Sans ça, une apostrophe dans un
+        // commentaire français ("l'image", "d'après") ouvre une chaîne qui ne se
+        // referme jamais, et tous les /* ... */ du reste du fichier deviennent
+        // invisibles — constaté sur deux sources du corpus, où le bloc masqué
+        // était respectivement 28 et 1000 lignes plus bas.
+        if (c == ';' || (c == '/' && i + 1 < s.size() && s[i + 1] == '/')) {
+            while (i < s.size() && s[i] != '\n') out += s[i++];
+            continue;
+        }
         if (c == '"' || c == '\'') { inStr = true; q = c; out += c; ++i; continue; }
         if (c == '/' && i + 1 < s.size() && s[i + 1] == '*') {
             size_t j = s.find("*/", i + 2);
@@ -73,7 +83,7 @@ bool isReservedWord(const std::string &upperTok) {
     };
     return kw.count(upperTok) != 0;
 }
-// Retire le commentaire ';' (hors chaîne/caractère).
+// Retire le commentaire de ligne (';' ou '//'), hors chaîne/caractère.
 std::string stripComment(const std::string &s) {
     bool inStr = false; char q = 0;
     for (size_t i = 0; i < s.size(); ++i) {
@@ -81,6 +91,8 @@ std::string stripComment(const std::string &s) {
         if (inStr) { if (c == q) inStr = false; continue; }
         if (c == '"' || c == '\'') { inStr = true; q = c; }
         else if (c == ';') return s.substr(0, i);
+        // Commentaire de ligne C : '//' (le '/' isolé reste la division).
+        else if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') return s.substr(0, i);
     }
     return s;
 }

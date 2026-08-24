@@ -29,6 +29,8 @@ std::string stripComment(const std::string &s) {
         if (inStr) { if (c == q) inStr = false; continue; }
         if (c == '"' || c == '\'') { inStr = true; q = c; }
         else if (c == ';') return s.substr(0, i);
+        // Commentaire de ligne C : '//' (le '/' isolé reste la division).
+        else if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') return s.substr(0, i);
     }
     return s;
 }
@@ -237,9 +239,19 @@ private:
             }
         } else emit((uint8_t)(evalExpr(p) & 0xFF));
     }
-    void emitDB(const std::string &ops) { for (auto &p : splitTopLevel(ops, ',')) emitByteOrStr(p); }
+    // Une virgule finale ("db 1,2,") est tolérée : elle est courante dans les
+    // tables de données générées, et rasm l'accepte. Seul le DERNIER élément vide
+    // est retiré — "db 1,,2" reste une erreur.
+    static void dropTrailingEmpty(std::vector<std::string> &parts) {
+        if (parts.size() > 1 && parts.back().empty()) parts.pop_back();
+    }
+    void emitDB(const std::string &ops) {
+        auto parts = splitTopLevel(ops, ','); dropTrailingEmpty(parts);
+        for (auto &p : parts) emitByteOrStr(p);
+    }
     void emitDW(const std::string &ops) {
-        for (auto &p : splitTopLevel(ops, ',')) { int64_t v = evalExpr(p); emit((uint8_t)(v & 0xFF)); emit((uint8_t)((v >> 8) & 0xFF)); }
+        auto parts = splitTopLevel(ops, ','); dropTrailingEmpty(parts);
+        for (auto &p : parts) { int64_t v = evalExpr(p); emit((uint8_t)(v & 0xFF)); emit((uint8_t)((v >> 8) & 0xFF)); }
     }
     void emitDS(const std::string &ops) {
         auto parts = splitTopLevel(ops, ',');

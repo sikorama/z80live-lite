@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <cmath>
+#include <set>
 #include <stdexcept>
 
 namespace expr {
@@ -38,6 +39,24 @@ struct Parser {
         if (i + n <= s.size() && s.compare(i, n, op) == 0) { i += n; return true; }
         return false;
     }
+    // Opérateur textuel (and/or/xor/not/mod/shl/shr/div) : casse indifférente, et
+    // doit être suivi d'un caractère non-identifiant — sinon "android" serait lu
+    // comme "and" suivi de "roid". Ces mots sont aussi des mnémoniques Z80, mais
+    // sans conflit possible : parser.cpp sépare le mnémonique des opérandes avant
+    // qu'expr ne voie quoi que ce soit ("ld a, b and 3" livre bien "b and 3").
+    bool eatWord(const char *w) {
+        skip();
+        size_t n = 0; while (w[n]) ++n;
+        if (i + n > s.size()) return false;
+        for (size_t k = 0; k < n; ++k)
+            if (std::tolower((unsigned char)s[i + k]) != std::tolower((unsigned char)w[k])) return false;
+        if (i + n < s.size()) {
+            char nx = s[i + n];
+            if (std::isalnum((unsigned char)nx) || nx == '_' || nx == '.' || nx == '@') return false;
+        }
+        i += n;
+        return true;
+    }
 
     [[noreturn]] void fail(const std::string &m) { throw EvalError{m}; }
 
@@ -54,17 +73,17 @@ struct Parser {
     }
     double bitOr() {
         double v = bitXor();
-        for (;;) { skip(); if (i+1 < s.size() && s[i]=='|' && s[i+1]=='|') break; if (eat("|")) v = (double)(toInt(v) | toInt(bitXor())); else break; }
+        for (;;) { skip(); if (i+1 < s.size() && s[i]=='|' && s[i+1]=='|') break; if (eat("|") || eatWord("or")) v = (double)(toInt(v) | toInt(bitXor())); else break; }
         return v;
     }
     double bitXor() {
         double v = bitAnd();
-        for (;;) { skip(); if (eat("^")) v = (double)(toInt(v) ^ toInt(bitAnd())); else break; }
+        for (;;) { skip(); if (eat("^") || eatWord("xor")) v = (double)(toInt(v) ^ toInt(bitAnd())); else break; }
         return v;
     }
     double bitAnd() {
         double v = equality();
-        for (;;) { skip(); if (i+1 < s.size() && s[i]=='&' && s[i+1]=='&') break; if (eat("&")) v = (double)(toInt(v) & toInt(equality())); else break; }
+        for (;;) { skip(); if (i+1 < s.size() && s[i]=='&' && s[i+1]=='&') break; if (eat("&") || eatWord("and")) v = (double)(toInt(v) & toInt(equality())); else break; }
         return v;
     }
     double equality() {
@@ -88,7 +107,9 @@ struct Parser {
     }
     double shift() {
         double v = additive();
-        for (;;) { skip(); if (eat("<<")) v = (double)(toInt(v) << toInt(additive())); else if (eat(">>")) v = (double)(toInt(v) >> toInt(additive())); else break; }
+        for (;;) { skip(); if (eat("<<") || eatWord("shl")) v = (double)(toInt(v) << toInt(additive()));
+            else if (eat(">>") || eatWord("shr")) v = (double)(toInt(v) >> toInt(additive()));
+            else break; }
         return v;
     }
     double additive() {
@@ -102,7 +123,11 @@ struct Parser {
             skip();
             if (eat("*")) v *= unary();
             else if (eat("/")) { double d = unary(); if (d == 0) fail("division by zero"); v /= d; }
-            else if (eat("%")) { int64_t d = toInt(unary()); if (d == 0) fail("modulo by zero"); v = (double)(toInt(v) % d); }
+            else if (eat("%") || eatWord("mod")) { int64_t d = toInt(unary()); if (d == 0) fail("modulo by zero"); v = (double)(toInt(v) % d); }
+            // Division entière. '//' n'est PAS retenu pour cet usage : il est
+            // réservé au commentaire de ligne. Arrondi vers -infini (floor), pas
+            // troncature vers zéro : "div" est le raccourci de floor(a/b).
+            else if (eatWord("div")) { double d = unary(); if (d == 0) fail("division by zero"); v = std::floor(v / d); }
             else break;
         }
         return v;
@@ -111,7 +136,7 @@ struct Parser {
         skip();
         if (eat("-")) return -unary();
         if (eat("+")) return unary();
-        if (eat("~")) return (double)(~toInt(unary()));
+        if (eat("~") || eatWord("not")) return (double)(~toInt(unary()));
         if (eat("!")) return unary() == 0 ? 1 : 0;
         return primary();
     }
@@ -177,16 +202,34 @@ struct Parser {
     // Fonctions rasm reconnues (angles en degrés pour sin/cos, comme rasm).
     // hi()/lo() opèrent sur la valeur convertie en entier (extraction d'octet).
     bool callBuiltin(const std::string &upperName, double &out) {
-        if (upperName != "SIN" && upperName != "COS" && upperName != "ABS" &&
-            upperName != "HI" && upperName != "LO") return false;
+        static const std::set<std::string> unary1 = {
+            "SIN", "COS", "ABS", "HI", "LO",
+            // Arrondis explicites. FLOOR vaut 99 usages dans le corpus — de loin le
+            // plus gros manque mesuré — parce que '/' est une division flottante :
+            // qui veut tronquer doit l'écrire. ROUND délègue à toInt(), donc il suit
+            // automatiquement la règle de départage retenue.
+            "FLOOR", "CEIL", "INT", "ROUND",
+        };
+        static const std::set<std::string> binary2 = { "MIN", "MAX" };
+        const bool is1 = unary1.count(upperName) != 0;
+        const bool is2 = binary2.count(upperName) != 0;
+        if (!is1 && !is2) return false;
         if (!eat("(")) fail("expected '(' after " + upperName);
         double a = logOr();
+        double b = 0;
+        if (is2) { if (!eat(",")) fail(upperName + ": expected ',' (2 arguments)"); b = logOr(); }
         if (!eat(")")) fail("expected ')'");
         if (upperName == "SIN") out = std::sin(a * M_PI / 180.0);
         else if (upperName == "COS") out = std::cos(a * M_PI / 180.0);
         else if (upperName == "ABS") out = std::fabs(a);
         else if (upperName == "HI") out = (double)((toInt(a) >> 8) & 0xFF);
-        else out = (double)(toInt(a) & 0xFF); // LO
+        else if (upperName == "LO") out = (double)(toInt(a) & 0xFF);
+        else if (upperName == "FLOOR") out = std::floor(a);   // vers -infini
+        else if (upperName == "CEIL") out = std::ceil(a);     // vers +infini
+        else if (upperName == "INT") out = std::trunc(a);     // vers zéro
+        else if (upperName == "ROUND") out = (double)toInt(a);
+        else if (upperName == "MIN") out = a < b ? a : b;
+        else out = a > b ? a : b; // MAX
         return true;
     }
     double parseIdentOrCall() {
