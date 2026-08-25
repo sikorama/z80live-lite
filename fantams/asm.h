@@ -37,7 +37,13 @@ struct Output {
     std::map<std::string, int64_t> symbols;
     std::vector<Diagnostic> errors;
     std::vector<Diagnostic> warnings;          // bonnes pratiques (non bloquant) : label sans ':', instruction en colonne 1...
+    std::vector<Diagnostic> prints;            // sorties de PRINT (diagnostic de build, ni erreur ni avertissement)
     std::vector<uint8_t> image;                // image mémoire 64K complète (pour SNA)
+    // coverage : 65536 octets, non nul là où le source a RÉELLEMENT écrit. Elle
+    // distingue « le source a écrit 0x00 ici » de « le source n'a rien écrit
+    // ici » — distinction que l'image seule ne porte pas, et sans laquelle le
+    // backend ne saurait pas quels octets d'une base laisser en place (ADR 0012).
+    std::vector<uint8_t> coverage;
 };
 
 Output assemble(const std::vector<SourceLine> &lines);

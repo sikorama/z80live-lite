@@ -1,6 +1,9 @@
 // asm.cpp - Assembleur 2 passes (voir asm.h)
 #include "asm.h"
+
+#include <cmath>
 #include "expr.h"
+#include "keywords.h"
 #include "parser.h"
 #include "z80.h"
 
@@ -12,9 +15,7 @@
 namespace asmb {
 namespace {
 
-bool isIdentChar(char c) {
-    return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '@';
-}
+using kw::isIdentChar;
 std::string upper(std::string s) { for (char &c : s) c = (char)std::toupper((unsigned char)c); return s; }
 std::string trim(const std::string &s) {
     size_t a = 0, b = s.size();
@@ -22,16 +23,7 @@ std::string trim(const std::string &s) {
     while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
     return s.substr(a, b - a);
 }
-std::string stripComment(const std::string &s) {
-    bool inStr = false; char q = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (inStr) { if (c == q) inStr = false; continue; }
-        if (c == '"' || c == '\'') { inStr = true; q = c; }
-        else if (c == ';') return s.substr(0, i);
-    }
-    return s;
-}
+using kw::stripComment;
 std::string firstToken(const std::string &s) {
     size_t a = 0; while (a < s.size() && std::isspace((unsigned char)s[a])) ++a;
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
@@ -41,37 +33,6 @@ std::string restAfterFirst(const std::string &s) {
     size_t a = 0; while (a < s.size() && std::isspace((unsigned char)s[a])) ++a;
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
-}
-// Mots-clés qui ne peuvent jamais être un label sans ':' — même liste que parser.cpp
-// (mnémoniques Z80 + directives gérées ici). Permet de tolérer "start" (label,
-// sans ':') sans le confondre avec une instruction/directive.
-bool isReservedWord(const std::string &upperTok) {
-    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
-    static const std::set<std::string> kw = {
-        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
-        "DS", "DEFS", "RMB", "EQU",
-        // directives rasm reconnues mais non implémentées (hors périmètre) : gardées
-        // réservées pour échouer proprement plutôt que d'être lues comme un label.
-        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
-    };
-    return kw.count(upperTok) != 0;
-}
-void peelLabel(const std::string &code, std::string &label, std::string &rest, bool *sawColon = nullptr) {
-    size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
-    if (p > 0) {
-        size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
-        if (q < code.size() && code[q] == ':') {
-            label = code.substr(0, p); rest = trim(code.substr(q + 1));
-            if (sawColon) *sawColon = true;
-            return;
-        }
-        if (!isReservedWord(upper(code.substr(0, p)))) {
-            label = code.substr(0, p); rest = trim(code.substr(p));
-            if (sawColon) *sawColon = false;
-            return;
-        }
-    }
-    label.clear(); rest = code;
 }
 std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
     std::vector<std::string> out;
@@ -104,10 +65,28 @@ size_t findAssign(const std::string &s) {
     }
     return std::string::npos;
 }
+// Retire les guillemets englobants et deshabille les echappements.
+std::string unquote(const std::string &s) {
+    if (s.size() >= 2 && (s[0] == '"' || s[0] == '\'') && s.back() == s[0])
+        return s.substr(1, s.size() - 2);
+    return s;
+}
 char unescape(char c) {
     switch (c) { case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
         case '0': return '\0'; case '\\': return '\\'; case '"': return '"'; case '\'': return '\''; }
     return c;
+}
+
+// Rendu d'une valeur pour PRINT, selon le mot-cle de format (ADR 0011).
+std::string formatValue(int64_t v, const std::string &fmt) {
+    if (fmt == "CHAR") return std::string(1, (char)(v & 0xFF));
+    if (fmt == "HEX") { char b[32]; snprintf(b, sizeof b, "#%llX", (unsigned long long)(v & 0xFFFFFFFF)); return b; }
+    if (fmt == "BIN") {
+        uint64_t u = (uint64_t)v; int hi = 63; while (hi > 0 && !((u >> hi) & 1)) --hi;
+        std::string s = "%"; for (int k = hi; k >= 0; --k) s += ((u >> k) & 1) ? '1' : '0';
+        return s;
+    }
+    return std::to_string(v);
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +94,9 @@ class Assembler : public z80::IAsmContext {
 public:
     Output run(const std::vector<SourceLine> &lines) {
         image_.assign(65536, 0);
+        prov_.assign(65536, 0);
+        sites_.clear();
+        ov_.active = false;
         symbols_.clear();
         ciIndex_.clear();
 
@@ -127,7 +109,7 @@ public:
         for (int iter = 0; iter < 32; ++iter) {
             bool changed = false;
             for (const auto &d : equDefs_) {
-                int64_t v = evalExpr(d.second);
+                double v = evalExprReal(d.second);
                 auto it = symbols_.find(d.first);
                 if (it == symbols_.end() || it->second != v) { setSymbol(d.first, v); changed = true; }
             }
@@ -136,13 +118,20 @@ public:
 
         pass_ = 2; pc_ = 0; lo_ = 0x10000; hi_ = 0; currentGlobal_.clear();
         for (const auto &l : lines) process(l);
+        flushOverlap();   // le dernier chevauchement accumulé doit sortir avant les diagnostics
 
         Output o;
-        o.symbols = symbols_;
+        // Output.symbols reste entier : c'est une table d'ADRESSES destinee aux
+        // outils et aux humains. La precision reelle n'a d'interet qu'a
+        // l'interieur du calcul d'expressions.
+        for (const auto &kv : symbols_) o.symbols[kv.first] = (int64_t)std::llround(kv.second);
         o.errors = errors_;
         o.warnings = warnings_;
+        o.prints = prints_;
         o.ok = errors_.empty();
         o.image = image_;
+        o.coverage.assign(65536, 0);
+        for (int a = 0; a < 65536; ++a) o.coverage[a] = prov_[a] ? 1 : 0;
         if (hi_ > lo_) {
             o.loadAddress = (uint16_t)lo_;
             o.bin.assign(image_.begin() + lo_, image_.begin() + hi_);
@@ -155,6 +144,7 @@ public:
     void emit(uint8_t b) override {
         int a = pc_ & 0xFFFF;
         if (pass_ == 2) {
+            noteWrite(a);
             image_[a] = b;
             if (a < lo_) lo_ = a;
             if (a + 1 > hi_) hi_ = a + 1;
@@ -166,8 +156,71 @@ public:
     int64_t eval(const std::string &e) override { return evalExpr(e); }
 
 private:
+    // --- coverage et provenance (ADR 0012) ---------------------------------
+    // prov_[a] : 0 = jamais écrit, sinon 1+index dans sites_, ou kUnknownSite.
+    // Deux octets par octet d'image, aujourd'hui sur une image plate de 64K ; le
+    // jour où l'image devient une collection d'espaces d'adressage (ADR 0006),
+    // c'est l'espace qui portera sa coverage, allouée à la première écriture.
+    static const uint16_t kUnknownSite = 0xFFFF;
+
+    struct Site { std::string file; int line; };
+    // Un chevauchement en cours d'accumulation : les octets consécutifs qui
+    // partagent le même couple (site écrasé, site écrasant) ne donnent qu'un
+    // seul avertissement. C'est cette coalescence, et non un plafond, qui
+    // empêche un bloc réécrit de produire un avertissement par octet.
+    struct Overlap { bool active = false; int start = 0, end = 0; uint16_t prev = 0, cur = 0; };
+
+    std::vector<uint16_t> prov_;
+    std::vector<Site> sites_;
+    int curSite_ = -1;      // site de la ligne courante, alloué à sa 1re écriture
+    Overlap ov_;
+
+    // Alloue paresseusement le site de la ligne courante : seules les lignes qui
+    // émettent des octets entrent dans la table.
+    uint16_t siteId() {
+        if (curSite_ >= 0) return (uint16_t)curSite_;
+        if (sites_.size() >= kUnknownSite - 1) { curSite_ = kUnknownSite; return kUnknownSite; }
+        sites_.push_back({cur_.file, cur_.line});
+        curSite_ = (int)sites_.size();   // 1-based : 0 signifie « jamais écrit »
+        return (uint16_t)curSite_;
+    }
+
+    std::string siteLabel(uint16_t id) const {
+        if (id == 0 || id == kUnknownSite) return "site inconnu";
+        const Site &s = sites_[id - 1];
+        return s.file + ":" + std::to_string(s.line);
+    }
+
+    void flushOverlap() {
+        if (!ov_.active) return;
+        ov_.active = false;
+        char range[64];
+        if (ov_.end - ov_.start == 1) snprintf(range, sizeof range, "&%04X", ov_.start);
+        else snprintf(range, sizeof range, "&%04X-&%04X", ov_.start, ov_.end - 1);
+        std::string where = (ov_.cur == 0 || ov_.cur == kUnknownSite)
+                                ? std::string() : sites_[ov_.cur - 1].file;
+        int line = (ov_.cur == 0 || ov_.cur == kUnknownSite) ? 0 : sites_[ov_.cur - 1].line;
+        warnings_.push_back({where, line,
+            std::string("chevauchement : ") + range + " deja ecrit par " + siteLabel(ov_.prev)});
+    }
+
+    void noteWrite(int a) {
+        uint16_t site = siteId();
+        uint16_t prev = prov_[a];
+        prov_[a] = site;
+        if (prev == 0 || prev == site) return;   // écrire sur du vierge, ou se relire soi-même
+        if (ov_.active && ov_.end == a && ov_.prev == prev && ov_.cur == site) { ov_.end = a + 1; return; }
+        flushOverlap();
+        ov_ = {true, a, a + 1, prev, site};
+    }
+
     std::vector<uint8_t> image_;
-    std::map<std::string, int64_t> symbols_;
+    std::vector<Diagnostic> prints_;
+    double lastReal_ = 0;
+    bool evalRealLast_ = false;
+    int instrStart_ = 0;
+    bool inInstruction_ = false;
+    std::map<std::string, double> symbols_;   // exact ; arrondi seulement a la sortie
     std::map<std::string, std::string> ciIndex_; // MAJUSCULES(nom) -> nom exact, pour le repli insensible à la casse
     std::set<std::string> definedP1_;
     std::vector<std::pair<std::string, std::string>> equDefs_; // (nom, texte expr) pour la résolution
@@ -192,12 +245,21 @@ private:
     std::string qualify(const std::string &n) const {
         return (!n.empty() && n[0] == '.') ? currentGlobal_ + n : n;
     }
-    void setSymbol(const std::string &n, int64_t v) { symbols_[n] = v; ciIndex_[upper(n)] = n; }
+    void setSymbol(const std::string &n, double v) { symbols_[n] = v; ciIndex_[upper(n)] = n; }
 
+    // Deux lectures d'une même expression : `evalExpr` pour émettre des octets,
+    // `evalExprReal` pour DÉFINIR un symbole. Stocker l'arrondi ferait perdre
+    // l'information avant tout usage — « v = 2.4 » puis « db v*2 » donnait 4 au
+    // lieu de 5, l'écrasement ayant lieu au stockage, pas au calcul.
+    double evalExprReal(const std::string &text) { evalRealLast_ = true; int64_t v = evalExpr(text); (void)v; return lastReal_; }
     int64_t evalExpr(const std::string &text) {
         evalOk_ = true;
-        auto r = expr::eval(text, [&](const std::string &n, int64_t &o) -> bool {
-            if (n == "$") { o = pc_ & 0xFFFF; return true; }
+        auto r = expr::eval(text, [&](const std::string &n, double &o) -> bool {
+            // '$' vaut l'adresse de DÉBUT de l'instruction, pas la position
+            // courante : pendant l'encodage, les octets d'opcode sont déjà émis
+            // et pc_ a avancé (de 1, ou de 2 pour un préfixe DD/FD). Hors
+            // instruction (db/dw/equ), pc_ EST la bonne réponse.
+            if (n == "$") { o = (double)((inInstruction_ ? instrStart_ : pc_) & 0xFFFF); return true; }
             std::string qn = qualify(n);
             auto it = symbols_.find(qn);
             if (it != symbols_.end()) { o = it->second; return true; }
@@ -213,17 +275,23 @@ private:
             return false;
         });
         if (!r.ok) { evalOk_ = false; if (pass_ == 2) push(r.error); return 0; }
+        lastReal_ = r.real;
         return r.value;
     }
 
     void defineLabel(const std::string &n) {
         std::string qn = qualify(n);
         if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
-        setSymbol(qn, pc_ & 0xFFFF);
+        setSymbol(qn, (double)(pc_ & 0xFFFF));
     }
-    void defineSymbol(const std::string &n, int64_t v) {
+    // `reassignable` : une VARIABLE ('=') peut être redéfinie, une CONSTANTE
+    // ('EQU') non. Cf. ADR 0003 — "angle = i - 1" dans un "repeat 256,i" est
+    // idiomatique, et l'interdire rejetait 9 sources du corpus.
+    void defineSymbol(const std::string &n, double v, bool reassignable = false) {
         std::string qn = qualify(n);
-        if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
+        if (pass_ == 1 && !reassignable) {
+            if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; }
+        } else if (pass_ == 1) definedP1_.insert(qn);
         setSymbol(qn, v);
     }
 
@@ -237,27 +305,50 @@ private:
             }
         } else emit((uint8_t)(evalExpr(p) & 0xFF));
     }
-    void emitDB(const std::string &ops) { for (auto &p : splitTopLevel(ops, ',')) emitByteOrStr(p); }
+    // Une virgule finale ("db 1,2,") est tolérée : elle est courante dans les
+    // tables de données générées, et rasm l'accepte. Seul le DERNIER élément vide
+    // est retiré — "db 1,,2" reste une erreur.
+    static void dropTrailingEmpty(std::vector<std::string> &parts) {
+        if (parts.size() > 1 && parts.back().empty()) parts.pop_back();
+    }
+    void emitDB(const std::string &ops) {
+        auto parts = splitTopLevel(ops, ','); dropTrailingEmpty(parts);
+        for (auto &p : parts) emitByteOrStr(p);
+    }
     void emitDW(const std::string &ops) {
-        for (auto &p : splitTopLevel(ops, ',')) { int64_t v = evalExpr(p); emit((uint8_t)(v & 0xFF)); emit((uint8_t)((v >> 8) & 0xFF)); }
+        auto parts = splitTopLevel(ops, ','); dropTrailingEmpty(parts);
+        for (auto &p : parts) { int64_t v = evalExpr(p); emit((uint8_t)(v & 0xFF)); emit((uint8_t)((v >> 8) & 0xFF)); }
     }
     void emitDS(const std::string &ops) {
         auto parts = splitTopLevel(ops, ',');
+        dropTrailingEmpty(parts);
         if (parts.empty()) { structErr("DS: missing size"); return; }
-        int64_t n = evalExpr(parts[0]);
-        if (!evalOk_) { structErr("DS: size not resolvable in pass 1"); return; }
-        int64_t fill = parts.size() > 1 ? evalExpr(parts[1]) : 0;
-        for (int64_t k = 0; k < n; ++k) emit((uint8_t)(fill & 0xFF));
+        // Plusieurs paires "compte,valeur" sur une même ligne : "ds 3,1,3,2"
+        // réserve 3 octets à 1 puis 3 à 2. N'honorer que la première faussait la
+        // LONGUEUR autant que le contenu.
+        for (size_t p = 0; p < parts.size(); p += 2) {
+            int64_t n = evalExpr(parts[p]);
+            if (!evalOk_) { structErr("DS: size not resolvable in pass 1"); return; }
+            int64_t fill = (p + 1 < parts.size()) ? evalExpr(parts[p + 1]) : 0;
+            for (int64_t k = 0; k < n; ++k) emit((uint8_t)(fill & 0xFF));
+        }
     }
 
     void process(const SourceLine &sl) {
         cur_ = sl;
+        curSite_ = -1;
         std::string code = trim(stripComment(sl.text));
         if (code.empty()) return;
 
         std::string label, rest; bool labelHasColon = true;
-        peelLabel(code, label, rest, &labelHasColon);
-        if (!label.empty() && !labelHasColon)
+        kw::peelLabel(code, label, rest, kw::Phase::Assembly, &labelHasColon);
+        // "nom EQU valeur" et "nom = valeur" SONT la forme canonique d'une
+        // définition de constante ou de variable : le ':' n'y a pas cours, et
+        // avertir dessus noierait les vrais cas (un label d'adresse sans ':').
+        const bool isDefinition =
+            upper(firstToken(rest)) == "EQU" ||
+            (findAssign(rest) != std::string::npos && trim(rest.substr(0, findAssign(rest))).empty());
+        if (!label.empty() && !labelHasColon && !isDefinition)
             warn("label without ':': '" + label + "' (best practice: write '" + label + ":')");
         // contexte de qualification pour les labels locaux ".nom" sur les lignes suivantes
         // (un label local ne change pas le contexte : qualify() ne modifie que ceux en '.').
@@ -268,7 +359,10 @@ private:
             if (!label.empty()) defineLabel(label);
             else if (cur_.col0)
                 warn("instruction '" + pr.mnemonic + "' in column 1 (best practice: indent instructions — only labels/symbols should start in column 1)");
+            instrStart_ = pc_;
+            inInstruction_ = true;
             z80::encode(*this, pr.instr);
+            inInstruction_ = false;
             return;
         }
         if (rest.empty()) { if (!label.empty()) defineLabel(label); return; }
@@ -299,16 +393,63 @@ private:
         if (W0 == "DW" || W0 == "DEFW") { if (!label.empty()) defineLabel(label); emitDW(after0); return; }
         if (W0 == "DS" || W0 == "DEFS" || W0 == "RMB") { if (!label.empty()) defineLabel(label); emitDS(after0); return; }
 
+        // --- ASSERT / PRINT : verifier et inspecter -------------------------
+        // Evalues en passe 2 uniquement : les labels y sont resolus, et PRINT ne
+        // doit parler qu'une fois. Ce sont des outils de DIAGNOSTIC DE BUILD, la
+        // meme famille que la source deroulee — ils disent ce que l'assembleur a
+        // compris, ils ne decrivent pas la machine cible.
+        if (W0 == "ASSERT") {
+            if (!label.empty()) defineLabel(label);
+            if (pass_ != 2) return;
+            auto parts = splitTopLevel(after0, ',');
+            if (parts.empty()) { structErr("ASSERT: missing condition"); return; }
+            if (evalExpr(parts[0]) == 0) {
+                std::string msg = "assertion failed: " + trim(parts[0]);
+                if (parts.size() > 1) msg += " — " + unquote(trim(parts[1]));
+                // push() et non structErr() : ce dernier ne rapporte qu'en passe 1
+                // pour eviter les doublons, or ASSERT ne s'evalue qu'en passe 2,
+                // quand les labels sont resolus. Son erreur y etait avalee.
+                push(msg);
+            }
+            return;
+        }
+        if (W0 == "PRINT") {
+            if (!label.empty()) defineLabel(label);
+            if (pass_ != 2) return;
+            std::string out;
+            for (auto &p : splitTopLevel(after0, ',')) {
+                std::string a = trim(p);
+                if (a.empty()) continue;
+                if (a[0] == '"' || a[0] == '\'') { out += unquote(a); continue; }
+                // Prefixe de format en MOT NU (ADR 0011) : « print "a=", hex v ».
+                // Pas d'accolades : dans fantams « {X} » ne veut dire qu'une chose,
+                // evaluer X et substituer.
+                std::string fmt = upper(firstToken(a));
+                if (fmt == "HEX" || fmt == "BIN" || fmt == "CHAR" || fmt == "INT") a = restAfterFirst(a);
+                else fmt = "INT";
+                out += formatValue(evalExpr(a), fmt);
+            }
+            prints_.push_back({cur_.file, cur_.line, out});
+            return;
+        }
+        // Refusees ou differees : le diagnostic nomme le remplacant plutot que de
+        // laisser croire a un oubli. Cf. ADR 0004 (formats hors du source),
+        // ADR 0005 (banques) et round 4 (TICKER).
+        if (W0 == "BANK") { structErr("BANK is not supported: write 'org b" + trim(after0) + ":<address>' instead (the bank and the address belong on the same line)"); return; }
+        if (W0 == "SNASET" || W0 == "SETCPC") { structErr(w0 + " describes the OUTPUT format, not the program: pass it at invocation instead of in the source"); return; }
+        if (W0 == "TICKER") { structErr("TICKER is not supported: cycle counting is a control-flow analysis, not a directive (it cannot account for conditional jumps)"); return; }
+        if (W0 == "STR") { structErr("STR is not implemented yet: use 'db' (STR emits the string with bit 7 set on the last character)"); return; }
+
         // définition de symbole : "name: EQU v" / "name EQU v" / "name = v"
         if (W0 == "EQU") {
             if (label.empty()) { structErr("EQU without a name"); return; }
-            defineSymbol(label, evalExpr(after0));
+            defineSymbol(label, evalExprReal(after0));
             if (pass_ == 1) equDefs_.push_back({qualify(label), after0});
             return;
         }
         if (W1 == "EQU") {
             std::string e = restAfterFirst(after0);
-            defineSymbol(w0, evalExpr(e));
+            defineSymbol(w0, evalExprReal(e));
             if (pass_ == 1) equDefs_.push_back({qualify(w0), e});
             return;
         }
@@ -318,8 +459,12 @@ private:
             std::string rhs = trim(rest.substr(eq + 1));
             std::string name = lhs.empty() ? label : lhs;
             if (name.empty()) { structErr("assignment without a name"); return; }
-            defineSymbol(name, evalExpr(rhs));
-            if (pass_ == 1) equDefs_.push_back({qualify(name), rhs});
+            // Une variable est SÉQUENTIELLE : sa valeur en un point d'usage est celle
+            // de la dernière affectation au-dessus. Elle n'entre donc PAS dans
+            // equDefs_, dont la résolution à point fixe est le mécanisme des
+            // constantes — il écraserait la valeur vue par les usages antérieurs.
+            // Corollaire assumé : une variable ne se référence pas en avant.
+            defineSymbol(name, evalExprReal(rhs), /*reassignable=*/true);
             return;
         }
 

@@ -16,7 +16,7 @@ OUT_DIR="$HERE/../wasm"
 CONTAINER="${CONTAINER:-podman}"
 IMAGE="${IMAGE:-docker.io/emscripten/emsdk:latest}"
 
-CORE=(z80.cpp expr.cpp parser.cpp pp.cpp asm.cpp sna.cpp asm_main.cpp)
+CORE=(z80.cpp expr.cpp keywords.cpp parser.cpp pp.cpp asm.cpp beautify.cpp sna.cpp asm_main.cpp)
 
 # Note pile 8 Mo : le parseur récursif de fantams déborde la pile Emscripten
 # par défaut (64 Ko) sur les grosses sources -> trap "table index out of bounds".

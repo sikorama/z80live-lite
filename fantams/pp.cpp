@@ -1,10 +1,12 @@
 // pp.cpp - Préprocesseur fantams (voir pp.h)
 #include "pp.h"
 #include "expr.h"
+#include "keywords.h"
 #include "z80.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <functional>
 #include <map>
 #include <set>
@@ -33,9 +35,6 @@ bool isIdentifier(const std::string &s) {
     for (char c : s) if (!isIdentChar(c)) return false;
     return true;
 }
-// Mots-clés qui ne peuvent jamais être un label — même liste que parser.cpp/asm.cpp.
-// Sert ici à distinguer "ident:" (label collé, style courant) de "ei:ret" (deux
-// instructions collées sans espace : "ei" est un mnémo connu, pas un label).
 // Retire les commentaires bloc /* ... */ (peuvent s'étendre sur plusieurs lignes),
 // hors chaînes/caractères. Les '\n' à l'intérieur du bloc sont préservés pour ne
 // pas décaler la numérotation des lignes dans les diagnostics.
@@ -46,6 +45,16 @@ std::string stripBlockComments(const std::string &s) {
     for (size_t i = 0; i < s.size(); ) {
         char c = s[i];
         if (inStr) { out += c; if (c == q) inStr = false; ++i; continue; }
+        // Commentaire de ligne (';' ou '//') : recopié tel quel jusqu'au saut de
+        // ligne, SANS interpréter les quotes. Sans ça, une apostrophe dans un
+        // commentaire français ("l'image", "d'après") ouvre une chaîne qui ne se
+        // referme jamais, et tous les /* ... */ du reste du fichier deviennent
+        // invisibles — constaté sur deux sources du corpus, où le bloc masqué
+        // était respectivement 28 et 1000 lignes plus bas.
+        if (c == ';' || (c == '/' && i + 1 < s.size() && s[i + 1] == '/')) {
+            while (i < s.size() && s[i] != '\n') out += s[i++];
+            continue;
+        }
         if (c == '"' || c == '\'') { inStr = true; q = c; out += c; ++i; continue; }
         if (c == '/' && i + 1 < s.size() && s[i + 1] == '*') {
             size_t j = s.find("*/", i + 2);
@@ -58,32 +67,25 @@ std::string stripBlockComments(const std::string &s) {
     }
     return out;
 }
-bool isReservedWord(const std::string &upperTok) {
-    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
-    static const std::set<std::string> kw = {
-        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
-        "DS", "DEFS", "RMB", "EQU",
-        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
-        // mots-clés du préprocesseur lui-même (sinon "LET N = 3", "REPEAT 3,i", etc.
-        // sont lus comme un label collé "LET"/"REPEAT" suivi du reste).
-        "LET", "IF", "IFDEF", "IFNDEF", "ELSE", "ELSEIF", "ENDIF",
-        "MACRO", "ENDM", "MEND", "REPEAT", "REND", "WHILE", "WEND",
-        "MODULE", "ENDMODULE", "STRUCT", "ENDSTRUCT", "ENDS",
-        "INCLUDE", "INCBIN", "READ", "@@EXPORT",
-    };
-    return kw.count(upperTok) != 0;
-}
-// Retire le commentaire ';' (hors chaîne/caractère).
-std::string stripComment(const std::string &s) {
-    bool inStr = false; char q = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (inStr) { if (c == q) inStr = false; continue; }
-        if (c == '"' || c == '\'') { inStr = true; q = c; }
-        else if (c == ';') return s.substr(0, i);
-    }
+// Formate une valeur numerique pour REINJECTION dans du texte source.
+// Entiere -> forme entiere (« 3 », pas « 3.000000 ») : c'est le cas de tous les
+// compteurs de boucle et de la generation de labels, ou des decimales seraient
+// catastrophiques. Reelle -> forme decimale sans zeros inutiles.
+std::string fmtNum(double v) {
+    if (v == (double)(int64_t)v && std::fabs(v) < 9e15) return std::to_string((int64_t)v);
+    std::string s = std::to_string(v);
+    while (s.size() > 1 && s.back() == '0') s.pop_back();
+    if (!s.empty() && s.back() == '.') s.pop_back();
     return s;
 }
+// Le préprocesseur travaille au cran le plus large : ses propres mots-clés
+// (MACRO, REPEAT, LET…) ne sont pas des labels ici, et n'existent plus après.
+// Sert aussi à distinguer "ident:" (label collé) de "ei:ret" (deux instructions
+// collées : "ei" est un mnémo connu, pas un label).
+bool isReservedWord(const std::string &upperTok) {
+    return kw::isReservedWord(upperTok, kw::Phase::Preprocess);
+}
+using kw::stripComment;
 std::string firstToken(const std::string &s) {
     size_t a = 0; while (a < s.size() && std::isspace((unsigned char)s[a])) ++a;
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
@@ -94,34 +96,31 @@ std::string restAfterFirst(const std::string &s) {
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
 }
-// Sépare un éventuel label de tête "ident:" du reste — ou "ident" seul (sans ':')
-// si "ident" n'est pas un mnémo/directive connu (même règle qu'asm.cpp/parser.cpp :
-// nécessaire pour que MACRO/REPEAT/MODULE reconnaissent aussi les labels sans ':').
-// `isMacro` (optionnel) : un nom de macro DÉFINI PAR L'UTILISATEUR (donc inconnu de
-// isReservedWord, statique) doit aussi être exclu — sinon un appel "SETA 42" sans ':'
-// est lu comme un label "SETA" au lieu d'un appel de macro.
+// Épluchage de label au cran préprocesseur. La phase est fixée ici, une fois,
+// plutôt qu'à chacun des sites d'appel.
 void peelLabel(const std::string &code, std::string &label, std::string &rest,
               const std::function<bool(const std::string &)> &isMacro = nullptr) {
-    size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
-    if (p > 0) {
-        size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
-        if (q < code.size() && code[q] == ':') {
-            label = code.substr(0, p);
-            rest = trim(code.substr(q + 1));
-            return;
-        }
-        std::string tok = upper(code.substr(0, p));
-        if (!isReservedWord(tok) && !(isMacro && isMacro(tok))) {
-            // exception : "nom MACRO params" (forme alternative de déclaration) — "nom"
-            // n'est pas un label, c'est le macro en cours de définition (son nom n'est pas
-            // encore dans `macros`). Laisse la ligne intacte pour la détection kw/secondUp.
-            if (upper(firstToken(trim(code.substr(p)))) == "MACRO") { label.clear(); rest = code; return; }
-            label = code.substr(0, p);
-            rest = trim(code.substr(p));
-            return;
+    kw::peelLabel(code, label, rest, kw::Phase::Preprocess, nullptr, isMacro);
+}
+// Position d'un '=' d'assignation (pas ==, <=, >=, !=), hors chaîne.
+// Même règle qu'asm.cpp : les deux étages doivent s'accorder sur ce qui est une
+// définition, sans quoi le préprocesseur et l'assembleur liraient des sources
+// différentes. À factoriser dans un en-tête commun le jour où un troisième
+// appelant apparaît.
+size_t findAssign(const std::string &s) {
+    bool inStr = false; char q = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) { if (c == q) inStr = false; continue; }
+        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
+        if (c == '=') {
+            char prev = i > 0 ? s[i - 1] : 0, next = i + 1 < s.size() ? s[i + 1] : 0;
+            if (prev == '<' || prev == '>' || prev == '!' || prev == '=') continue;
+            if (next == '=') continue;
+            return i;
         }
     }
-    label.clear(); rest = code;
+    return std::string::npos;
 }
 // Découpe en respectant () [] {} "" ''.
 std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
@@ -262,7 +261,14 @@ public:
 
 private:
     FileProvider files;
-    std::map<std::string, int64_t> ppvars;      // variables PP globales (LET)
+    std::map<std::string, double> ppvars;       // variables PP globales (LET)
+    // ADR 0003 : constantes EQU et variables '=' lues par le préprocesseur quand
+    // leur expression y est résoluble. `asmDeferred` retient celles qui sont bien
+    // définies mais dépendent d'un label — connues, mais pas ici.
+    std::map<std::string, double> asmvars;
+    std::set<std::string> asmDeferred;
+    std::set<std::string> readAtPP;             // noms d'asmvars effectivement lus
+    std::set<std::string> seenLabels;           // labels deja rencontres (pour IFDEF)
     std::map<std::string, Macro> macros;         // clé = nom majuscule
     std::map<std::string, StructDef> structs_;    // clé = nom majuscule
     long uid = 0;
@@ -271,8 +277,15 @@ private:
         result.ok = false;
         result.errors.push_back({sl.file, sl.line, msg});
     }
-    // avertissement de bonne pratique (non bloquant, n'affecte pas result.ok)
+    // Avertissement de bonne pratique (non bloquant, n'affecte pas result.ok).
+    // Dédupliqué sur (fichier, ligne, message) : une ligne source à l'intérieur
+    // d'un REPEAT déroulé ou d'une macro appelée N fois produirait sinon N
+    // copies du même message — mesuré à 3,9 Mo sur une source du corpus, assez
+    // pour faire déborder le tampon de l'appelant. Une ligne source ne parle
+    // qu'une fois.
+    std::set<std::string> warnedOnce;
     void warning(const SrcLine &sl, const std::string &msg) {
+        if (!warnedOnce.insert(sl.file + "\x01" + std::to_string(sl.line) + "\x01" + msg).second) return;
         result.warnings.push_back({sl.file, sl.line, msg});
     }
 
@@ -290,20 +303,64 @@ private:
         return out;
     }
 
+    // IFDEF / IFNDEF. Voit tout ce que le préprocesseur a RENCONTRÉ jusqu'ici :
+    // variables LET, macros, locaux et arguments, mais aussi les constantes et
+    // variables d'assemblage (ADR 0003) et les labels déjà définis — « FOO » seul
+    // sur une ligne est un drapeau, idiome rasm courant.
+    //
+    // La limite est celle de la frontière de phase : un symbole défini PLUS BAS
+    // reste invisible, le préprocesseur n'ayant qu'une passe avant. Ce n'est pas
+    // un manque, c'est ce qu'un préprocesseur peut savoir.
     bool isDefined(const std::string &name, const Env &env) {
         return ppvars.count(name) || macros.count(upper(name)) ||
-               env.locals.count(name) || env.args.count(name);
+               env.locals.count(name) || env.args.count(name) ||
+               asmvars.count(name) || asmDeferred.count(name) ||
+               seenLabels.count(name);
     }
 
     expr::Result evalPP(const std::string &text, const Env &env) {
-        auto resolver = [&](const std::string &name, int64_t &out) -> bool {
-            auto l = env.locals.find(name); if (l != env.locals.end()) { out = l->second; return true; }
+        std::string deferred;
+        auto resolver = [&](const std::string &name, double &out) -> bool {
+            auto l = env.locals.find(name); if (l != env.locals.end()) { out = (double)l->second; return true; }
             auto p = ppvars.find(name); if (p != ppvars.end()) { out = p->second; return true; }
             auto a = env.args.find(name);
-            if (a != env.args.end()) { auto r = expr::eval(a->second, {}); if (r.ok) { out = r.value; return true; } }
+            if (a != env.args.end()) { auto r = expr::eval(a->second, {}); if (r.ok) { out = r.real; return true; } }
+            auto v = asmvars.find(name);
+            if (v != asmvars.end()) { readAtPP.insert(name); out = v->second; return true; }
+            if (asmDeferred.count(name)) deferred = name;
             return false;
         };
-        return expr::eval(text, resolver);
+        auto r = expr::eval(text, resolver);
+        // Frontière de l'ADR 0005/0003 : le préprocesseur s'exécute avant qu'aucune
+        // adresse existe. Un nom qui dépend d'un label n'est pas « inconnu » — il est
+        // connu et pas encore calculable. Le dire, plutôt que laisser un
+        // « unknown symbol » trompeur.
+        if (!r.ok && !deferred.empty())
+            r.error = "'" + deferred + "' is defined at assembly time and cannot be resolved here "
+                      "(it depends on a label or on the current address); the preprocessor runs "
+                      "before any address exists";
+        return r;
+    }
+
+    // Enregistre "nom EQU expr" / "nom = expr" SANS consommer la ligne : c'est
+    // l'assembleur qui définit réellement le symbole, le préprocesseur ne fait
+    // que le lire au passage.
+    void noteAsmDefinition(const std::string &name, const std::string &ev,
+                           const Env &env, const SrcLine &raw) {
+        if (!isIdentifier(name)) return;
+        // Ambiguïté réelle : le PP a déjà utilisé cette valeur plus haut et elle
+        // change ici. L'assembleur, lui, résout les EQU/= jusqu'à point fixe et
+        // retiendra la dernière — les deux étages ne verraient pas la même chose.
+        if (readAtPP.count(name)) {
+            auto prev = asmvars.find(name);
+            warning(raw, "'" + name + "' was already used by the preprocessor" +
+                         (prev != asmvars.end() ? " with value " + fmtNum(prev->second) : "") +
+                         "; redefining it here makes the preprocessor and the assembler disagree");
+            readAtPP.erase(name);
+        }
+        auto r = evalPP(ev, env);
+        if (r.ok) { asmvars[name] = r.real; asmDeferred.erase(name); }
+        else { asmvars.erase(name); asmDeferred.insert(name); }
     }
 
     // Substitution {name} / {=expr} / {expr}
@@ -315,15 +372,33 @@ private:
                 while (j < text.size() && d) { if (text[j] == '{') ++d; else if (text[j] == '}') --d; if (d) ++j; }
                 if (j >= text.size()) { error(sl, "unclosed brace '{'"); out += text.substr(i); break; }
                 std::string inner = trim(text.substr(i + 1, j - i - 1));
+                // rasm surcharge les accolades : « {hex}valeur » y est un format
+                // d'affichage et « {sizeof}type » un opérateur. Dans fantams, {X}
+                // a un seul rôle — évaluer X et substituer. Ces sources doivent
+                // être éditées, autant le dire précisément. Cf. ADR 0011.
+                static const std::map<std::string, std::string> rasmBrace = {
+                    {"SIZEOF", "write sizeof(name) instead"},
+                    {"HEX", "use the print format prefix: print \"x=\", hex expr"},
+                    {"BIN", "use the print format prefix: print \"x=\", bin expr"},
+                    {"CHAR", "use the print format prefix: print \"x=\", char expr"},
+                    {"INT", "use the print format prefix: print \"x=\", int expr"},
+                };
+                auto rb = rasmBrace.find(upper(inner));
+                if (rb != rasmBrace.end()) {
+                    error(sl, "'{" + inner + "}' is a rasm notation that fantams does not accept: "
+                              "here '{X}' only ever means 'evaluate X and substitute' — " + rb->second);
+                    i = j + 1;
+                    continue;
+                }
                 if (inner.empty()) error(sl, "empty substitution '{}'");
                 else if (inner[0] == '=') {
                     auto r = evalPP(trim(inner.substr(1)), env);
-                    if (!r.ok) error(sl, r.error); else out += std::to_string(r.value);
+                    if (!r.ok) error(sl, r.error); else out += fmtNum(r.real);
                 } else if (isIdentifier(inner) && env.args.count(inner)) {
                     out += env.args.at(inner);
                 } else {
                     auto r = evalPP(inner, env);
-                    if (!r.ok) error(sl, r.error); else out += std::to_string(r.value);
+                    if (!r.ok) error(sl, r.error); else out += fmtNum(r.real);
                 }
                 i = j + 1;
             } else out += text[i++];
@@ -401,9 +476,9 @@ private:
                 while (j < text.size() && isIdentChar(text[j])) ++j;
                 std::string name = text.substr(i, j - i);
                 auto l = env.locals.find(name);
-                const int64_t *val = nullptr;
-                if (l != env.locals.end()) val = &l->second;
-                else { auto p = ppvars.find(name); if (p != ppvars.end()) val = &p->second; }
+                bool has = false; double val = 0;
+                if (l != env.locals.end()) { val = (double)l->second; has = true; }
+                else { auto p = ppvars.find(name); if (p != ppvars.end()) { val = p->second; has = true; } }
                 // opérande entier d'une instruction = registre/condition, jamais un symbole
                 bool whole = false;
                 if (instr && isRegOrCond(upper(name))) {
@@ -412,7 +487,7 @@ private:
                     whole = (prevSig == 0 || prevSig == ',' || prevSig == '(') &&
                             (next == 0 || next == ',' || next == ')');
                 }
-                if (val && !whole) out += std::to_string(*val);
+                if (has && !whole) out += fmtNum(val);
                 else out += name;
                 i = j;
                 continue;
@@ -437,16 +512,52 @@ private:
         return k;
     }
 
+    // Remplace sizeof(NOM) par la taille declaree de la structure NOM.
+    // C'est le preprocesseur qui porte cette connaissance : apres l'abaissement
+    // des STRUCT, il n'y a plus de structure, seulement des EQU.
+    //
+    // On n'implemente PAS la notation rasm {sizeof}NOM : dans fantams, {X}
+    // signifie « evalue X et substitue », un seul role grammatical. Cf. ADR 0011.
+    std::string expandSizeof(const std::string &code, const SrcLine &src) {
+        std::string out; size_t i = 0;
+        while (i < code.size()) {
+            bool boundary = (i == 0) || !isIdentChar(code[i - 1]);
+            if (boundary && upper(code.substr(i, 6)) == "SIZEOF") {
+                size_t j = i + 6;
+                while (j < code.size() && std::isspace((unsigned char)code[j])) ++j;
+                if (j < code.size() && code[j] == '(') {
+                    size_t k = code.find(')', j);
+                    if (k != std::string::npos) {
+                        std::string arg = trim(code.substr(j + 1, k - j - 1));
+                        auto it = structs_.find(upper(arg));
+                        if (it == structs_.end())
+                            error(src, "sizeof: unknown struct '" + arg + "'");
+                        else {
+                            out += std::to_string(it->second.size);
+                            i = k + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out += code[i++];
+        }
+        return out;
+    }
+
     void emit(const std::string &code, const SrcLine &src) {
-        std::string t = trim(code);
+        std::string t = trim(expandSizeof(code, src));
         if (t.empty()) return;
         // ':' -> retour à la ligne ; push/pop multi-registres -> une instruction chacun.
         // Les sous-lignes après la 1re sont indentées (jamais lues comme un label).
+        // Quatre espaces, comme le beautify : la source déroulée est mise en
+        // forme par définition, et une tabulation y serait une indentation dont
+        // la largeur dépend du lecteur (ADR 0013).
         bool first = true;
         std::vector<std::string> glued;
         for (const auto &stmt : splitStatements(t, &glued))
             for (const auto &line : expandPushPop(stmt)) {
-                result.lines.push_back({first ? line : "\t" + line, src.file, src.line, first && src.col0});
+                result.lines.push_back({first ? line : "    " + line, src.file, src.line, first && src.col0});
                 first = false;
             }
         for (const auto &ident : glued)
@@ -646,6 +757,7 @@ private:
             if (code.empty()) { ++i; continue; }
 
             std::string label, rest; peelLabel(code, label, rest, [&](const std::string &n) { return macros.count(n) != 0; });
+            if (!label.empty()) seenLabels.insert(label);
             std::string kw = upper(firstToken(rest));
             std::string secondUp = upper(firstToken(restAfterFirst(rest)));
 
@@ -671,7 +783,7 @@ private:
                 auto r = evalPP(ev, env);
                 if (!isIdentifier(name)) error(raw, "LET: invalid variable name");
                 else if (!r.ok) error(raw, r.error);
-                else ppvars[name] = r.value;
+                else ppvars[name] = r.real;
                 ++i; continue;
             }
 
@@ -752,10 +864,14 @@ private:
                 if (endm < 0) { error(raw, "MACRO without ENDM"); return; }
                 Macro m;
                 std::string decl;
+                // "macro foo:" — le ':' de fin fait partie du style courant, il
+                // n'appartient pas au nom. Sans ce retrait, la macro s'enregistre
+                // sous "foo:" et l'appel nu ne la trouve jamais.
                 if (kw == "MACRO") { m.name = firstToken(restAfterFirst(rest)); decl = restAfterFirst(restAfterFirst(rest)); }
                 else { m.name = firstToken(rest); decl = restAfterFirst(restAfterFirst(rest)); }
                 for (auto &p : splitTopLevel(decl, ',')) if (!p.empty()) m.params.push_back(p);
                 for (int j = i + 1; j < endm; ++j) m.body.push_back(lines[j]);
+                if (!m.name.empty() && m.name.back() == ':') m.name.pop_back();
                 if (m.name.empty()) error(raw, "MACRO without a name");
                 else macros[upper(m.name)] = m;
                 i = endm + 1; continue;
@@ -815,8 +931,24 @@ private:
             auto mit = macros.find(upper(firstToken(rest)));
             if (mit != macros.end()) {
                 if (!label.empty()) emit(label + ":", raw);
-                expandMacro(mit->second, restAfterFirst(rest), raw, depth);
+                // Les arguments sont evalues dans la portee de l'APPELANT : sans ce
+                // substituteVars, un compteur de REPEAT passe a une macro
+                // ("repeat 3,k / poke k*2") traversait l'expansion tel quel et
+                // echouait plus tard en "unknown symbol 'k'". Le nom de la macro
+                // n'etant pas un mnemonique Z80, la protection des noms de
+                // registres ne s'applique pas ici — c'est le comportement voulu.
+                expandMacro(mit->second, restAfterFirst(substituteVars(rest, env)), raw, depth);
                 ++i; continue;
+            }
+
+            // --- constante EQU / variable '=' : observée, pas consommée ---
+            if (!label.empty()) {
+                if (kw == "EQU") noteAsmDefinition(label, restAfterFirst(rest), env, raw);
+                else {
+                    size_t eq = findAssign(rest);
+                    if (eq != std::string::npos && trim(rest.substr(0, eq)).empty())
+                        noteAsmDefinition(label, trim(rest.substr(eq + 1)), env, raw);
+                }
             }
 
             // --- ligne ordinaire : passe-plat ---

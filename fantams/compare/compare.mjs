@@ -12,6 +12,7 @@
 // probablement directive non supportée) / sources où ça diverge (bug à corriger).
 
 import { DatabaseSync } from 'node:sqlite';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -42,6 +43,41 @@ let rows = db.prepare(
      AND buildmode LIKE 'sna%'
    ORDER BY id`
 ).all();
+
+// --- Textes distincts ---------------------------------------------------
+// La base contient des copies : 13 groupes de textes strictement identiques
+// couvrant 33 sources, dont un programme en 7 exemplaires. Le cardinal brut
+// n'est donc PAS une population valide pour décider quoi implémenter.
+//
+// La clé est le CONTENU, pas la filiation : seules 3 sources sur 425 ont un
+// fork_parent renseigné — l'import depuis l'ancien système ne l'a pas conservé,
+// donc dédupliquer par lignée reviendrait à ne rien dédupliquer.
+//
+// Limite assumée : seules les copies EXACTES (aux espaces près) sont
+// regroupées. Deux variantes d'un même programme séparées par une ligne restent
+// comptées deux fois, donc « distincts » est une borne HAUTE de la diversité.
+//
+// Les deux chiffres répondent à deux questions différentes — le brut dit combien
+// d'utilisateurs sont débloqués, le distinct combien de constructions
+// syntaxiques restent à écrire — et ils ne classent pas les causes pareil.
+const contentKey = new Map();
+for (const r of rows)
+  contentKey.set(r.id, createHash('sha1')
+    .update(String(r.code || '').replace(/\r/g, '').replace(/[ \t]+/g, ' ').trim())
+    .digest('hex'));
+const distinct = (list) => new Set(list.map((x) => contentKey.get(x.id))).size;
+
+// --- Classement des échecs par cause --------------------------------------
+// Provisoire : normalise le TEXTE de l'erreur. À remplacer par le code stable
+// que le cœur émettra (E_UNKNOWN_SYMBOL, ...) — reparser une chaîne destinée à
+// un humain est précisément ce que l'API structurée doit supprimer.
+function classify(err) {
+  return String(err || '(vide)')
+    .replace(/^[^:]*:\d+:\s*/, '')
+    .replace(/'[^']*'/g, "'X'")
+    .replace(/\b\d+\b/g, 'N')
+    .trim() || '(vide)';
+}
 if (opt.id) rows = rows.filter((r) => r.id === opt.id);
 if (rows.length > opt.limit) rows = rows.slice(0, opt.limit);
 
@@ -53,7 +89,11 @@ function runFantamsNative(wrapped) {
   const snaPath = join(tmpDir, 'out.sna');
   writeFileSync(asmPath, wrapped);
   try {
-    execFileSync(FANTAMS_BIN, [asmPath, '-o', snaPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    execFileSync(FANTAMS_BIN, [asmPath, '-o', snaPath],
+      // maxBuffer relevé : un débordement du tampon par défaut (1 Mo) faisait
+      // remonter une erreur VIDE, indiscernable d'un crash. Un assembleur
+      // bavard ne doit pas se traduire par un diagnostic muet.
+      { stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 64 * 1024 * 1024 });
   } catch (e) {
     return { ok: false, error: (e.stderr || e.message || '').toString() };
   }
@@ -106,7 +146,7 @@ function firstDiff(a, b) {
   return -1;
 }
 
-const results = { match: [], fantamsFail: [], mismatch: [] };
+const results = { match: [], fantamsFail: [], mismatch: [], skipped: [] };
 
 for (const r of rows) {
   const opts = {
@@ -114,8 +154,11 @@ for (const r of rows) {
     entryPoint: r.entry_point, startPoint: r.start_point, endPoint: r.end_point,
   };
   const ref = await assemble(opts, factories);
-  if (!ref.ok) { continue; } // ne devrait pas arriver (build_status=ok) mais sécurité
-  if (ref.ext !== 'sna') { continue; } // rasm n'a pas produit un .sna (ex: BUILDSNA en commentaire mal détecté) -> non comparable
+  // Les sources non comparables sont COMPTABILISÉES, pas ignorées en silence :
+  // sans ça le dénominateur est inconnu et le taux de compatibilité ne veut
+  // rien dire (constaté : 215 lignes lues pour 207 sources réparties).
+  if (!ref.ok) { results.skipped.push({ id: r.id, name: r.name, reason: 'rasm-failed' }); continue; }
+  if (ref.ext !== 'sna') { results.skipped.push({ id: r.id, name: r.name, reason: 'rasm-not-sna' }); continue; }
 
   const fOpts = { ...opts, ...parseDirectives(r.code) };
   const wrapped = wrapFantams(r.code, fOpts);
@@ -145,10 +188,35 @@ for (const r of rows) {
 
 rmSync(tmpDir, { recursive: true, force: true });
 
-console.log(`\n== Résultat (${rows.length} sources testées) ==`);
-console.log(`  match     : ${results.match.length}`);
-console.log(`  mismatch  : ${results.mismatch.length}`);
-console.log(`  fantamsFail: ${results.fantamsFail.length}`);
+const comparable = results.match.length + results.mismatch.length + results.fantamsFail.length;
+const pct = (n, d) => (d ? ((100 * n) / d).toFixed(1) : '0.0');
+console.log(`\n== Résultat ==`);
+console.log(`  lues        : ${rows.length}`);
+console.log(`  écartées    : ${results.skipped.length}  (rasm n'a pas produit de .sna comparable)`);
+console.log(`  comparables : ${comparable}   <- dénominateur`);
+console.log(`\n                    brut          textes distincts`);
+const line = (label, list) =>
+  console.log(`  ${label.padEnd(11)} ${String(list.length).padStart(4)} (${pct(list.length, comparable).padStart(5)}%)` +
+              `   ${String(distinct(list)).padStart(4)} (${pct(distinct(list), distinct([...results.match, ...results.mismatch, ...results.fantamsFail])).padStart(5)}%)`);
+line('match', results.match);
+line('mismatch', results.mismatch);
+line('échecs', results.fantamsFail);
+
+if (results.fantamsFail.length) {
+  // Classement par cause : c'est ce chiffre qui dit quoi implémenter ensuite.
+  // La colonne « distincts » est celle qui compte — le brut sur-pondère les
+  // causes concentrées sur une source très forkée.
+  const byCause = new Map();
+  for (const f of results.fantamsFail) {
+    const k = classify(f.firstError);
+    if (!byCause.has(k)) byCause.set(k, []);
+    byCause.get(k).push(f);
+  }
+  const causes = [...byCause.entries()].sort((a, b) => distinct(b[1]) - distinct(a[1]) || b[1].length - a[1].length);
+  console.log('\n-- Causes d\'échec (brut / distincts) --');
+  for (const [cause, list] of causes)
+    console.log(`  ${String(list.length).padStart(4)} /${String(distinct(list)).padStart(4)}   ${cause}`);
+}
 
 if (results.mismatch.length) {
   console.log('\n-- Divergences (RAM dump) --');

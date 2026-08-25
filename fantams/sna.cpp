@@ -11,9 +11,67 @@
 //   0xA4 crtcstate.model  0xB2 vsyncdelay  0xB4 interruptrequestflag
 #include "sna.h"
 
+#include <cstdio>
+
 namespace sna {
 
-std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &opt) {
+bool parseBase(const std::vector<uint8_t> &snapshot, Base &out, std::string &error) {
+    // La signature d'abord : sur un fichier qui n'est pas un snapshot du tout,
+    // « base tronquee » designerait le mauvais probleme.
+    if (snapshot.size() < 8 || std::string((const char *)snapshot.data(), 8) != "MV - SNA") {
+        error = "ce n'est pas un snapshot CPC : signature « MV - SNA » absente";
+        return false;
+    }
+    if (snapshot.size() < 256 + 65536) {
+        char b[128];
+        snprintf(b, sizeof b, "base tronquee : %zu octets, il en faut 256 + 65536",
+                 snapshot.size());
+        error = b;
+        return false;
+    }
+    uint8_t version = snapshot[0x10];
+    if (version > 2) {
+        error = "base en version " + std::to_string((int)version) +
+                " : reenregistre-la en version 2 (en-tete + dump plat de 64K), "
+                "les chunks MEM0 ne sont pas lus";
+        return false;
+    }
+    int dumpKo = snapshot[0x6B] | (snapshot[0x6C] << 8);
+    if (dumpKo != 64) {
+        error = "base de " + std::to_string(dumpKo) +
+                " Ko : une base ne peuple que les 64K de memoire de base";
+        return false;
+    }
+    out.header.assign(snapshot.begin(), snapshot.begin() + 256);
+    out.memory.assign(snapshot.begin() + 256, snapshot.begin() + 256 + 65536);
+    out.cpcType = snapshot[0x6D];
+    return true;
+}
+
+std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &opt,
+                           const Base *base, const std::vector<uint8_t> *coverage) {
+    // Avec une base, son en-tete fait foi : l'etat materiel post-boot (ROM basse
+    // activee, I, IM, SP dans la pile firmware, gate array) est coherent par
+    // construction, et le recomposer a la main creerait une seconde verite.
+    // Seul PC est patche — sinon le snapshot redemarrerait sur le BASIC.
+    if (base) {
+        std::vector<uint8_t> h = base->header;
+        h[0x23] = (uint8_t)(opt.pc & 0xFF);
+        h[0x24] = (uint8_t)((opt.pc >> 8) & 0xFF);
+
+        std::vector<uint8_t> mem = base->memory;
+        bool hasCov = coverage && coverage->size() >= 65536;
+        size_t n = image64k.size() < 65536 ? image64k.size() : 65536;
+        for (size_t a = 0; a < n; ++a)
+            if (!hasCov || (*coverage)[a]) mem[a] = image64k[a];
+
+        std::vector<uint8_t> out;
+        out.reserve(256 + 65536);
+        out.insert(out.end(), h.begin(), h.end());
+        out.insert(out.end(), mem.begin(), mem.end());
+        return out;
+    }
+
     std::vector<uint8_t> h(256, 0);
 
     const char *sig = "MV - SNA";

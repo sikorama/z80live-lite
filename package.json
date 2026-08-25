@@ -6,8 +6,10 @@
   "scripts": {
     "import": "node --experimental-sqlite db/import.mjs",
     "classify": "node --experimental-sqlite db/classify.mjs",
+    "build": "npm --prefix app run build",
     "serve": "node --experimental-sqlite server/api.mjs",
     "dev": "PORT=3000 node --experimental-sqlite server/api.mjs",
+    "dev:full": "npm --prefix app run build && PORT=3000 node --experimental-sqlite server/api.mjs",
     "export:lite": "node --experimental-sqlite scripts/export-lite.mjs",
     "export:sna": "node --experimental-sqlite scripts/export-sna.mjs",
     "export:sna:zip": "node --experimental-sqlite scripts/export-sna.mjs --zip"

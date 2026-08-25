@@ -56,3 +56,7 @@ temp/
 # Test coverage
 coverage/
 .nyc_output/
+
+# ROMs Amstrad (droits reserves) - presentes localement pour une evolution
+# a venir (injection de l etat RAM post-boot dans un SNA), jamais versionnees.
+app/public/*.rom

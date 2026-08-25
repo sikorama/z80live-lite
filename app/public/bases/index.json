@@ -1,0 +1,9 @@
+[
+  {
+    "id": "cpc6128-en",
+    "label": "CPC 6128 — ROM anglaise",
+    "file": "cpc6128-en.sna",
+    "cpcType": 2,
+    "rom": "OS_6128_EN"
+  }
+]
