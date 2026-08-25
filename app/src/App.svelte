@@ -1,7 +1,7 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { openStore } from '../../client/store.mjs';
-  import { assemble, parseDirectives, upsertDirectives } from '../../wasm/assemble.mjs';
+  import { assemble, beautifySource, parseDirectives, upsertDirectives } from '../../wasm/assemble.mjs';
   import { makeEditor, makeViewer } from './lib/editor.js';
   import { ping as pingAmspirit, injectSna } from './lib/amspirit.js';
 
@@ -12,6 +12,9 @@
   let query = $state('');
   let selected = $state(null);
   let asm = $state(''), buildmode = $state('sna'), entry = $state('');
+  // Base (ADR 0012) : le snapshot post-boot sur lequel l'assemblage est pose, pour
+  // qu'un code appelant le firmware s'execute. '' = aucune (la memoire vaut zero).
+  let base = $state(''), bases = $state([]);
   let isInclude = $state(false), incFilename = $state(''); // fichier librairie (sans point d'entrée), injecté dans le FS wasm des autres sources
   let includeCache = null; // liste des sources is_include=1 ({id,name,filename,code}), rafraîchie à chaque run()
   let logLines = $state([]);
@@ -125,6 +128,26 @@
   // Réinstancie un Module WASM neuf à chaque assemblage (rasm/sjasmplus appellent exit()).
   // URL construite dynamiquement -> non analysée par le bundler, chargée depuis /wasm (public/).
   const loadWasm = (name) => import(/* @vite-ignore */ new URL('/wasm/' + name, location.origin).href);
+  // Catalogue des bases : servi statiquement depuis public/bases/. L'ID de la
+  // directive (`base=cpc6128-en`) est resolu ICI — fantams ne voit qu'un chemin.
+  const baseUrl = (name) => new URL('/bases/' + name, location.origin).href;
+  const baseCache = new Map();
+  (async () => {
+    try { bases = await (await fetch(baseUrl('index.json'))).json(); } catch { bases = []; }
+  })();
+  async function resolveBase(id) {
+    if (baseCache.has(id)) return baseCache.get(id);
+    const entryDef = (bases || []).find((b) => b.id === id);
+    if (!entryDef) return null;
+    try {
+      const r = await fetch(baseUrl(entryDef.file));
+      if (!r.ok) return null;
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      baseCache.set(id, bytes);
+      return bytes;
+    } catch { return null; }
+  }
+
   const factories = {
     createRasm: async (o) => (await loadWasm('rasm.mjs')).default(o),
     createSjasm: async (o) => (await loadWasm('sjasmplus.mjs')).default(o),
@@ -196,6 +219,7 @@
     const bm = d.buildmode || s.buildmode || 'sna';
     buildmode = bm.startsWith('sna') ? (bm === 'sna' ? 'sna' : bm) : 'sna';
     entry = d.entryPoint || s.entry_point || '';
+    base = d.base && d.base !== 'none' ? d.base : '';
     isInclude = !!s.is_include; incFilename = s.filename || '';
     await run(); // charge -> assemble -> envoie à l'émulateur en un clic
   }
@@ -204,14 +228,15 @@
     selected = { name: 'nouveau', author: null, description: null };
     setCode('; z80: assembler=fantams buildmode=sna entry=#8000\n  org #8000\nstart:\n  ret\n');
     dirty = false;
-    asm = 'fantams'; buildmode = 'sna'; entry = '#8000';
+    asm = 'fantams'; buildmode = 'sna'; entry = '#8000'; base = '';
     isInclude = false; incFilename = '';
   }
 
   async function run() {
     savedListScroll = listEl ? listEl.scrollTop : 0; // à préserver malgré le lancement de l'émulateur
     busy = true; logLines = []; log('Assemblage…');
-    const cfg = { assembler: asm || undefined, buildmode, entryPoint: entry || undefined };
+    const cfg = { assembler: asm || undefined, buildmode, entryPoint: entry || undefined,
+                  base: base || undefined };
     const up = upsertDirectives(editor.value, cfg);  // maintien de la ligne ;z80:
     if (up !== editor.value) setCode(up);            // n'écrit que si ça change (évite la boucle auto)
     try {
@@ -220,7 +245,7 @@
       try { includeCache = await store.listIncludes(); } catch { includeCache = includeCache || []; }
       const includes = (includeCache || []).filter((i) => i.id !== selected?.id);
       const t0 = performance.now();
-      const res = await assemble({ code: editor.value, ...cfg, includes }, factories);
+      const res = await assemble({ code: editor.value, ...cfg, includes, resolveBase }, factories);
       const dt = (performance.now() - t0).toFixed(0);
       preText = res.preprocessed || ''; // dispo même en cas d'échec (pour debug)
       lineOffset = res.lineOffset || 0;
@@ -280,6 +305,34 @@
     }
   }
 
+  // Mise en forme du tampon par fantams (ADR 0013) : deux-points sur les labels
+  // qui en manquent, quatre espaces devant les lignes de code. Rien d'autre.
+  //
+  // Passe par `editor.value` et non `setCode` : le tampon a bel et bien changé,
+  // donc `dirty` doit le dire. L'annulation est celle de l'éditeur (Ctrl+Z), qui
+  // voit ça comme une modification de plus.
+  async function beautify() {
+    if (!editor || busy) return;
+    const before = editor.value;
+    busy = true;
+    try {
+      const r = await beautifySource(before, factories);
+      if (!r.ok || r.code === null) {
+        log('⚠ Mise en forme impossible : ' + (r.error || r.log.slice(-1)[0] || 'échec de fantams'), 'err');
+        return;
+      }
+      if (r.code === before) { log('Déjà en forme.', 'muted'); return; }
+      const line = editor.cursorLine;      // la mise en forme préserve les lignes…
+      editor.value = r.code;
+      editor.gotoLine(line);               // …donc le curseur retrouve la sienne
+      log('Mis en forme.', 'ok');
+    } catch (e) {
+      log('⚠ Mise en forme impossible : ' + (e?.message || e), 'err');
+    } finally {
+      busy = false;
+    }
+  }
+
   async function openPre() {
     if (!preText) return;
     showPre = true;
@@ -321,6 +374,12 @@
   if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 's' || e.key === 'S')) {
     e.preventDefault(); // pas d'enregistrement de la page : on sauvegarde la source à la place
     if (canWrite && !busy) save();
+    return;
+  }
+  // Alt+Maj+F : le raccourci « mettre en forme » qu'on a partout ailleurs.
+  if (e.altKey && e.shiftKey && (e.key === 'F' || e.key === 'f')) {
+    e.preventDefault();
+    if (!busy) beautify();
   }
 }} />
 
@@ -388,6 +447,7 @@
         <button class="ico" class:dirty onclick={save} title={dirty ? 'Sauvegarder (modifications non enregistrées)' : 'Sauvegarder'}>💾</button>
         {#if selected?.id}<button class="ico" onclick={fork} title="Forker">⑂</button>{/if}
       {/if}
+      <button class="ico" onclick={beautify} disabled={busy} title="Mettre en forme (Alt+Maj+F)">¶</button>
       {#if preText}<button class="ico" onclick={openPre} title="Code après préprocesseur">⧉</button>{/if}
       {#if dlUrl}<a class="ico dl" href={dlUrl} download={dlName} title="Télécharger le .{dlExt}">⬇</a>{/if}
     </div>
@@ -435,6 +495,12 @@
       </label>
       <label>Type de sortie
         <select bind:value={buildmode}><option>sna</option><option>sna_cpc6128</option><option>sna_cpc464</option></select>
+      </label>
+      <label title="Snapshot post-boot pose sous l'assemblage : sans lui, les vecteurs d'indirection firmware valent zero et tout CALL &amp;BBxx part dans le vide.">Base (firmware)
+        <select bind:value={base}>
+          <option value="">aucune (mémoire à zéro)</option>
+          {#each bases as b}<option value={b.id}>{b.label || b.id}</option>{/each}
+        </select>
       </label>
       <label class="wide chk">
         <input type="checkbox" bind:checked={isInclude} />

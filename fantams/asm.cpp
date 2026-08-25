@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include "expr.h"
+#include "keywords.h"
 #include "parser.h"
 #include "z80.h"
 
@@ -14,9 +15,7 @@
 namespace asmb {
 namespace {
 
-bool isIdentChar(char c) {
-    return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '@';
-}
+using kw::isIdentChar;
 std::string upper(std::string s) { for (char &c : s) c = (char)std::toupper((unsigned char)c); return s; }
 std::string trim(const std::string &s) {
     size_t a = 0, b = s.size();
@@ -24,18 +23,7 @@ std::string trim(const std::string &s) {
     while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
     return s.substr(a, b - a);
 }
-std::string stripComment(const std::string &s) {
-    bool inStr = false; char q = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (inStr) { if (c == q) inStr = false; continue; }
-        if (c == '"' || c == '\'') { inStr = true; q = c; }
-        else if (c == ';') return s.substr(0, i);
-        // Commentaire de ligne C : '//' (le '/' isolé reste la division).
-        else if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') return s.substr(0, i);
-    }
-    return s;
-}
+using kw::stripComment;
 std::string firstToken(const std::string &s) {
     size_t a = 0; while (a < s.size() && std::isspace((unsigned char)s[a])) ++a;
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
@@ -45,42 +33,6 @@ std::string restAfterFirst(const std::string &s) {
     size_t a = 0; while (a < s.size() && std::isspace((unsigned char)s[a])) ++a;
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
-}
-// Mots-clés qui ne peuvent jamais être un label sans ':' — même liste que parser.cpp
-// (mnémoniques Z80 + directives gérées ici). Permet de tolérer "start" (label,
-// sans ':') sans le confondre avec une instruction/directive.
-bool isReservedWord(const std::string &upperTok) {
-    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
-    static const std::set<std::string> kw = {
-        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
-        "DS", "DEFS", "RMB", "EQU",
-        // directives rasm reconnues mais non implémentées (hors périmètre) : gardées
-        // réservées pour échouer proprement plutôt que d'être lues comme un label.
-        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
-        // Directives reconnues OU explicitement refusees : dans les deux cas
-        // elles ne sont pas des labels. Sans ca, « BANK 4 » est lu comme un
-        // label « BANK » suivi d'une directive « 4 », et le diagnostic parle
-        // d'un token que personne n'a ecrit.
-        "ASSERT", "PRINT", "BANK", "SNASET", "SETCPC", "TICKER", "STR",
-    };
-    return kw.count(upperTok) != 0;
-}
-void peelLabel(const std::string &code, std::string &label, std::string &rest, bool *sawColon = nullptr) {
-    size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
-    if (p > 0) {
-        size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
-        if (q < code.size() && code[q] == ':') {
-            label = code.substr(0, p); rest = trim(code.substr(q + 1));
-            if (sawColon) *sawColon = true;
-            return;
-        }
-        if (!isReservedWord(upper(code.substr(0, p)))) {
-            label = code.substr(0, p); rest = trim(code.substr(p));
-            if (sawColon) *sawColon = false;
-            return;
-        }
-    }
-    label.clear(); rest = code;
 }
 std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
     std::vector<std::string> out;
@@ -142,6 +94,9 @@ class Assembler : public z80::IAsmContext {
 public:
     Output run(const std::vector<SourceLine> &lines) {
         image_.assign(65536, 0);
+        prov_.assign(65536, 0);
+        sites_.clear();
+        ov_.active = false;
         symbols_.clear();
         ciIndex_.clear();
 
@@ -163,6 +118,7 @@ public:
 
         pass_ = 2; pc_ = 0; lo_ = 0x10000; hi_ = 0; currentGlobal_.clear();
         for (const auto &l : lines) process(l);
+        flushOverlap();   // le dernier chevauchement accumulé doit sortir avant les diagnostics
 
         Output o;
         // Output.symbols reste entier : c'est une table d'ADRESSES destinee aux
@@ -174,6 +130,8 @@ public:
         o.prints = prints_;
         o.ok = errors_.empty();
         o.image = image_;
+        o.coverage.assign(65536, 0);
+        for (int a = 0; a < 65536; ++a) o.coverage[a] = prov_[a] ? 1 : 0;
         if (hi_ > lo_) {
             o.loadAddress = (uint16_t)lo_;
             o.bin.assign(image_.begin() + lo_, image_.begin() + hi_);
@@ -186,6 +144,7 @@ public:
     void emit(uint8_t b) override {
         int a = pc_ & 0xFFFF;
         if (pass_ == 2) {
+            noteWrite(a);
             image_[a] = b;
             if (a < lo_) lo_ = a;
             if (a + 1 > hi_) hi_ = a + 1;
@@ -197,6 +156,64 @@ public:
     int64_t eval(const std::string &e) override { return evalExpr(e); }
 
 private:
+    // --- coverage et provenance (ADR 0012) ---------------------------------
+    // prov_[a] : 0 = jamais écrit, sinon 1+index dans sites_, ou kUnknownSite.
+    // Deux octets par octet d'image, aujourd'hui sur une image plate de 64K ; le
+    // jour où l'image devient une collection d'espaces d'adressage (ADR 0006),
+    // c'est l'espace qui portera sa coverage, allouée à la première écriture.
+    static const uint16_t kUnknownSite = 0xFFFF;
+
+    struct Site { std::string file; int line; };
+    // Un chevauchement en cours d'accumulation : les octets consécutifs qui
+    // partagent le même couple (site écrasé, site écrasant) ne donnent qu'un
+    // seul avertissement. C'est cette coalescence, et non un plafond, qui
+    // empêche un bloc réécrit de produire un avertissement par octet.
+    struct Overlap { bool active = false; int start = 0, end = 0; uint16_t prev = 0, cur = 0; };
+
+    std::vector<uint16_t> prov_;
+    std::vector<Site> sites_;
+    int curSite_ = -1;      // site de la ligne courante, alloué à sa 1re écriture
+    Overlap ov_;
+
+    // Alloue paresseusement le site de la ligne courante : seules les lignes qui
+    // émettent des octets entrent dans la table.
+    uint16_t siteId() {
+        if (curSite_ >= 0) return (uint16_t)curSite_;
+        if (sites_.size() >= kUnknownSite - 1) { curSite_ = kUnknownSite; return kUnknownSite; }
+        sites_.push_back({cur_.file, cur_.line});
+        curSite_ = (int)sites_.size();   // 1-based : 0 signifie « jamais écrit »
+        return (uint16_t)curSite_;
+    }
+
+    std::string siteLabel(uint16_t id) const {
+        if (id == 0 || id == kUnknownSite) return "site inconnu";
+        const Site &s = sites_[id - 1];
+        return s.file + ":" + std::to_string(s.line);
+    }
+
+    void flushOverlap() {
+        if (!ov_.active) return;
+        ov_.active = false;
+        char range[64];
+        if (ov_.end - ov_.start == 1) snprintf(range, sizeof range, "&%04X", ov_.start);
+        else snprintf(range, sizeof range, "&%04X-&%04X", ov_.start, ov_.end - 1);
+        std::string where = (ov_.cur == 0 || ov_.cur == kUnknownSite)
+                                ? std::string() : sites_[ov_.cur - 1].file;
+        int line = (ov_.cur == 0 || ov_.cur == kUnknownSite) ? 0 : sites_[ov_.cur - 1].line;
+        warnings_.push_back({where, line,
+            std::string("chevauchement : ") + range + " deja ecrit par " + siteLabel(ov_.prev)});
+    }
+
+    void noteWrite(int a) {
+        uint16_t site = siteId();
+        uint16_t prev = prov_[a];
+        prov_[a] = site;
+        if (prev == 0 || prev == site) return;   // écrire sur du vierge, ou se relire soi-même
+        if (ov_.active && ov_.end == a && ov_.prev == prev && ov_.cur == site) { ov_.end = a + 1; return; }
+        flushOverlap();
+        ov_ = {true, a, a + 1, prev, site};
+    }
+
     std::vector<uint8_t> image_;
     std::vector<Diagnostic> prints_;
     double lastReal_ = 0;
@@ -319,11 +336,12 @@ private:
 
     void process(const SourceLine &sl) {
         cur_ = sl;
+        curSite_ = -1;
         std::string code = trim(stripComment(sl.text));
         if (code.empty()) return;
 
         std::string label, rest; bool labelHasColon = true;
-        peelLabel(code, label, rest, &labelHasColon);
+        kw::peelLabel(code, label, rest, kw::Phase::Assembly, &labelHasColon);
         // "nom EQU valeur" et "nom = valeur" SONT la forme canonique d'une
         // définition de constante ou de variable : le ':' n'y a pas cours, et
         // avertir dessus noierait les vrais cas (un label d'adresse sans ':').

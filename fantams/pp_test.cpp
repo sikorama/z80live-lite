@@ -191,23 +191,23 @@ int main() {
         "Line.b EQU 2\nLine.b.x EQU 2\nLine.b.y EQU 3\nLine EQU 4\n");
 
     // séparateur d'instructions ':' -> retour à la ligne (+ tabulation)
-    chk("colon sep", "  ld a,1 : ld b,2 : ret\n", "ld a,1\n\tld b,2\n\tret\n");
-    chk("colon garde label collé", "start: di : ret\n", "start: di\n\tret\n");
-    chk("colon mnémo 0-op", "nop : ret\n", "nop\n\tret\n");
-    chk("colon dans chaîne protégé", "  db \"a:b\" : nop\n", "db \"a:b\"\n\tnop\n");
-    chk("colon dans (ix+d)", "  ld a,(ix+0) : ret\n", "ld a,(ix+0)\n\tret\n");
+    chk("colon sep", "  ld a,1 : ld b,2 : ret\n", "ld a,1\n    ld b,2\n    ret\n");
+    chk("colon garde label collé", "start: di : ret\n", "start: di\n    ret\n");
+    chk("colon mnémo 0-op", "nop : ret\n", "nop\n    ret\n");
+    chk("colon dans chaîne protégé", "  db \"a:b\" : nop\n", "db \"a:b\"\n    nop\n");
+    chk("colon dans (ix+d)", "  ld a,(ix+0) : ret\n", "ld a,(ix+0)\n    ret\n");
 
     // "mnémo:mnémo" collé (style non canonique, mais rasm le découpe quand même en 2
     // instructions car "ei"/"ret" sont des mnémos connus, pas des labels) -> avertissement.
-    chkWarn("mnémo:mnémo collé", "ei:ret\n", "ei\n\tret\n", true);
-    chkWarn("mnémo: mnémo (espace après)", "ei: ret\n", "ei\n\tret\n", true);
-    chkWarn("mnémo:mnémo inversé", "ret:ei\n", "ret\n\tei\n", true);
-    chkWarn("mnémo : mnémo (espace avant, pas d'avertissement)", "ret : ei\n", "ret\n\tei\n", false);
+    chkWarn("mnémo:mnémo collé", "ei:ret\n", "ei\n    ret\n", true);
+    chkWarn("mnémo: mnémo (espace après)", "ei: ret\n", "ei\n    ret\n", true);
+    chkWarn("mnémo:mnémo inversé", "ret:ei\n", "ret\n    ei\n", true);
+    chkWarn("mnémo : mnémo (espace avant, pas d'avertissement)", "ret : ei\n", "ret\n    ei\n", false);
 
     // push/pop multi-registres -> une instruction par registre
-    chk("push multi", "  push af,bc,de\n", "push af\n\tpush bc\n\tpush de\n");
-    chk("pop multi + label", "lbl: pop hl,de\n", "lbl: pop hl\n\tpop de\n");
-    chk("push multi + colon", "  push af,bc : ret\n", "push af\n\tpush bc\n\tret\n");
+    chk("push multi", "  push af,bc,de\n", "push af\n    push bc\n    push de\n");
+    chk("pop multi + label", "lbl: pop hl,de\n", "lbl: pop hl\n    pop de\n");
+    chk("push multi + colon", "  push af,bc : ret\n", "push af\n    push bc\n    ret\n");
 
     // --- erreurs (PP strict) ---
     chkErr("IF sur label temps-assemblage", "IF taille>0x4000\n nop\nENDIF\n");

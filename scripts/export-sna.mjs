@@ -14,6 +14,7 @@ import { dirname, join, resolve } from 'node:path';
 import createRasm from '../wasm/rasm.mjs';
 import createSjasm from '../wasm/sjasmplus.mjs';
 import { assemble } from '../wasm/assemble.mjs';
+import { readFileSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
@@ -102,6 +103,23 @@ const rows = db.prepare(
 db.close();
 console.log(`Sources SNA candidates : ${rows.length}`);
 
+// Bases (ADR 0012) : une source dont la directive dit `base=<id>` doit trouver
+// son snapshot ici, sinon l'assemblage echoue — jamais de repli sur des zeros.
+const BASES_DIR = resolve(__dirname, '../app/public/bases');
+const baseCache = new Map();
+let baseIndex = null;
+async function resolveBase(id) {
+  if (baseCache.has(id)) return baseCache.get(id);
+  try {
+    baseIndex ??= JSON.parse(readFileSync(join(BASES_DIR, 'index.json'), 'utf8'));
+    const def = baseIndex.find((b) => b.id === id);
+    if (!def) return null;
+    const bytes = new Uint8Array(readFileSync(join(BASES_DIR, def.file)));
+    baseCache.set(id, bytes);
+    return bytes;
+  } catch { return null; }
+}
+
 const stats = { ok: 0, ok_fallback: 0, fail: 0 };
 const outputs = [];
 const seen = new Map(); // dédoublonnage des noms de fichiers
@@ -110,6 +128,7 @@ for (const r of rows) {
   const opts = {
     code: r.code, assembler: r.assembler, buildmode: r.buildmode,
     entryPoint: r.entry_point, startPoint: r.start_point, endPoint: r.end_point,
+    resolveBase,
   };
   let res = await assemble(opts, factories);
   if (!res.ok && !r.assembler) {

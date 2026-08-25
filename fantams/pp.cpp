@@ -1,6 +1,7 @@
 // pp.cpp - Préprocesseur fantams (voir pp.h)
 #include "pp.h"
 #include "expr.h"
+#include "keywords.h"
 #include "z80.h"
 
 #include <algorithm>
@@ -34,9 +35,6 @@ bool isIdentifier(const std::string &s) {
     for (char c : s) if (!isIdentChar(c)) return false;
     return true;
 }
-// Mots-clés qui ne peuvent jamais être un label — même liste que parser.cpp/asm.cpp.
-// Sert ici à distinguer "ident:" (label collé, style courant) de "ei:ret" (deux
-// instructions collées sans espace : "ei" est un mnémo connu, pas un label).
 // Retire les commentaires bloc /* ... */ (peuvent s'étendre sur plusieurs lignes),
 // hors chaînes/caractères. Les '\n' à l'intérieur du bloc sont préservés pour ne
 // pas décaler la numérotation des lignes dans les diagnostics.
@@ -80,39 +78,14 @@ std::string fmtNum(double v) {
     if (!s.empty() && s.back() == '.') s.pop_back();
     return s;
 }
+// Le préprocesseur travaille au cran le plus large : ses propres mots-clés
+// (MACRO, REPEAT, LET…) ne sont pas des labels ici, et n'existent plus après.
+// Sert aussi à distinguer "ident:" (label collé) de "ei:ret" (deux instructions
+// collées : "ei" est un mnémo connu, pas un label).
 bool isReservedWord(const std::string &upperTok) {
-    if (z80::mnemoFromString(upperTok) != z80::Mnemo::Invalid) return true;
-    static const std::set<std::string> kw = {
-        "ORG", "RUN", "ALIGN", "DB", "DEFB", "DM", "DEFM", "DW", "DEFW",
-        "DS", "DEFS", "RMB", "EQU",
-        "BUILDSNA", "BANKSET", "NOLIST", "LIST",
-        // Directives reconnues OU explicitement refusees : dans les deux cas
-        // elles ne sont pas des labels. Sans ca, « BANK 4 » est lu comme un
-        // label « BANK » suivi d'une directive « 4 », et le diagnostic parle
-        // d'un token que personne n'a ecrit.
-        "ASSERT", "PRINT", "BANK", "SNASET", "SETCPC", "TICKER", "STR",
-        // mots-clés du préprocesseur lui-même (sinon "LET N = 3", "REPEAT 3,i", etc.
-        // sont lus comme un label collé "LET"/"REPEAT" suivi du reste).
-        "LET", "IF", "IFDEF", "IFNDEF", "ELSE", "ELSEIF", "ENDIF",
-        "MACRO", "ENDM", "MEND", "REPEAT", "REND", "WHILE", "WEND",
-        "MODULE", "ENDMODULE", "STRUCT", "ENDSTRUCT", "ENDS",
-        "INCLUDE", "INCBIN", "READ", "@@EXPORT",
-    };
-    return kw.count(upperTok) != 0;
+    return kw::isReservedWord(upperTok, kw::Phase::Preprocess);
 }
-// Retire le commentaire de ligne (';' ou '//'), hors chaîne/caractère.
-std::string stripComment(const std::string &s) {
-    bool inStr = false; char q = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (inStr) { if (c == q) inStr = false; continue; }
-        if (c == '"' || c == '\'') { inStr = true; q = c; }
-        else if (c == ';') return s.substr(0, i);
-        // Commentaire de ligne C : '//' (le '/' isolé reste la division).
-        else if (c == '/' && i + 1 < s.size() && s[i + 1] == '/') return s.substr(0, i);
-    }
-    return s;
-}
+using kw::stripComment;
 std::string firstToken(const std::string &s) {
     size_t a = 0; while (a < s.size() && std::isspace((unsigned char)s[a])) ++a;
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
@@ -123,34 +96,11 @@ std::string restAfterFirst(const std::string &s) {
     size_t b = a; while (b < s.size() && !std::isspace((unsigned char)s[b])) ++b;
     return trim(s.substr(b));
 }
-// Sépare un éventuel label de tête "ident:" du reste — ou "ident" seul (sans ':')
-// si "ident" n'est pas un mnémo/directive connu (même règle qu'asm.cpp/parser.cpp :
-// nécessaire pour que MACRO/REPEAT/MODULE reconnaissent aussi les labels sans ':').
-// `isMacro` (optionnel) : un nom de macro DÉFINI PAR L'UTILISATEUR (donc inconnu de
-// isReservedWord, statique) doit aussi être exclu — sinon un appel "SETA 42" sans ':'
-// est lu comme un label "SETA" au lieu d'un appel de macro.
+// Épluchage de label au cran préprocesseur. La phase est fixée ici, une fois,
+// plutôt qu'à chacun des sites d'appel.
 void peelLabel(const std::string &code, std::string &label, std::string &rest,
               const std::function<bool(const std::string &)> &isMacro = nullptr) {
-    size_t p = 0; while (p < code.size() && isIdentChar(code[p])) ++p;
-    if (p > 0) {
-        size_t q = p; while (q < code.size() && std::isspace((unsigned char)code[q])) ++q;
-        if (q < code.size() && code[q] == ':') {
-            label = code.substr(0, p);
-            rest = trim(code.substr(q + 1));
-            return;
-        }
-        std::string tok = upper(code.substr(0, p));
-        if (!isReservedWord(tok) && !(isMacro && isMacro(tok))) {
-            // exception : "nom MACRO params" (forme alternative de déclaration) — "nom"
-            // n'est pas un label, c'est le macro en cours de définition (son nom n'est pas
-            // encore dans `macros`). Laisse la ligne intacte pour la détection kw/secondUp.
-            if (upper(firstToken(trim(code.substr(p)))) == "MACRO") { label.clear(); rest = code; return; }
-            label = code.substr(0, p);
-            rest = trim(code.substr(p));
-            return;
-        }
-    }
-    label.clear(); rest = code;
+    kw::peelLabel(code, label, rest, kw::Phase::Preprocess, nullptr, isMacro);
 }
 // Position d'un '=' d'assignation (pas ==, <=, >=, !=), hors chaîne.
 // Même règle qu'asm.cpp : les deux étages doivent s'accorder sur ce qui est une
@@ -600,11 +550,14 @@ private:
         if (t.empty()) return;
         // ':' -> retour à la ligne ; push/pop multi-registres -> une instruction chacun.
         // Les sous-lignes après la 1re sont indentées (jamais lues comme un label).
+        // Quatre espaces, comme le beautify : la source déroulée est mise en
+        // forme par définition, et une tabulation y serait une indentation dont
+        // la largeur dépend du lecteur (ADR 0013).
         bool first = true;
         std::vector<std::string> glued;
         for (const auto &stmt : splitStatements(t, &glued))
             for (const auto &line : expandPushPop(stmt)) {
-                result.lines.push_back({first ? line : "\t" + line, src.file, src.line, first && src.col0});
+                result.lines.push_back({first ? line : "    " + line, src.file, src.line, first && src.col0});
                 first = false;
             }
         for (const auto &ident : glued)

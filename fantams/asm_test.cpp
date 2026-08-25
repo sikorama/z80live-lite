@@ -28,6 +28,10 @@ static void chk(const char *desc, const std::string &src,
     } else ++g_pass;
 }
 
+static void okc(const char *desc, bool cond) {
+    if (cond) ++g_pass; else { ++g_fail; printf("  \033[31mFAIL\033[0m %s\n", desc); }
+}
+
 static void chkSym(const char *desc, const std::string &src, const char *sym, int64_t val) {
     asmb::Output o = asmb::assembleText(src, "t.asm");
     auto it = o.symbols.find(sym);
@@ -153,6 +157,35 @@ int main() {
     chkErr("symbole indéfini", "  ld a,UNDEF\n");
     chkErr("label dupliqué", "foo:\n  nop\nfoo:\n  nop\n");
     chkErr("directive inconnue", "  bogus 1,2\n");
+
+    // --- coverage et chevauchement (ADR 0012) ------------------------------
+    {
+        asmb::Output o = asmb::assembleText("  org #8000\n  db 0,0\n", "t.asm");
+        int n = 0;
+        for (auto c : o.coverage) if (c) ++n;
+        okc("coverage : deux zeros ecrits sont couverts", o.ok && n == 2 &&
+            o.coverage[0x8000] && o.coverage[0x8001]);
+        okc("coverage : le reste ne l'est pas", !o.coverage[0x7FFF] && !o.coverage[0x8002]);
+        okc("coverage : pas d'avertissement sans chevauchement", o.warnings.empty());
+    }
+    {
+        // deux ORG qui se recouvrent : un seul avertissement pour la plage, avec
+        // les DEUX lignes en conflit nommees.
+        asmb::Output o = asmb::assembleText(
+            "  org #8000\n  db 1,2,3,4\n  org #8001\n  db 9,9\n", "t.asm");
+        bool one = o.warnings.size() == 1;
+        std::string m = one ? o.warnings[0].message : std::string();
+        okc("chevauchement : un seul avertissement pour la plage", one);
+        okc("chevauchement : plage coalescee &8001-&8002",
+            m.find("&8001-&8002") != std::string::npos);
+        okc("chevauchement : nomme le site ecrase", m.find("t.asm:2") != std::string::npos);
+        okc("chevauchement : rapporte sur le site ecrasant",
+            one && o.warnings[0].line == 4);
+    }
+    {
+        asmb::Output o = asmb::assembleText("  org #8000\n  db 1\n  org #9000\n  db 1\n", "t.asm");
+        okc("chevauchement : deux ORG disjoints n'en produisent pas", o.warnings.empty());
+    }
 
     printf("\n%d réussis, %d échoués\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

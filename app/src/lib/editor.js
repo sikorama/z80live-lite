@@ -34,6 +34,11 @@ export function makeEditor(parent, doc, onChange) {
   return {
     get value() { return view.state.doc.toString(); },
     set value(v) { view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: v || '' } }); },
+    // Ligne 1-indexée du curseur. La mise en forme étant bijective sur les lignes
+    // (ADR 0013), c'est ce qu'il suffit de retenir pour y revenir après.
+    get cursorLine() {
+      return view.state.doc.lineAt(view.state.selection.main.head).number;
+    },
     // Place le curseur sur la ligne 1-indexée `line1` et la fait défiler à l'écran.
     gotoLine(line1) {
       const doc = view.state.doc;

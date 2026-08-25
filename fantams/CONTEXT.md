@@ -24,8 +24,25 @@ _Éviter_ : passe 1 / passe 2 (qui désignent ses sous-étapes, pas la phase)
 **Source déroulée** :
 Le texte plat produit par le préprocesseur : macros expansées, boucles
 déroulées, includes insérés, scopes renommés. Elle est réassemblable à
-l'identique et lisible par un humain.
+l'identique, mise en forme, et lisible par un humain. La mise en forme fait
+partie de sa définition : une source déroulée qui déclencherait les
+avertissements de bonnes pratiques contredirait sa propre raison d'être.
 _Éviter_ : source expansée, source préprocessée, sortie du PP
+
+**Beautify** :
+La réécriture d'un texte source qui en corrige la mise en forme sans rien
+changer aux octets qu'il produit. Elle ne connaît que deux règles — le
+deux-points d'un label écrit sans lui, et l'indentation d'une instruction
+laissée en colonne 1 — soit exactement les deux écarts que l'assembleur sait
+déjà signaler. Beautifier, c'est éteindre ces avertissements, pas imposer un
+goût : casse des mnémoniques, colonne de commentaires et espacement des
+opérandes n'en relèvent pas.
+_Éviter_ : pretty print, formatage (qui désigne le rendu d'une valeur pour
+`PRINT`), mise en forme de sortie (qui évoque le format d'export), embellir
+
+**Source beautifiée** :
+Le résultat de la passe de beautify. Elle a le même nombre de lignes que son
+entrée, ligne pour ligne, et s'assemble aux mêmes octets.
 
 ### Noms et valeurs
 
@@ -104,6 +121,21 @@ La collection complète des espaces d'adressage remplis, telle que le backend la
 reçoit.
 _Éviter_ : dump, mémoire
 
+**Coverage** :
+L'ensemble des adresses effectivement écrites par le source. Elle distingue
+« le source a écrit 0x00 ici » de « le source n'a rien écrit ici » — distinction
+que l'image seule ne porte pas, et sans laquelle ni la base ni l'avertissement
+de chevauchement ne sont possibles.
+_Éviter_ : couverture, masque, plage écrite (qui désigne l'intervalle lo..hi, bien
+plus grossier)
+
+**Provenance** :
+Le site d'émission auquel chaque octet écrit est attribué — une ligne de la
+source déroulée, et non un numéro de ligne d'origine, que deux expansions d'une
+même macro rendraient indiscernables. C'est ce qui permet de nommer les deux
+lignes en conflit lors d'un chevauchement.
+_Éviter_ : origine, numéro de ligne
+
 **Configuration RAM** :
 L'une des huit combinaisons de pagination du gate array, sélectionnée par
 `&7Fxx`. Sans rapport avec une banque, malgré la graphie `C0`–`C7` qui les
@@ -133,6 +165,14 @@ Ce qui rassemble les morceaux encapsulés en livraison : système de fichiers,
 image DSK, cartouche CPR, arborescence CRO. Le SNA n'en est pas un — il prend
 l'image entière.
 _Éviter_ : format (trop large), archive
+
+**Base** :
+L'image mémoire préexistante sur laquelle les octets du source sont écrits, avec
+l'état matériel qui va avec : un snapshot de référence pris après le boot d'une
+machine réelle. Il rend exécutable un code qui appelle le firmware, dont les
+vecteurs d'indirection et les variables système ne sont pas produits par
+l'assemblage. Hors d'une base, ces zones valent zéro.
+_Éviter_ : socle, overlay (qui désigne ce qu'on pose, soit l'inverse), dump firmware
 
 **Artefact** :
 Un fichier produit par un backend. Un backend en rend un ensemble, pas un seul.
