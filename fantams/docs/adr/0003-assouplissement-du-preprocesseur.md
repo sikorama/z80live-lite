@@ -79,3 +79,33 @@ adresse 41 % des échecs mesurés. Les directives absentes (`BANK`, `SNASET`,
 `ASSERT`, `PRINT`) et les préfixes `{hex}`/`{sizeof}` constituent le reste, et
 relèvent d'arbitrages distincts — certains touchant à des fonctionnalités dont
 nous ne voulons pas.
+
+## Amendement — l'avertissement d'ambiguïté n'avait pas de domaine
+
+Cet ADR appelait « des avertissements aux points d'ambiguïté réelle : variable
+lue au temps préprocesseur puis réaffectée plus loin, ou nom résolu à une valeur
+différente selon la phase ». Cet avertissement a été implémenté, puis retiré :
+mesuré sur une source réelle, il tirait quatorze fois sur une seule ligne, et
+aucun de ces tirs ne désignait une ambiguïté.
+
+La raison est que les deux étages ne divergent pas là où on le croyait. Une
+**variable** est séquentielle des deux côtés : le préprocesseur lit la dernière
+affectation rencontrée au-dessus, et l'assembleur fait de même — il la tient
+explicitement hors de la résolution à point fixe, réservée aux constantes. Sur
+une même source déroulée, les deux sont donc **d'accord par construction**, et
+`v = v - 1` dans une boucle n'est pas une ambiguïté, c'est l'accumulateur
+idiomatique.
+
+Une **constante** redéfinie, elle, est bien un désaccord potentiel — mais c'est
+déjà une **erreur** : l'assembleur refuse la seconde définition d'un symbole non
+réassignable. L'avertissement n'annonçait donc qu'une erreur que l'étage suivant
+lève de toute façon, en plus faible et en premier. Un fait, un étage.
+
+Il reste un seul point de frontière, et il est couvert : un nom qui dépend d'un
+label n'est pas « inconnu », il est connu et pas encore calculable, et le
+préprocesseur le dit nommément. C'est la part du modèle strict qui survit, telle
+que la section « Frontière conservée » l'énonce.
+
+La garantie que cet ADR échangeait contre l'assouplissement reste donc la
+**source déroulée** — inspectable, fidèle, réassemblable — et non un jeu
+d'avertissements.

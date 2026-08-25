@@ -102,3 +102,35 @@ Cette décision ne couvre pas l'alignement des commentaires, la casse des
 mnémoniques ni l'espacement des opérandes. Les ajouter plus tard reste possible,
 mais chacun devra d'abord exister comme avertissement — c'est ce qui distingue
 une correction d'un goût.
+
+## Amendement — la préservation des lignes ne survit qu'en option
+
+Le titre de cet ADR est désormais inexact pour le beautify lui-même. Sa règle 3
+(ADR 0017) détache « label: instruction » en deux lignes, par défaut, et rompt
+donc la bijection.
+
+Ce qui a rendu la décision possible est que la justification écrite ici était
+fausse. Cet ADR affirmait que la bijection protégeait « la provenance et le
+recalage des diagnostics ». Elle ne protège ni l'un ni l'autre : l'assembleur
+consomme `pp::Result::lines`, chaque ligne portant son fichier et son numéro
+d'origine (`asm_main.cpp`), et le beautify n'est **jamais** dans le chemin
+d'assemblage. En mode `--beautify` il produit un fichier que l'auteur réassemble
+ensuite ; en mode `-E` il met en forme un texte qu'on écrit et qu'on ne relit pas.
+
+Le seul consommateur réel était le curseur de l'éditeur, qui retrouvait sa ligne
+par son numéro. Il corrige maintenant le décalage en comptant les labels collés
+au-dessus de lui.
+
+La préservation des lignes reste vraie, et testée, sous `--no-detach-labels`.
+
+## Note — `--normalize` n'est pas de la mise en forme
+
+Le reste de cet ADR vaut pour le **beautify**.
+
+`--normalize` (ADR 0017) est un outil **distinct**, pas une option du beautify :
+il canonise sans dérouler, et il change délibérément le nombre de lignes —
+`push hl,de` devient deux lignes, `ld a,1:inc a` aussi. Il ne contredit pas la
+préservation des lignes énoncée ici, il n'y est pas soumis.
+
+Ce que les deux partagent, en revanche, est le refus de deviner et l'égalité des
+octets assemblés.

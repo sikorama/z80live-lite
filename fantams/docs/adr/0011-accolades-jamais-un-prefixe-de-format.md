@@ -2,7 +2,7 @@
 status: accepted
 ---
 
-# Les accolades n'ont qu'un rôle : `{X}` évalue X et substitue
+# Les accolades ne sont jamais un préfixe de format
 
 Nous refusons les notations rasm `{sizeof}`, `{hex}`, `{bin}`, `{char}` et
 `{int}`. `sizeof` devient une fonction — `sizeof(nom)` — et les formats
@@ -62,3 +62,27 @@ délibéré du plafond de compatibilité, décidé en connaissance du chiffre.
 Si un jour des opérateurs rendant des chaînes entrent dans le langage
 d'expressions, `hex()` deviendra naturellement exprimable et cette décision
 pourra être revue. La porte reste ouverte, non franchie.
+
+## Amendement — l'invariant reformulé
+
+Cet ADR s'intitulait « les accolades n'ont qu'un rôle : `{X}` évalue X et
+substitue ». La décision est intacte — `{hex}` et `{sizeof}` restent refusés —
+mais sa formulation est devenue fausse, et il valait mieux la corriger que la
+laisser affirmer un invariant que le langage ne tient plus.
+
+`{arg}`, sur un argument de macro, n'évalue rien : il substitue le **texte brut**
+de l'argument, quand la forme nue en substitue la **valeur**, calculée au site
+d'appel. La différence est observable — un corps de macro qui réaffecte une
+variable entre deux usages voit `5, 5, 5` par la forme nue et `5, 4, 3` par les
+accolades — donc elle est porteuse, et une formulation qui la nie ne peut pas
+tenir.
+
+Ce que cet ADR refusait n'était pas la multiplicité des sources de substitution,
+c'était le **préfixe de format** : `{int}x` et `{hex}x` désignent le même nombre
+rendu autrement, et rien dans la ligne ne dit qu'on a changé de registre
+grammatical. C'est ce refus qui porte le titre désormais, et il ne souffre
+toujours aucune exception.
+
+Conséquence à porter dans le code : les commentaires de `pp.cpp` et de
+`expandSizeof` qui citent « un seul rôle grammatical » doivent citer le nouvel
+énoncé.
