@@ -39,6 +39,19 @@ enum class Phase {
 // main au moment d'appeler, et le convertir ici le referait deux fois.
 bool isReservedWord(const std::string &upperTok, Phase ph);
 
+// Registres, paires et conditions du Z80. Contrairement aux mots ci-dessus, cet
+// ensemble n'est PAS indexé par phase : un registre est un mot de la machine à
+// toutes les phases. Il vivait dans `pp.cpp`, seul à le consulter, alors qu'il
+// décrit le vocabulaire de la machine — exactement la duplication que cet
+// en-tête a supprimée pour les labels (ADR 0015).
+bool isMachineWord(const std::string &upperTok);
+
+// Un identifiant utilisateur ne porte pas un nom du langage ni de la machine
+// (ADR 0015). Rend le diagnostic à émettre, ou "" si le nom est libre.
+// `position` complète la phrase : "a macro parameter", "a loop index", "a
+// symbol", "a label". Une seule formulation pour les quatre positions.
+std::string reservedName(const std::string &name, const std::string &position);
+
 // Sépare un éventuel label de tête « ident: » du reste — ou « ident » seul
 // (sans ':') si `ident` n'est pas réservé à cette phase, forme tolérée et
 // courante chez rasm. `code` doit être dépourvu de commentaire et d'espaces de
@@ -53,6 +66,29 @@ bool isReservedWord(const std::string &upperTok, Phase ph);
 void peelLabel(const std::string &code, std::string &label, std::string &rest, Phase ph,
                bool *sawColon = nullptr,
                const std::function<bool(const std::string &)> &isMacro = nullptr);
+
+// --- Littéraux de chaîne (ADR 0010) ------------------------------------------
+//
+// « 'texte' » et « "texte" » désignent le MÊME objet : une chaîne. Les deux
+// délimiteurs sont synonymes, et rien ne distingue 'A' de "A" — un littéral
+// d'un octet, dont la valeur en expression est le code de ce caractère.
+//
+// Un littéral court jusqu'à la prochaine occurrence de SON PROPRE délimiteur :
+// l'autre y est un caractère ordinaire, sans échappement (« db 'a"b' » émet
+// trois octets). C'est ce que fait déjà rasm, et ce que faisaient déjà les
+// scanners de pp.cpp et parser.cpp — l'écrire ici une fois supprime une
+// divergence plutôt qu'elle n'en ajoute une.
+struct Literal {
+    bool present = false;   // la position lue commençait bien par un délimiteur
+    std::string bytes;      // contenu, échappements résolus
+    size_t end = 0;         // index juste après le délimiteur fermant
+    std::string error;      // non vide si le littéral n'est pas terminé
+};
+
+// Lit un littéral à la position `pos`. `present` reste faux — sans erreur — si
+// `s[pos]` n'est pas un délimiteur : c'est à l'appelant de décider si un
+// littéral était attendu là.
+Literal readLiteral(const std::string &s, size_t pos);
 
 // Index du début du commentaire de ligne (';' ou '//'), hors chaîne et
 // caractère, ou npos. Partagé pour que le beautify et l'assembleur s'accordent

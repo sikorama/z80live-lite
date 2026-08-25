@@ -68,7 +68,7 @@ int main() {
 
     // référence AVANT (le point clé des 2 passes)
     chk("forward jp",
-        "  org 0x8000\nstart:\n  jp end\n  nop\nend:\n  ret\n",
+        "  org 0x8000\nstart:\n  jp done\n  nop\ndone:\n  ret\n",
         {0xC3, 0x04, 0x80, 0x00, 0xC9}, 0x8000);
     chk("forward jr",
         "  org 0\n  jr next\nnext:\n  nop\n",
@@ -186,6 +186,105 @@ int main() {
         asmb::Output o = asmb::assembleText("  org #8000\n  db 1\n  org #9000\n  db 1\n", "t.asm");
         okc("chevauchement : deux ORG disjoints n'en produisent pas", o.warnings.empty());
     }
+
+    // --- Chaines : les deux delimiteurs, et la chaine decalee (ADR 0010) -----
+    // Cas de reference du lot : chaque ligne exerce UNE construction, et les
+    // refus en font partie autant que les acceptations — un message d'erreur
+    // qui cesse de nommer son remplacant est une regression que rien d'autre
+    // n'attrape.
+    {
+        // Les deux delimiteurs designent le meme objet : aucune ecriture ne
+        // marche d'un cote et echoue de l'autre.
+        chk("chaine : db simple quote", "  org #8000\n  db 'hi'\n", {0x68, 0x69}, 0x8000);
+        chk("chaine : db double quote", "  org #8000\n  db \"hi\"\n", {0x68, 0x69}, 0x8000);
+        chk("chaine : dm accepte aussi le simple quote", "  org #8000\n  dm 'hi'\n", {0x68, 0x69}, 0x8000);
+
+        // Le delimiteur OPPOSE est du contenu ordinaire, sans echappement.
+        chk("chaine : guillemet dans un litteral simple", "  org #8000\n  db 'a\"b'\n",
+            {0x61, 0x22, 0x62}, 0x8000);
+        chk("chaine : apostrophe dans un litteral double", "  org #8000\n  db \"a'b\"\n",
+            {0x61, 0x27, 0x62}, 0x8000);
+
+        // Un litteral d'UN octet vaut son code, quel que soit le delimiteur.
+        chk("chaine : 'x' en expression", "  org #8000\n  ld a,'x'\n", {0x3E, 0x78}, 0x8000);
+        chk("chaine : \"x\" en expression", "  org #8000\n  ld a,\"x\"\n", {0x3E, 0x78}, 0x8000);
+        chk("chaine : arithmetique sur un litteral d'un octet",
+            "  org #8000\n  db 'a'+1\n", {0x62}, 0x8000);
+
+        // Litteral vide : zero octet emis, et l'element suivant reste en place.
+        chk("chaine : litteral vide n'emet rien", "  org #8000\n  db '',#AA\n", {0xAA}, 0x8000);
+
+        // Chaine decalee : la queue s'applique a CHAQUE octet.
+        chk("chaine decalee : db 'hello'-'a'", "  org #8000\n  db 'hello'-'a'\n",
+            {0x07, 0x04, 0x0B, 0x0B, 0x0E}, 0x8000);
+        chk("chaine decalee : queue composee", "  org #8000\n  db 'hello'-'a'+1\n",
+            {0x08, 0x05, 0x0C, 0x0C, 0x0F}, 0x8000);
+        chk("chaine decalee : les deux delimiteurs, meme resultat",
+            "  org #8000\n  db \"hello\"-\"a\"\n", {0x07, 0x04, 0x0B, 0x0B, 0x0E}, 0x8000);
+        chk("chaine decalee : tout operateur binaire, pas seulement + et -",
+            "  org #8000\n  db 'ab'*2\n", {0xC2, 0xC4}, 0x8000);
+        chk("chaine decalee : le decalage se masque sur 8 bits",
+            "  org #8000\n  db 'a'-'z'\n", {0xE7}, 0x8000);
+
+        // --- Refus ----------------------------------------------------------
+        // Contexte SCALAIRE : aucune valeur n'existe, et rasm y repond par un
+        // zero silencieux qu'on se refuse a reproduire.
+        chkErr("refus : ld hl,'ab' (aucune convention d'endianness)",
+               "  org #8000\n  ld hl,'ab'\n");
+        chkErr("refus : ld hl,\"\" (litteral vide sans valeur)",
+               "  org #8000\n  ld hl,\"\"\n");
+        chkErr("refus : dw n'est pas un contexte de chaine decalee",
+               "  org #8000\n  dw 'hello'-'a'\n");
+        // Les parentheses annoncent une expression : le litteral y redevient un
+        // operande, donc sans valeur.
+        chkErr("refus : db ('hello')-'a' n'est pas une chaine decalee",
+               "  org #8000\n  db ('hello')-'a'\n");
+        // Le litteral doit etre en TETE de l'element.
+        chkErr("refus : db 1+'hello' (litteral pas en tete)",
+               "  org #8000\n  db 1+'hello'\n");
+        chkErr("refus : deux litteraux dans un element",
+               "  org #8000\n  db 'ab'-'cd'\n");
+        chkErr("refus : litteral non termine", "  org #8000\n  db 'hello\n");
+        chkErr("refus : PRINT n'accepte pas une chaine decalee",
+               "  org #8000\n  print 'hello'-'a'\n");
+        chkErr("refus : CHARSET", "  org #8000\n  charset '0123',0\n");
+    }
+    {
+        // Le choix du delimiteur n'est pas un avertissement : il ne nomme
+        // aucune ambiguite (ADR 0010), contrairement au label sans ':'.
+        chkWarn("chaine : le simple quote n'avertit pas",
+                "  org #8000\n  db 'hello'\n", false);
+        chkWarn("chaine : le double quote n'avertit pas non plus",
+                "  org #8000\n  db \"hello\"\n", false);
+    }
+    {
+        // Le refus de CHARSET nomme son remplacant, comme BANK ou TICKER.
+        asmb::Output o = asmb::assembleText("  org #8000\n  charset '0123',0\n", "t.asm");
+        bool named = !o.errors.empty() &&
+                     o.errors[0].message.find("asset encoding") != std::string::npos;
+        okc("refus : CHARSET nomme son remplacant", named);
+    }
+
+    // ADR 0015 : aucun identifiant utilisateur ne porte un nom du langage ni de la
+
+    // machine. Les deux positions que l'assembleur possède : symbole et label.
+
+    chkErr("registre en nom de constante", "hl equ 5\n");
+
+    chkErr("registre en nom de variable", "c = 7\n");
+
+    chkErr("condition en nom de constante", "nz equ 1\n");
+
+    chkErr("mnémonique en label", "call: nop\n");
+
+    chkErr("directive en label", "org: nop\n");
+
+    chkErr("registre en label", "hl: nop\n");
+
+    chkSym("label libre", "boucle: nop\n", "boucle", 0);
+
+    chkSym("label local non concerné", "g: nop\n.b: nop\n", "g.b", 1);
+
 
     printf("\n%d réussis, %d échoués\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

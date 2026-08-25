@@ -17,11 +17,12 @@ start:
         WAIT b          ; 1er appel -> @wloop__x
         WAIT b          ; 2e appel  -> @wloop__y (pas de collision)
 
-; table générée par REPEAT (i est 1-based, comme rasm : 1er tour i=1)
+; table générée par FOR : les bornes sont écrites, rien à deviner.
+; `to` inclut la borne haute, `until` l'exclut.
 tbl:
-REPEAT COUNT, i
-        db {=i*i}       ; carrés : 1,4,9,16
-REND
+FOR k = 1 TO COUNT
+        db {=k*k}       ; carrés : 1,4,9,16
+END
 
 IF DEBUG
         ld a,0xFF       ; inclus seulement si DEBUG

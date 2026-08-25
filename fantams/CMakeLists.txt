@@ -15,6 +15,7 @@ add_library(keywords STATIC keywords.cpp)
 target_include_directories(keywords PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(keywords PUBLIC z80)
 
+# expr.cpp depend de keywords (kw::readLiteral, ADR 0010).
 add_library(pp STATIC pp.cpp expr.cpp)
 target_include_directories(pp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(pp PUBLIC keywords)

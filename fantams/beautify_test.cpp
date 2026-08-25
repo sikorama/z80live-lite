@@ -7,6 +7,7 @@
 // Le reste vérifie chaque règle et, surtout, ce que la mise en forme REFUSE de
 // toucher.
 #include "beautify.h"
+#include "pp.h"
 
 #include "asm.h"
 
@@ -61,12 +62,30 @@ static void sameBytes(const char *desc, const std::string &src) {
     okc(desc, a.ok && o.ok && a.bin == o.bin && a.loadAddress == o.loadAddress);
     if (a.ok && o.ok && a.bin != o.bin)
         printf("    (%zu octets contre %zu)\n", a.bin.size(), o.bin.size());
-    // La bijection sur les lignes vaut pour toute source, y compris celles que
-    // la mise en forme laisse intactes : c'est elle qui protège la provenance.
-    okc("bijection sur les lignes", countLines(src) == countLines(b));
+    // La bijection sur les lignes ne vaut plus que SANS détachement (ADR 0017) :
+    // la règle 3 la rompt délibérément, et rien dans la chaîne n'en dépend —
+    // l'assembleur consomme la provenance de `pp::Result::lines`, pas des numéros
+    // de ligne de texte mis en forme.
+    okc("bijection sur les lignes sans détachement",
+        countLines(src) == countLines(beautify::apply(src, kw::Phase::Assembly, /*detach=*/false)));
 }
 
 // Invariant n°2 : idempotence.
+// ADR 0017 : `--normalize` ne change pas le programme. C'est SA promesse, et la
+// seule qui compte — le nombre de lignes, lui, change délibérément. Vérifiée ici
+// parce que c'est le seul binaire de test où le préprocesseur et l'assembleur sont
+// liés ensemble.
+static void normKeepsBytes(const char *desc, const std::string &src) {
+    auto build = [](const std::string &text) {
+        pp::Result p = pp::preprocess(text, "t.asm", [](const std::string &, std::string &) { return false; });
+        return p.ok ? asmb::assembleText(p.dump(), "t.asm") : asmb::Output{};
+    };
+    asmb::Output before = build(src);
+    asmb::Output after = build(pp::normalize(src));
+    okc(desc, before.ok && after.ok && before.bin == after.bin &&
+              before.loadAddress == after.loadAddress);
+}
+
 static void idem(const char *desc, const std::string &src, kw::Phase ph = kw::Phase::Assembly) {
     std::string once = beautify::apply(src, ph);
     okc(desc, beautify::apply(once, ph) == once);
@@ -105,8 +124,16 @@ int main() {
     keep("appel de macro sans argument laissé intact", "cls 0\n");
     keep("constante EQU", "ecran EQU #C000\n");
     keep("variable '='", "compteur = 3\n");
-    keep("label + instruction sur la même ligne (bijection)", "start: ld a,1\n");
     keep("label sans ':' + instruction : intact, le doute est justifié", "start ld a,1\n");
+
+    // --- règle 3 : détachement des labels (ADR 0017) ------------------------
+    chk("label détaché de son instruction", "start: ld a,1\n", "start:\n    ld a,1\n");
+    chk("détachement avec commentaire : il suit le CODE",
+        "start: ld a,1  ; init\n", "start:\n    ld a,1 ; init\n");
+    chk("label local détaché aussi", ".loop: djnz .loop\n", ".loop:\n    djnz .loop\n");
+    okc("opt-out : la ligne reste entière",
+        beautify::apply("start: ld a,1\n", kw::Phase::Assembly, /*detach=*/false) == "start: ld a,1\n");
+    keep("sans ':' rien n'est détaché : ce peut être un appel de macro", "sprite 4,12\n");
 
     // --- règle 2 : quatre espaces ------------------------------------------
     chk("instruction en colonne 1", "start:\nnop\n", "start:\n    nop\n");
@@ -161,8 +188,11 @@ int main() {
 
     {
         std::string src = "start\nnop\n\tld a,1\n";
-        okc("nombre de lignes préservé",
+        okc("nombre de lignes préservé quand aucun label n'est collé",
             countLines(src) == countLines(beautify::apply(src, kw::Phase::Assembly)));
+        std::string glued = "start: ld a,1\n";
+        okc("détachement : une ligne de plus, et une seule",
+            countLines(beautify::apply(glued, kw::Phase::Assembly)) == countLines(glued) + 1);
     }
 
     // --- invariants --------------------------------------------------------
@@ -193,6 +223,21 @@ int main() {
             if (w.message.find("label without ':'") != std::string::npos) still = true;
         okc("l'avertissement survit sur un appel de macro possible", still);
     }
+
+    // ADR 0017 : normaliser ne change pas le programme.
+
+    normKeepsBytes("normalize : sucre un-vers-plusieurs",
+
+                    "  org 0x8000\nstart:\n  push hl,de\n  ld a,1: inc a\n  ret\n");
+
+    normKeepsBytes("normalize : orthographes obsoletes",
+
+                    "  org 0x100\n  defb 1,2\n  defw 0x1234\n  defs 3\n");
+
+    normKeepsBytes("normalize : macros et boucles conservees",
+
+                    "  org 0\nmacro m\n  push hl,de\nmend\n  repeat 2\n  m\n  rend\n");
+
 
     printf("\n%d réussis, %d échoués\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

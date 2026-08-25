@@ -42,6 +42,7 @@ const std::set<std::string> &instructionWords() {
 const std::set<std::string> &assemblyWords() {
     static const std::set<std::string> kws = {
         "ASSERT", "PRINT", "BANK", "SNASET", "SETCPC", "TICKER", "STR",
+        "CHARSET",
     };
     return kws;
 }
@@ -53,14 +54,51 @@ const std::set<std::string> &preprocessWords() {
         "MACRO", "ENDM", "MEND", "REPEAT", "REND", "WHILE", "WEND",
         "MODULE", "ENDMODULE", "STRUCT", "ENDSTRUCT", "ENDS",
         "INCLUDE", "INCBIN", "READ", "@@EXPORT",
+        // ADR 0016 : fermeture universelle, fermetures explicites, et la boucle
+        // à bornes écrites. `TO` et `UNTIL` sont réservés parce qu'ils portent la
+        // sémantique de la borne — les confondre avec un symbole la ferait deviner.
+        "END", "ENDMACRO", "ENDREPEAT", "ENDWHILE", "ENDFOR",
+        "FOR", "TO", "UNTIL",
     };
     return kws;
+}
+
+// Registres, paires et conditions : le vocabulaire de la MACHINE, sans phase.
+const std::set<std::string> &machineWords() {
+    static const std::set<std::string> kws = {
+        "A", "B", "C", "D", "E", "H", "L", "I", "R",
+        "AF", "BC", "DE", "HL", "SP", "PC",
+        "IX", "IY", "IXL", "IXH", "IYL", "IYH", "LX", "LY", "HX", "HY",
+        "NZ", "Z", "NC", "PO", "PE", "P", "M",
+    };
+    return kws;
+}
+
+// La CATÉGORIE d'un mot réservé, pour que le diagnostic dise de quoi il s'agit :
+// « 'hl' is a Z80 register » se corrige, « 'hl' is reserved » se subit.
+const char *reservedKind(const std::string &U) {
+    if (z80::mnemoFromString(U) != z80::Mnemo::Invalid) return "a Z80 mnemonic";
+    if (machineWords().count(U)) return "a Z80 register or condition";
+    if (instructionWords().count(U) || assemblyWords().count(U)) return "an assembler directive";
+    if (preprocessWords().count(U)) return "a preprocessor keyword";
+    return nullptr;
 }
 
 } // namespace
 
 bool isIdentChar(char c) {
     return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '@';
+}
+
+bool isMachineWord(const std::string &upperTok) {
+    return machineWords().count(upperTok) != 0;
+}
+
+std::string reservedName(const std::string &name, const std::string &position) {
+    const char *kind = reservedKind(upper(name));
+    if (!kind) return {};
+    return "'" + name + "' is " + kind + " and cannot name " + position +
+           ": reserved words are reserved — rename it";
 }
 
 bool isReservedWord(const std::string &upperTok, Phase ph) {
@@ -103,6 +141,32 @@ void peelLabel(const std::string &code, std::string &label, std::string &rest, P
         }
     }
     label.clear(); rest = code;
+}
+
+// Échappements reconnus dans un littéral. Inchangés : ce lot unifie les
+// DÉLIMITEURS, pas la table d'échappement.
+static char unescapeChar(char c) {
+    switch (c) { case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
+        case '0': return '\0'; case '\\': return '\\'; case '"': return '"'; case '\'': return '\''; }
+    return c;
+}
+
+Literal readLiteral(const std::string &s, size_t pos) {
+    Literal r;
+    if (pos >= s.size() || (s[pos] != '"' && s[pos] != '\'')) return r;
+    const char q = s[pos];
+    size_t i = pos + 1;
+    for (;;) {
+        if (i >= s.size()) { r.error = "unterminated string literal"; return r; }
+        const char c = s[i];
+        if (c == q) { ++i; break; }
+        // Le délimiteur OPPOSÉ n'est pas échappé : il est du contenu.
+        if (c == '\\' && i + 1 < s.size()) { r.bytes += unescapeChar(s[i + 1]); i += 2; continue; }
+        r.bytes += c; ++i;
+    }
+    r.present = true;
+    r.end = i;
+    return r;
 }
 
 size_t commentPos(const std::string &s) {

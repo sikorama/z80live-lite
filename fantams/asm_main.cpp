@@ -1,6 +1,7 @@
 // asm_main.cpp - end-to-end CLI: .asm source -> preprocessor -> assembler -> .bin
 //
-//   fantams file.asm [-o output.bin] [-s] [-E] [--beautify] [--base base.sna]
+//   fantams file.asm [-o out] [-s] [-E] [--strict] [--beautify] [--normalize]
+//           [--no-detach-labels] [--base base.sna]
 //     -o : output binary file (default: <source>.bin)
 //     -s : print the symbol table
 //     --base : reference snapshot the assembled bytes are laid onto (ADR 0012).
@@ -14,7 +15,18 @@
 //          definition de la source deroulee (ADR 0013).
 //     --beautify : mettre en forme le source et l'ecrire dans -o, sans
 //          preprocesseur ni assemblage. C'est ce que le bouton « Mettre en
-//          forme » de l'editeur appelle.
+//          forme » de l'editeur appelle. Preserve le nombre de lignes (ADR 0013).
+//     --strict : refuser tout ce qui n'est pas du Z80 canonique — sucre
+//          un-vers-plusieurs et orthographes obsoletes (ADR 0017). N'ajoute rien,
+//          refuse. C'est le drapeau du PIPELINE, pas d'une couche.
+//     --no-detach-labels : garder « label: instruction » sur une seule ligne.
+//          Le beautify detache par defaut (regle 3) : l'indentation fixe aligne
+//          tous les opcodes, un label de longueur variable ne les aligne pas.
+//     --normalize : canoniser le source SANS le derouler (ADR 0017) : orthographes
+//          obsoletes et opcodes composes. Change deliberement le nombre de lignes.
+//          Transformation INDEPENDANTE du beautify, composable avec lui — les deux
+//          ensemble normalisent puis mettent en forme. Incompatible avec -E, qui
+//          canonise deja PUIS deroule : deux sorties differentes.
 #include "asm.h"
 #include "beautify.h"
 #include "pp.h"
@@ -39,6 +51,9 @@ int main(int argc, char **argv) {
     bool showSyms = false;
     bool dumpOnly = false;
     bool beautifyOnly = false;
+    bool normalizeOnly = false;
+    bool strict = false;
+    bool detachLabels = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) outPath = argv[++i];
@@ -46,22 +61,31 @@ int main(int argc, char **argv) {
         else if (a == "-s") showSyms = true;
         else if (a == "-E") dumpOnly = true;
         else if (a == "--beautify") beautifyOnly = true;
+        else if (a == "--normalize") normalizeOnly = true;
+        else if (a == "--strict") strict = true;
+        else if (a == "--no-detach-labels") detachLabels = false;
         else path = a;
     }
-    if (path.empty()) { fprintf(stderr, "usage: fantams file.asm [-o output.bin] [-s] [-E] [--beautify] [--base base.sna]\n"); return 2; }
+    if (path.empty()) { fprintf(stderr, "usage: fantams file.asm [-o out] [-s] [-E] [--strict] [--beautify] [--normalize] [--no-detach-labels] [--base base.sna]\n"); return 2; }
+    // Le mode « la sortie est un source » : l'un ou l'autre des deux drapeaux suffit.
+    const bool sourceOut = beautifyOnly || normalizeOnly;
     if (outPath.empty()) {
         size_t dot = path.find_last_of('.');
         std::string stem = (dot == std::string::npos ? path : path.substr(0, dot));
-        outPath = stem + (beautifyOnly ? ".fmt.asm" : dumpOnly ? ".pp.asm" : ".bin");
+        outPath = stem + (sourceOut ? ".fmt.asm" : dumpOnly ? ".pp.asm" : ".bin");
     }
 
     if (beautifyOnly && dumpOnly) {
         fprintf(stderr, "error: -E et --beautify demandent deux sorties differentes : la source deroulee, ou le source mis en forme\n");
         return 2;
     }
+    if (normalizeOnly && dumpOnly) {
+        fprintf(stderr, "error: -E canonise deja PUIS deroule les macros et les boucles ; --normalize canonise sans derouler. Deux sorties differentes.\n");
+        return 2;
+    }
 
     bool wantSna = outPath.size() >= 4 && outPath.substr(outPath.size() - 4) == ".sna";
-    if (!basePath.empty() && (dumpOnly || beautifyOnly || !wantSna)) {
+    if (!basePath.empty() && (dumpOnly || sourceOut || !wantSna)) {
         fprintf(stderr, "error: --base ne s'applique qu'a une sortie .sna : %s\n", outPath.c_str());
         return 2;
     }
@@ -95,17 +119,24 @@ int main(int argc, char **argv) {
     // mots-cles y sont donc vivants. Au temps d'assemblage, « MEND » n'est pas
     // reserve et serait lu comme un label seul sur sa ligne — le beautify lui
     // ajouterait un deux-points et detruirait le source.
-    if (beautifyOnly) {
-        std::string text = beautify::apply(content, kw::Phase::Preprocess);
+    if (sourceOut) {
+        // L'ordre compte : --normalize change le nombre de lignes, le beautify met
+        // en forme ce qui en resulte. L'inverse mettrait en forme des lignes que
+        // la canonisation allait couper.
+        std::string text = content;
+        if (normalizeOnly) text = pp::normalize(text);
+        if (beautifyOnly) text = beautify::apply(text, kw::Phase::Preprocess, detachLabels);
         std::ofstream f(outPath, std::ios::binary);
         if (!f) { fprintf(stderr, "error: cannot write: %s\n", outPath.c_str()); return 2; }
         f.write(text.data(), (std::streamsize)text.size());
-        fprintf(stderr, "%s: source mis en forme\n", outPath.c_str());
+        fprintf(stderr, "%s: %s\n", outPath.c_str(),
+                beautifyOnly && normalizeOnly ? "source canonise et mis en forme"
+                : normalizeOnly ? "source canonise" : "source mis en forme");
         return 0;
     }
 
     // 1) preprocessor
-    pp::Result pre = pp::preprocess(content, path, readFile);
+    pp::Result pre = pp::preprocess(content, path, readFile, strict);
     for (auto &w : pre.warnings) fprintf(stderr, "%s:%d: warning: %s\n", w.file.c_str(), w.line, w.message.c_str());
     if (!pre.ok) {
         for (auto &e : pre.errors) fprintf(stderr, "%s:%d: error (preproc): %s\n", e.file.c_str(), e.line, e.message.c_str());
@@ -118,11 +149,17 @@ int main(int argc, char **argv) {
     // traiter comme reserves ferait indenter un label nomme « read » au lieu de
     // lui donner son deux-points.
     if (dumpOnly) {
-        std::string text = beautify::apply(pre.dump(), kw::Phase::Assembly);
+        std::string text = beautify::apply(pre.dump(), kw::Phase::Assembly, detachLabels);
         std::ofstream f(outPath, std::ios::binary);
         if (!f) { fprintf(stderr, "error: cannot write: %s\n", outPath.c_str()); return 2; }
         f.write(text.data(), (std::streamsize)text.size());
-        fprintf(stderr, "%s: unrolled source (%zu lines)\n", outPath.c_str(), pre.lines.size());
+        // Le compte est celui du TEXTE ECRIT, pas celui de pre.lines : le
+        // detachement des labels ajoute des lignes, et annoncer l'autre chiffre
+        // ferait mentir le seul nombre que le lecteur peut verifier.
+        size_t written = text.empty() ? 0 : 1;
+        for (char c : text) if (c == '\n') ++written;
+        if (!text.empty() && text.back() == '\n') --written;
+        fprintf(stderr, "%s: unrolled source (%zu lines)\n", outPath.c_str(), written);
         return 0;
     }
 

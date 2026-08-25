@@ -65,16 +65,11 @@ size_t findAssign(const std::string &s) {
     }
     return std::string::npos;
 }
-// Retire les guillemets englobants et deshabille les echappements.
-std::string unquote(const std::string &s) {
-    if (s.size() >= 2 && (s[0] == '"' || s[0] == '\'') && s.back() == s[0])
-        return s.substr(1, s.size() - 2);
-    return s;
-}
-char unescape(char c) {
-    switch (c) { case 'n': return '\n'; case 't': return '\t'; case 'r': return '\r';
-        case '0': return '\0'; case '\\': return '\\'; case '"': return '"'; case '\'': return '\''; }
-    return c;
+// Texte d'un littéral, ou l'argument tel quel s'il n'en est pas un — pour les
+// messages (ASSERT), où un argument non quoté reste lisible.
+std::string literalText(const std::string &s) {
+    const kw::Literal lit = kw::readLiteral(s, 0);
+    return (lit.present && lit.error.empty()) ? lit.bytes : s;
 }
 
 // Rendu d'une valeur pour PRINT, selon le mot-cle de format (ADR 0011).
@@ -101,6 +96,7 @@ public:
         ciIndex_.clear();
 
         pass_ = 1; pc_ = 0; lo_ = 0x10000; hi_ = 0; definedP1_.clear(); equDefs_.clear(); currentGlobal_.clear();
+        badNames_.clear();
         for (const auto &l : lines) process(l);
 
         // Les labels sont fixés (adresses indépendantes des valeurs). On réévalue
@@ -224,6 +220,7 @@ private:
     std::map<std::string, std::string> ciIndex_; // MAJUSCULES(nom) -> nom exact, pour le repli insensible à la casse
     std::set<std::string> definedP1_;
     std::vector<std::pair<std::string, std::string>> equDefs_; // (nom, texte expr) pour la résolution
+    std::set<std::string> badNames_;          // noms refusés déjà signalés (ADR 0015)
     std::vector<Diagnostic> errors_;
     std::vector<Diagnostic> warnings_;
     int pass_ = 1, pc_ = 0, lo_ = 0, hi_ = 0;
@@ -279,7 +276,20 @@ private:
         return r.value;
     }
 
+    // ADR 0015 : aucun identifiant utilisateur ne porte un nom du langage ni de la
+    // machine. Le refus vit ici pour les symboles et les labels — l'assembleur est
+    // le seul étage qui les définisse, et un fait ne se diagnostique qu'une fois.
+    // Dédupliqué sur le nom : une variable refusée à l'intérieur d'un REPEAT déroulé
+    // reparaîtrait sinon à chaque itération de la passe 1.
+    bool nameRefused(const std::string &n, const std::string &position) {
+        std::string bad = kw::reservedName(n, position);
+        if (bad.empty()) return false;
+        if (pass_ == 1 && badNames_.insert(n).second) push(bad);
+        return true;
+    }
+
     void defineLabel(const std::string &n) {
+        if (nameRefused(n, "a label")) return;
         std::string qn = qualify(n);
         if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
         setSymbol(qn, (double)(pc_ & 0xFFFF));
@@ -288,6 +298,7 @@ private:
     // ('EQU') non. Cf. ADR 0003 — "angle = i - 1" dans un "repeat 256,i" est
     // idiomatique, et l'interdire rejetait 9 sources du corpus.
     void defineSymbol(const std::string &n, double v, bool reassignable = false) {
+        if (nameRefused(n, "a symbol")) return;
         std::string qn = qualify(n);
         if (pass_ == 1 && !reassignable) {
             if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; }
@@ -295,15 +306,38 @@ private:
         setSymbol(qn, v);
     }
 
+    // Un élément de « db » : soit une expression, soit un littéral de chaîne,
+    // soit une CHAÎNE DÉCALÉE — un littéral suivi d'une queue arithmétique
+    // appliquée à chacun de ses octets (« db 'hello'-'a' » émet cinq octets).
+    //
+    // Le littéral doit être en TÊTE de l'élément. « db 1+'hello' » et
+    // « db ('hello')-'a' » ne sont pas des chaînes décalées : ce sont des
+    // expressions, et expr les refuse lui-même puisqu'un littéral multi-octets
+    // n'y a pas de valeur. Ce refus vit donc en un seul endroit.
     void emitByteOrStr(const std::string &p) {
-        if (!p.empty() && p[0] == '"') {
-            for (size_t k = 1; k < p.size(); ++k) {
-                char c = p[k];
-                if (c == '"') break;
-                if (c == '\\' && k + 1 < p.size()) { ++k; c = unescape(p[k]); }
-                emit((uint8_t)c);
+        const kw::Literal lit = kw::readLiteral(p, 0);
+        if (!lit.present) { emit((uint8_t)(evalExpr(p) & 0xFF)); return; }
+        if (!lit.error.empty()) { structErr(lit.error + ": " + p); return; }
+
+        const std::string tail = trim(p.substr(lit.end));
+        if (tail.empty()) {                       // littéral nu
+            for (char c : lit.bytes) emit((uint8_t)c);
+            return;
+        }
+        // Un second littéral dans la queue n'a pas de lecture : « db 'ab'-'cd' »
+        // décalerait deux octets par deux autres, sans règle d'appariement.
+        for (size_t k = 0; k < tail.size(); ++k) {
+            if (tail[k] != '"' && tail[k] != '\'') continue;
+            const kw::Literal t2 = kw::readLiteral(tail, k);
+            if (t2.error.empty() && t2.bytes.size() > 1) {
+                structErr("two string literals in one element: " + p +
+                          " (a shifted string takes a numeric tail, e.g. db 'hello'-'a')");
+                return;
             }
-        } else emit((uint8_t)(evalExpr(p) & 0xFF));
+            k = t2.error.empty() ? t2.end - 1 : tail.size();
+        }
+        for (char c : lit.bytes)
+            emit((uint8_t)(evalExpr(std::to_string((unsigned char)c) + " " + tail) & 0xFF));
     }
     // Une virgule finale ("db 1,2,") est tolérée : elle est courante dans les
     // tables de données générées, et rasm l'accepte. Seul le DERNIER élément vide
@@ -405,7 +439,7 @@ private:
             if (parts.empty()) { structErr("ASSERT: missing condition"); return; }
             if (evalExpr(parts[0]) == 0) {
                 std::string msg = "assertion failed: " + trim(parts[0]);
-                if (parts.size() > 1) msg += " — " + unquote(trim(parts[1]));
+                if (parts.size() > 1) msg += " — " + literalText(trim(parts[1]));
                 // push() et non structErr() : ce dernier ne rapporte qu'en passe 1
                 // pour eviter les doublons, or ASSERT ne s'evalue qu'en passe 2,
                 // quand les labels sont resolus. Son erreur y etait avalee.
@@ -420,7 +454,20 @@ private:
             for (auto &p : splitTopLevel(after0, ',')) {
                 std::string a = trim(p);
                 if (a.empty()) continue;
-                if (a[0] == '"' || a[0] == '\'') { out += unquote(a); continue; }
+                const kw::Literal lit = kw::readLiteral(a, 0);
+                if (lit.present && lit.error.empty()) {
+                    // La chaîne décalée est une construction d'ÉMISSION : elle
+                    // rend une suite d'octets, et PRINT attend un texte.
+                    // push() et non structErr() : PRINT ne s'évalue qu'en passe 2,
+                    // où structErr se tait pour éviter les doublons — le
+                    // diagnostic y était avalé (même piège que pour ASSERT).
+                    if (!trim(a.substr(lit.end)).empty()) {
+                        push("PRINT takes a string or a value, not a shifted string: " + a);
+                        return;
+                    }
+                    out += lit.bytes; continue;
+                }
+                if (lit.present) { push(lit.error + ": " + a); return; }
                 // Prefixe de format en MOT NU (ADR 0011) : « print "a=", hex v ».
                 // Pas d'accolades : dans fantams « {X} » ne veut dire qu'une chose,
                 // evaluer X et substituer.
@@ -437,6 +484,12 @@ private:
         // ADR 0005 (banques) et round 4 (TICKER).
         if (W0 == "BANK") { structErr("BANK is not supported: write 'org b" + trim(after0) + ":<address>' instead (the bank and the address belong on the same line)"); return; }
         if (W0 == "SNASET" || W0 == "SETCPC") { structErr(w0 + " describes the OUTPUT format, not the program: pass it at invocation instead of in the source"); return; }
+        // Refus de fond, pas un manque : une permutation de jeu de caractères est
+        // un encodage d'asset, au même titre qu'une image convertie en tuiles.
+        // Et « charset » ne se lit nulle part : il change les octets émis par
+        // toutes les lignes suivantes sans que la source déroulée le montre —
+        // or elle est un livrable, réassemblable et lisible (ADR 0010).
+        if (W0 == "CHARSET") { structErr("CHARSET is not supported: a character-set permutation is an asset encoding — generate the 'db' with a script (fantams macros cannot manipulate strings)"); return; }
         if (W0 == "TICKER") { structErr("TICKER is not supported: cycle counting is a control-flow analysis, not a directive (it cannot account for conditional jumps)"); return; }
         if (W0 == "STR") { structErr("STR is not implemented yet: use 'db' (STR emits the string with bit 7 set on the last character)"); return; }
 

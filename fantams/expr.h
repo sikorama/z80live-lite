@@ -26,7 +26,10 @@ struct Result {
 
 // Évalue une expression entière. Opérateurs (précédence C) :
 //   || && | ^ &  == !=  < <= > >=  << >>  + -  * / %  unaires - ~ !
-// Nombres : décimal, 0x.. / $.. / #.. (hexa), %.. (binaire), 'c' (caractère).
+// Nombres : décimal, 0x.. / $.. / #.. (hexa), %.. (binaire), et un littéral de
+// chaîne d'UN octet — 'c' ou "c" indifféremment (ADR 0010). Tout littéral d'une
+// autre longueur est une erreur : une expression rend un nombre, et une suite
+// d'octets n'en est pas un.
 Result eval(const std::string &text, const Resolver &resolver);
 
 } // namespace expr

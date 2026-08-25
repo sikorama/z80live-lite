@@ -11,8 +11,10 @@ all: z80_test expr_test pp_test parser_test asm_test beautify_test sna_test ppdu
 z80_test: z80.cpp z80_test.cpp z80.h
 	$(CXX) $(CXXFLAGS) z80.cpp z80_test.cpp -o $@
 
-expr_test: expr.cpp expr_test.cpp expr.h
-	$(CXX) $(CXXFLAGS) expr.cpp expr_test.cpp -o $@
+# expr lit les littéraux de chaîne par kw::readLiteral (ADR 0010) : la règle
+# « où finit un littéral » vit une seule fois, dans keywords.
+expr_test: expr.cpp keywords.cpp z80.cpp expr_test.cpp expr.h keywords.h
+	$(CXX) $(CXXFLAGS) expr.cpp keywords.cpp z80.cpp expr_test.cpp -o $@
 
 pp_test: pp.cpp expr.cpp z80.cpp keywords.cpp pp_test.cpp pp.h expr.h z80.h keywords.h
 	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp z80.cpp keywords.cpp pp_test.cpp -o $@

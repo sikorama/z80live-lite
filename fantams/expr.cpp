@@ -8,6 +8,8 @@
 // résultat en double pour rester dans le même arbre d'évaluation.
 #include "expr.h"
 
+#include "keywords.h"
+
 #include <cctype>
 #include <cmath>
 #include <set>
@@ -144,7 +146,7 @@ struct Parser {
         skip();
         if (eat("(")) { double v = logOr(); if (!eat(")")) fail("expected ')'"); return v; }
         char c = peek();
-        if (c == '\'') return (double)parseChar();
+        if (c == '\'' || c == '"') return (double)parseLiteral();
         if (c == '$') {
             // '$' suivi d'un chiffre hexa = nombre ; sinon = symbole (adresse courante)
             if (i + 1 < s.size() && std::isxdigit((unsigned char)s[i + 1])) return parseNumber();
@@ -159,13 +161,22 @@ struct Parser {
             return parseIdentOrCall();
         fail("invalid expression");
     }
-    int64_t parseChar() {
-        ++i; // '
-        if (i >= s.size()) fail("unterminated character");
-        int64_t v = (unsigned char)s[i++];
-        if (i >= s.size() || s[i] != '\'') fail("unterminated character");
-        ++i;
-        return v;
+    // Un littéral en EXPRESSION doit valoir un nombre, et seul un littéral d'un
+    // octet en a un. « ld hl,'ab' » n'est pas un cas à tolérer : aucune
+    // convention d'endianness n'est écrite dans le source, et rasm y répond par
+    // un zéro silencieux — reproduire ça, c'est émettre du faux sans le dire.
+    // Le contexte qui accepte une SUITE d'octets, lui, c'est « db » : là le
+    // littéral n'est pas un opérande, et la chaîne décalée s'en charge.
+    int64_t parseLiteral() {
+        kw::Literal lit = kw::readLiteral(s, i);
+        if (!lit.error.empty()) fail(lit.error);
+        i = lit.end;
+        if (lit.bytes.size() == 1) return (unsigned char)lit.bytes[0];
+        if (lit.bytes.empty())
+            fail("an empty string literal has no value");
+        fail("a string literal of " + std::to_string(lit.bytes.size()) +
+             " bytes has no value: only a 1-byte literal has one (to emit the "
+             "bytes, use 'db')");
     }
     // Nombre : entier (décimal/hexa/binaire) OU flottant décimal ("0.2", "3.14").
     // Le point décimal n'est reconnu qu'en base 10 (pas de sens en hexa/binaire).

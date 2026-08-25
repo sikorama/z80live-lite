@@ -40,6 +40,23 @@ opérandes n'en relèvent pas.
 _Éviter_ : pretty print, formatage (qui désigne le rendu d'une valeur pour
 `PRINT`), mise en forme de sortie (qui évoque le format d'export), embellir
 
+**Canon** :
+La forme de référence d'une ligne de code : une ligne qui porte un opcode n'en
+porte qu'un, et cet opcode est du Z80 standard sous son orthographe canonique.
+Un label n'est pas un opcode, et n'entre pas dans le compte. Le canon est une
+structure, jamais un goût : l'indentation, la casse et le détachement des labels
+n'en relèvent pas.
+_Éviter_ : forme normale, style
+
+**Canonisation** :
+La réécriture d'une facilité d'écriture en son équivalent canonique :
+`push hl,de` devient deux `push`, `ld a,1:inc a` devient deux lignes. Elle est
+la **dernière** étape du préprocesseur, en aval de toute substitution, et elle ne
+produit que du Z80 canonique — jamais de directive de préprocesseur, jamais de
+substitution, jamais de sucre. Distincte du **déroulage**, qui multiplie les
+lignes par répétition ou par expansion d'une définition.
+_Éviter_ : abaissement, lowering, désucrage, expansion (qui désigne le déroulage)
+
 **Source beautifiée** :
 Le résultat de la passe de beautify. Elle a le même nombre de lignes que son
 entrée, ligne pour ligne, et s'assemble aux mêmes octets.
@@ -76,6 +93,27 @@ Se dit d'une expression dont tous les noms sont des variables de
 préprocesseur, des variables, des constantes ou des arguments de macro
 eux-mêmes résolubles à cette phase. Une expression touchant un label ne l'est
 jamais.
+
+### Chaînes
+
+**Chaîne** :
+Une suite d'octets écrite entre délimiteurs. `'texte'` et `"texte"` en sont deux
+graphies du même objet — les délimiteurs sont interchangeables, et `'A'` ne se
+distingue en rien de `"A"`. Une chaîne d'un octet a une valeur en expression : le
+code de son caractère. Toute autre longueur n'en a pas.
+_Éviter_ : littéral de caractère (qui suggère un objet distinct de la chaîne,
+alors que c'est le cas à un octet), string
+
+**Chaîne décalée** :
+Une chaîne suivie d'une queue arithmétique appliquée à chacun de ses octets :
+`db 'hello'-'a'` émet cinq octets. C'est une construction d'**émission**, licite
+là où une suite d'octets est attendue, jamais là où une valeur l'est.
+_Éviter_ : distribution (jargon d'implémentation), offset (déjà pris par
+l'emplacement de rangement), chaîne translatée
+
+**Décalage** :
+La queue elle-même. « Décalée de `'a'` » se dit d'une chaîne, pas de ses octets
+pris un à un.
 
 ### Portée
 

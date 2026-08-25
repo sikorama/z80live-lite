@@ -27,6 +27,55 @@ static void chk(const char *desc, const std::string &src, const std::string &exp
     } else ++g_pass;
 }
 
+// Vérifie qu'un source est refusé — ou accepté — en mode strict (ADR 0017).
+static void chkStrict(const char *desc, const std::string &src, bool shouldPass) {
+    pp::Result r = pp::preprocess(src, "test.asm", provider, /*strict=*/true);
+    if (r.ok != shouldPass) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s (ok=%d attendu=%d)\n", desc, r.ok, shouldPass);
+        for (auto &e : r.errors) printf("    err %s:%d %s\n", e.file.c_str(), e.line, e.message.c_str());
+    } else ++g_pass;
+}
+
+// Vérifie que `--normalize` rend exactement `expected` (ADR 0017).
+static void chkNorm(const char *desc, const std::string &src, const std::string &expected) {
+    std::string got = pp::normalize(src);
+    if (got != expected) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s\n    attendu:\n%s\n    obtenu:\n%s\n",
+               desc, expected.c_str(), got.c_str());
+    } else ++g_pass;
+}
+
+// Les deux propriétés qui font de `--normalize` un outil : il est idempotent, et
+// l'assemblage de son résultat rend les mêmes octets (ADR 0017). La seconde est
+// vérifiée en comparant les sources déroulées, l'assembleur n'étant pas lié ici.
+static void chkNormStable(const char *desc, const std::string &src) {
+    const std::string once = pp::normalize(src);
+    const bool idem = pp::normalize(once) == once;
+    // Les deux sources déroulées sont comparées LIGNE À LIGNE TRIMÉE : quand le PP
+    // coupe lui-même « push hl,de », il indente ses sous-lignes de quatre espaces
+    // (emit), ce que la source déjà canonisée n'a pas à faire. Le code est le même,
+    // l'indentation non — et c'est l'égalité des octets qui compte, vérifiée avec
+    // l'assembleur dans beautify_test.
+    pp::Result a = pp::preprocess(src, "test.asm", provider);
+    pp::Result b = pp::preprocess(once, "test.asm", provider);
+    auto trimmedLines = [](const pp::Result &r) {
+        std::string out;
+        for (const auto &l : r.lines) {
+            size_t x = l.text.find_first_not_of(" \t"), y = l.text.find_last_not_of(" \t");
+            out += (x == std::string::npos ? "" : l.text.substr(x, y - x + 1)) + "\n";
+        }
+        return out;
+    };
+    const bool same = a.ok && b.ok && trimmedLines(a) == trimmedLines(b);
+    if (!idem || !same) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s (idempotent=%d meme source deroulee=%d)\n", desc, idem, same);
+        if (!same) printf("    avant:\n%s\n    apres:\n%s\n", trimmedLines(a).c_str(), trimmedLines(b).c_str());
+    } else ++g_pass;
+}
+
 // Vérifie qu'un préprocessing échoue (erreur attendue).
 static void chkErr(const char *desc, const std::string &src) {
     pp::Result r = pp::preprocess(src, "test.asm", provider);
@@ -62,30 +111,102 @@ int main() {
     chk("subst expr", "LET N = 3\n  ld a,{=N*2+1}\n", "ld a,7\n");
 
     // REPEAT avec index (1-based, comme rasm : {i} vaut 1 à la 1re itération)
-    chk("REPEAT", "REPEAT 3, i\n  ld a,{i}\nREND\n", "ld a,1\nld a,2\nld a,3\n");
+    chk("REPEAT", "REPEAT 3, k\n  ld a,{k}\nREND\n", "ld a,0\nld a,1\nld a,2\n");
+    chkErr("registre en index de boucle", "REPEAT 3, i\n  ld a,{i}\nREND\n");
     chk("REPEAT expr count", "LET n=2\nREPEAT n\n  nop\nREND\n", "nop\nnop\n");
 
     // Variables PP / compteurs de boucle écrits en clair (sans {}) : rasm les
     // expose comme des symboles ordinaires, fantams les substitue textuellement.
-    chk("compteur REPEAT en clair", "REPEAT 3, i\n  db i*2\nREND\n", "db 1*2\ndb 2*2\ndb 3*2\n");
+    chk("compteur REPEAT en clair", "REPEAT 3, k\n  db k*2\nREND\n", "db 0*2\ndb 1*2\ndb 2*2\n");
     chk("LET en clair", "LET v=7\n db v+1\n", "db 7+1\n");
     chk("substitution hors chaînes/caractères",
         "LET y=3\n db y, \"y\", 'y'\n", "db 3, \"y\", 'y'\n");
-    chk("registres jamais substitués", "LET b=3\n ld a,b\n", "ld a,b\n");
-    chk("registre 1er opérande", "LET a=3\n ld a,#10\n", "ld a,#10\n");
-    chk("registre indirect", "LET hl=3\n ld (hl),a\n", "ld (hl),a\n");
-    chk("condition de saut", "LET z=3\n jr z,#100\n", "jr z,#100\n");
-    chk("registre dans une sous-expression", "LET i=5\n ld a,(tbl+i)\n", "ld a,(tbl+5)\n");
-    chk("registre après directive", "LET i=5\n db i\n", "db 5\n");
+    chkErr("registre en nom de variable PP", "LET b=3\n ld a,b\n");
+    chkErr("registre en nom de variable PP (1er operande)", "LET a=3\n ld a,#10\n");
+    chkErr("paire de registres en nom de variable PP", "LET hl=3\n ld (hl),a\n");
+    chkErr("condition en nom de variable PP", "LET z=3\n jr z,#100\n");
+    chk("variable PP dans une sous-expression", "LET n=5\n ld a,(tbl+n)\n", "ld a,(tbl+5)\n");
+    chkErr("registre I en nom de variable PP", "LET i=5\n ld a,(tbl+i)\n");
+    chk("variable PP après directive", "LET n=5\n db n\n", "db 5\n");
     chk("label jamais substitué", "LET v=1\nv: nop\n", "v: nop\n");
     chk("pas de substitution dans un nombre hexa", "LET f=1\n db #ff\n", "db #ff\n");
 
     // IF / ELSE / ELSEIF (PP-strict)
-    chk("IF vrai", "LET D=1\nIF D\n  ld a,1\nELSE\n  ld a,2\nENDIF\n", "ld a,1\n");
-    chk("IF faux", "LET D=0\nIF D\n  ld a,1\nELSE\n  ld a,2\nENDIF\n", "ld a,2\n");
+    chk("IF vrai", "LET FLAG=1\nIF FLAG\n  ld a,1\nELSE\n  ld a,2\nENDIF\n", "ld a,1\n");
+    chk("IF faux", "LET FLAG=0\nIF FLAG\n  ld a,1\nELSE\n  ld a,2\nENDIF\n", "ld a,2\n");
     chk("ELSEIF", "LET X=2\nIF X==1\n a\nELSEIF X==2\n b\nELSE\n c\nENDIF\n", "b\n");
     chk("IFDEF", "LET FOO=0\nIFDEF FOO\n yes\nENDIF\nIFDEF BAR\n no\nENDIF\n", "yes\n");
-    chk("IF imbriqué", "LET A=1\nLET B=0\nIF A\nIF B\n x\nELSE\n y\nENDIF\nENDIF\n", "y\n");
+    chk("IF imbriqué", "LET ONE=1\nLET ZERO=0\nIF ONE\nIF ZERO\n x\nELSE\n y\nENDIF\nENDIF\n", "y\n");
+
+    // --- ADR 0017 : --normalize, canoniser sans dérouler --------------------
+    chkNorm("orthographes obsoletes", " defb 1,2\n", " db 1,2\n");
+    chkNorm("fermetures obsoletes", "macro m\n nop\nmend\n", "macro m\n nop\nendmacro\n");
+    chkNorm("casse epousee", " DEFW 3\n", " DW 3\n");
+    chkNorm("push multi-registres", " push hl,de\n", " push hl\n push de\n");
+    chkNorm("deux opcodes sur une ligne", " ld a,1: inc a\n", " ld a,1\n inc a\n");
+    chkNorm("label conserve, suite indentee", "s: ld a,1: inc a\n", "s: ld a,1\n    inc a\n");
+    chkNorm("commentaire suit la premiere", " push hl,de ; ctx\n", " push hl ; ctx\n push de\n");
+    chkNorm("ligne a substitution laissee telle quelle", " push {r}\n", " push {r}\n");
+    chkNorm("macros et boucles NON deroulees",
+            "macro m\n nop\nendmacro\n repeat 2\n nop\n endrepeat\n",
+            "macro m\n nop\nendmacro\n repeat 2\n nop\n endrepeat\n");
+    chkNormStable("idempotent sur du sucre", " push hl,de ; ctx\ns: ld a,1: inc a\n defb 1\n");
+    chkNormStable("idempotent sur du canonique", "start:\n    ld a,1\n    ret\n");
+
+    // Le mode strict n'ajoute rien, il refuse.
+    chkStrict("strict refuse le push multi-registres", " push hl,de\n", false);
+    chkStrict("strict refuse deux opcodes sur une ligne", " ld a,1: inc a\n", false);
+    chkStrict("strict refuse une orthographe obsolete", " defb 1\n", false);
+    chkStrict("strict accepte le canonique", " push hl\n push de\n db 1\n", true);
+    chkStrict("strict laisse passer macros et boucles",
+              "macro m\n nop\nendmacro\n repeat 2\n m\n endrepeat\n", true);
+    // Le sucre normalisé passe le mode strict : c'est la promesse de --normalize.
+    chkStrict("normalize rend une source strict-propre",
+              pp::normalize(" push hl,de\n ld a,1: inc a\n defb 1\n"), true);
+
+    // --- ADR 0016 : blocs, fermetures, boucles -----------------------------
+    // `end` ferme le bloc le plus interne, y compris imbriqué dans un autre.
+    chk("end ferme le plus interne",
+        "macro m\n repeat 2\n nop\n end\n end\n m\n", "nop\nnop\n");
+    chk("fermetures explicites",
+        " repeat 2\n nop\n endrepeat\n", "nop\nnop\n");
+    chk("formes courtes tolerees en silence",
+        "macro m\n nop\nmend\n m\n", "nop\n");
+    chkErr("fermeture croisee refusee",
+           "macro m\n repeat 2\n nop\n endm\n end\n m\n");
+    chkErr("bloc non ferme", " repeat 2\n nop\n");
+
+    // L'index de repeat commence à 0, et la forme à index est signalée.
+    chkWarn("index de repeat 0-based et signale",
+            " repeat 3,k\n db k\n rend\n", "db 0\ndb 1\ndb 2\n", true);
+    chkWarn("repeat sans index ne signale rien",
+            " repeat 2\n nop\n rend\n", "nop\nnop\n", false);
+
+    // FOR : `to` inclut la borne, `until` l'exclut.
+    chk("for until exclut la borne",
+        " for x = 0 until 4\n db x\n endfor\n", "db 0\ndb 1\ndb 2\ndb 3\n");
+    chk("for to inclut la borne",
+        " for x = 1 to 3\n db x\n end\n", "db 1\ndb 2\ndb 3\n");
+    chk("for a bornes symboliques",
+        "n equ 3\n for x = 0 until n\n db x*2\n end\n",
+        "n equ 3\ndb 0*2\ndb 1*2\ndb 2*2\n");
+    chk("for vide ne deroule rien",
+        " for x = 0 until 0\n nop\n end\n nop\n", "nop\n");
+    chkErr("for sans to ni until", " for x = 0, 4\n nop\n end\n");
+    chkErr("for sans affectation", " for x\n nop\n end\n");
+    chkErr("registre en index de for", " for b = 0 until 2\n nop\n end\n");
+
+    // ADR 0015 : les mots réservés sont réservés, dans les quatre positions.
+    // Ici les deux que seul le préprocesseur connaît.
+    chkErr("registre en paramètre de macro",
+           "macro m b\n ld a,b\nendm\n m 3\n");
+    chkErr("mnémonique en paramètre de macro",
+           "macro m call\n db call\nendm\n m 3\n");
+    chkErr("directive en paramètre de macro",
+           "macro m org\n db org\nendm\n m 3\n");
+    chkErr("mot-clé PP en paramètre de macro",
+           "macro m repeat\n db repeat\nendm\n m 3\n");
+    chk("paramètre libre", "macro m n\n db {n}\nendm\n m 3\n", "db 3\n");
 
     // MACRO simple + paramètre
     chk("MACRO param",
@@ -122,7 +243,7 @@ int main() {
 
     // WHILE piloté par variable PP
     chk("WHILE",
-        "LET i=0\nWHILE i<3\n  db {i}\n  LET i = i+1\nWEND\n",
+        "LET n=0\nWHILE n<3\n  db {n}\n  LET n = n+1\nWEND\n",
         "db 0\ndb 1\ndb 2\n");
 
     // INCLUDE

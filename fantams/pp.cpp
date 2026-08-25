@@ -194,6 +194,121 @@ std::vector<std::string> expandPushPop(const std::string &stmt) {
     return out;
 }
 
+// Position du mot-clé de plage (`to` ou `until`) dans l'en-tête d'un FOR, au
+// niveau supérieur et en JETON entier — un symbole nommé « stop » contient « to »,
+// et le chercher en sous-chaîne le couperait en deux. `inclusive` dit lequel a été
+// trouvé. Rend npos si aucun des deux n'y est.
+inline size_t findRangeKeyword(const std::string &s, bool &inclusive) {
+    int depth = 0; bool inStr = false; char q = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        const char c = s[i];
+        if (inStr) { if (c == q) inStr = false; continue; }
+        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
+        if (c == '(' || c == '[') { ++depth; continue; }
+        if (c == ')' || c == ']') { if (depth > 0) --depth; continue; }
+        if (depth || !std::isalpha((unsigned char)c)) continue;
+        if (i && isIdentChar(s[i - 1])) continue;             // milieu d'identifiant
+        size_t j = i; while (j < s.size() && isIdentChar(s[j])) ++j;
+        const std::string tok = upper(s.substr(i, j - i));
+        if (tok == "TO")    { inclusive = true;  return i; }
+        if (tok == "UNTIL") { inclusive = false; return i; }
+        i = j - 1;
+    }
+    return std::string::npos;
+}
+
+// --- Canonisation (ADR 0017) -------------------------------------------------
+// Une règle de canonisation ne produit QUE du Z80 canonique : jamais de directive
+// de préprocesseur, jamais de substitution, jamais de sucre. C'est cette contrainte
+// qui garantit qu'une seule passe suffit, et qui met `-E`, `--normalize` et
+// l'assembleur d'accord par construction plutôt que par chance.
+//
+// Deux familles, et elles ne vivent pas au même endroit :
+//   - un-vers-plusieurs (`push hl,de`, plusieurs opcodes sur une ligne) : ici,
+//     parce que la source déroulée doit montrer une instruction par ligne ;
+//   - un-pour-un (les orthographes ci-dessous) : ici aussi, mais l'assembleur les
+//     tolère de son côté — la politique des alias reste différée.
+const std::map<std::string, std::string> &canonicalSpelling() {
+    static const std::map<std::string, std::string> t = {
+        {"DEFB", "db"}, {"DM", "db"}, {"DEFM", "db"},
+        {"DEFW", "dw"},
+        {"DEFS", "ds"}, {"RMB", "ds"},
+        {"ENDM", "endmacro"}, {"MEND", "endmacro"},
+        {"REND", "endrepeat"},
+        {"WEND", "endwhile"},
+        {"ENDS", "endstruct"},
+    };
+    return t;
+}
+
+// La casse du mot d'origine est épousée : un source tout en majuscules qui reçoit
+// un `endwhile` minuscule au milieu de ses `ORG` a l'air abîmé, et son auteur
+// désactivera l'option pour cette seule raison.
+inline std::string matchCase(const std::string &orig, const std::string &canonLower) {
+    bool allUpper = true;
+    for (char c : orig) if (std::isalpha((unsigned char)c) && std::islower((unsigned char)c)) allUpper = false;
+    return allUpper ? upper(canonLower) : canonLower;
+}
+
+// Réécrit le mot de tête d'une instruction (label éventuel conservé) dans son
+// orthographe canonique. Rend `stmt` inchangé si elle l'est déjà.
+std::string canonicalizeSpelling(const std::string &stmt) {
+    std::string label, rest; peelLabel(stmt, label, rest);
+    if (rest.empty()) return stmt;
+    const std::string tok = firstToken(rest);
+    auto it = canonicalSpelling().find(upper(tok));
+    if (it == canonicalSpelling().end()) return stmt;
+    const std::string tail = restAfterFirst(rest);
+    const std::string head = label.empty() ? std::string() : label + ": ";
+    return head + matchCase(tok, it->second) + (tail.empty() ? "" : " " + tail);
+}
+
+// --- Blocs (ADR 0016) --------------------------------------------------------
+// Un bloc a un OUVREUR, une fermeture CANONIQUE et d'éventuelles fermetures
+// TOLÉRÉES, héritées de rasm et conservées en silence : elles sont omniprésentes
+// et, la correspondance étant désormais vérifiée, elles ne sont plus ambiguës.
+// `END` ferme le bloc ouvert le plus interne, quel qu'il soit.
+//
+// MODULE n'y figure pas : il bascule le module actif, il n'ouvre pas un bloc.
+struct BlockKind {
+    const char *kind;                  // nom du bloc dans les diagnostics
+    std::vector<const char *> openers; // mots qui l'ouvrent
+    std::vector<const char *> closers; // canonique en tête, puis les tolérées
+};
+
+const std::vector<BlockKind> &blockKinds() {
+    static const std::vector<BlockKind> t = {
+        {"IF",      {"IF", "IFDEF", "IFNDEF"}, {"ENDIF"}},
+        {"REPEAT",  {"REPEAT"},                {"ENDREPEAT", "REND"}},
+        {"WHILE",   {"WHILE"},                 {"ENDWHILE", "WEND"}},
+        {"FOR",     {"FOR"},                   {"ENDFOR"}},
+        {"MACRO",   {"MACRO"},                 {"ENDMACRO", "ENDM", "MEND"}},
+        {"STRUCT",  {"STRUCT"},                {"ENDSTRUCT", "ENDS"}},
+    };
+    return t;
+}
+
+// Le bloc qu'ouvre ce mot-clé, ou "".
+std::string blockOfOpener(const std::string &kw) {
+    for (const auto &b : blockKinds())
+        for (const char *o : b.openers) if (kw == o) return b.kind;
+    return "";
+}
+
+// Le bloc que ferme ce mot-clé, "*" pour `END` qui ferme n'importe lequel, ou "".
+std::string blockOfCloser(const std::string &kw) {
+    if (kw == "END") return "*";
+    for (const auto &b : blockKinds())
+        for (const char *c : b.closers) if (kw == c) return b.kind;
+    return "";
+}
+
+// La fermeture canonique d'un bloc, pour les diagnostics.
+std::string canonicalCloser(const std::string &kind) {
+    for (const auto &b : blockKinds()) if (kind == b.kind) return b.closers.front();
+    return "END";
+}
+
 struct Macro {
     std::string name;
     std::vector<std::string> params;
@@ -252,7 +367,7 @@ int countTokens(const std::string &s) {
 // ---------------------------------------------------------------------------
 class PP {
 public:
-    explicit PP(const FileProvider &fp) : files(fp) {}
+    PP(const FileProvider &fp, bool strict) : files(fp), strict_(strict) {}
     Result result;
 
     void runFile(const std::string &content, const std::string &file) {
@@ -261,6 +376,15 @@ public:
 
 private:
     FileProvider files;
+    bool strict_ = false;
+    // Un refus du mode strict porte sur une LIGNE SOURCE : dans un corps de macro
+    // appelé dix fois, la ligne fautive est la même dix fois. Une ligne ne parle
+    // qu'une fois, comme pour les avertissements.
+    std::set<std::string> strictOnce;
+    void strictErr(const SrcLine &sl, const std::string &msg) {
+        if (!strictOnce.insert(sl.file + "\x01" + std::to_string(sl.line) + "\x01" + msg).second) return;
+        error(sl, msg);
+    }
     std::map<std::string, double> ppvars;       // variables PP globales (LET)
     // ADR 0003 : constantes EQU et variables '=' lues par le préprocesseur quand
     // leur expression y est résoluble. `asmDeferred` retient celles qui sont bien
@@ -408,16 +532,16 @@ private:
 
     // Registres, paires et conditions Z80 : dans une VRAIE instruction, un opérande
     // qui vaut exactement l'un de ces noms est un registre, pas un symbole — on ne le
-    // substitue donc jamais (sinon "ld a,b" serait détruit dès qu'une variable PP
-    // s'appelle 'b', et 'i'/'c' sont des compteurs de boucle très courants). Dans une
-    // sous-expression ("ld a,(tbl+i)") ou après une directive ("db i"), c'est un symbole.
-    static bool isRegOrCond(const std::string &up) {
-        static const std::set<std::string> names = {
-            "A","B","C","D","E","H","L","I","R","AF","BC","DE","HL","SP","PC",
-            "IX","IY","IXL","IXH","IYL","IYH","LX","LY","HX","HY",
-            "NZ","Z","NC","PO","PE","P","M"};
-        return names.count(up) != 0;
-    }
+    // substitue donc jamais (sinon "ld a,b" serait détruit dès qu'un compteur de boucle
+    // s'appelle 'b'). Dans une sous-expression ("ld a,(tbl+i)") ou après une directive
+    // ("db i"), c'est un symbole. La liste vit dans keywords.h (ADR 0015).
+    //
+    // GARDE-FOU INATTEIGNABLE, conservé délibérément. `substituteVars` ne consulte que
+    // `env.locals` (index de REPEAT) et `ppvars` (LET), et l'ADR 0015 refuse désormais
+    // un nom de registre dans ces deux positions : aucun utilisateur ne peut plus
+    // fabriquer une entrée nommée 'b'. Aucun test ne peut donc atteindre ce test — il
+    // reste là pour qu'une construction future qui alimenterait ces tables sans passer
+    // par la validation ne détruise pas silencieusement « ld a,b ».
 
     // Index du 1er caractère des opérandes dans une ligne déjà trim : saute le label
     // éventuel puis le mnémonique/directive (ni l'un ni l'autre n'est substituable).
@@ -481,7 +605,7 @@ private:
                 else { auto p = ppvars.find(name); if (p != ppvars.end()) { val = p->second; has = true; } }
                 // opérande entier d'une instruction = registre/condition, jamais un symbole
                 bool whole = false;
-                if (instr && isRegOrCond(upper(name))) {
+                if (instr && kw::isMachineWord(upper(name))) {
                     size_t k = j; while (k < text.size() && std::isspace((unsigned char)text[k])) ++k;
                     char next = k < text.size() ? text[k] : 0;
                     whole = (prevSig == 0 || prevSig == ',' || prevSig == '(') &&
@@ -555,14 +679,36 @@ private:
         // la largeur dépend du lecteur (ADR 0013).
         bool first = true;
         std::vector<std::string> glued;
-        for (const auto &stmt : splitStatements(t, &glued))
-            for (const auto &line : expandPushPop(stmt)) {
+        const std::vector<std::string> stmts = splitStatements(t, &glued);
+        if (strict_ && stmts.size() > 1)
+            strictErr(src, "strict: several instructions on one line is a writing facility, "
+                           "not canonical Z80 — write one instruction per line");
+        for (const auto &stmt : stmts) {
+            const std::string canon = canonicalizeSpelling(stmt);
+            if (strict_ && canon != stmt) {
+                // Le mot fautif est la directive, pas le label éventuel qui la précède.
+                std::string l0, r0, l1, r1;
+                peelLabel(stmt, l0, r0);
+                peelLabel(canon, l1, r1);
+                strictErr(src, "strict: '" + firstToken(r0) + "' is a non-canonical spelling — write '" +
+                               firstToken(r1) + "'");
+            }
+            const std::vector<std::string> expanded = expandPushPop(canon);
+            if (strict_ && expanded.size() > 1)
+                strictErr(src, "strict: a multi-register '" + firstToken(canon) +
+                               "' is a writing facility, not canonical Z80 — write one per line");
+            for (const auto &line : expanded) {
                 result.lines.push_back({first ? line : "    " + line, src.file, src.line, first && src.col0});
                 first = false;
             }
+        }
+        // ADR 0015 : un mot réservé ne nomme pas un label. Ici le ':' n'a donc pas
+        // pu être celui d'un label — il sépare deux instructions, ce qui est licite
+        // (« ei: ret ») mais se lit mal. Le dire, plutôt que parler de style seul.
         for (const auto &ident : glued)
-            warning(src, "'" + ident + ":' with no space is non-canonical style (ambiguous with a label) — "
-                         "prefer '" + ident + " : ...' or put '" + ident + "' on its own line");
+            warning(src, "'" + ident + ":' is read as two statements, not as a label — '" + ident +
+                         "' is a reserved word and cannot name a label; write '" + ident +
+                         " : ...' if that is what you meant");
     }
 
     // Collecte les labels définis (par "ident:") dans un corps, hors @@export.
@@ -619,18 +765,33 @@ private:
         return renameScope(body, names, [&](const std::string &n) { return n + suf; });
     }
 
-    // Trouve la ligne de fermeture correspondante (imbrication même type).
-    int findMatching(const std::vector<SrcLine> &lines, int start,
-                     const std::vector<std::string> &open, const std::vector<std::string> &close) {
-        auto in = [](const std::vector<std::string> &v, const std::string &k) {
-            for (auto &x : v) { if (x == k) return true; }
-            return false;
-        };
-        int depth = 1;
+    // Trouve la ligne de fermeture correspondante (ADR 0016).
+    //
+    // La profondeur est comptée sur l'UNION des ouvreurs, pas sur une seule paire :
+    // c'est la condition pour que `end` puisse fermer le bloc le plus interne sans
+    // qu'un `end` imbriqué soit pris pour celui du bloc englobant. Et puisque la pile
+    // dit désormais quel bloc est ouvert, une fermeture nommée qui ne correspond pas
+    // est une ERREUR qui le dit — là où l'ancienne version rendait -1 et laissait
+    // l'appelant annoncer « REPEAT without REND », diagnostic trompeur.
+    //
+    // MODULE est délibérément absent de la table : « MODULE x » bascule le module
+    // actif au lieu d'ouvrir un bloc, si bien que deux MODULE pour un ENDMODULE est
+    // la forme normale — le compter déséquilibrerait la pile.
+    int findMatching(const std::vector<SrcLine> &lines, int start, const std::string &block) {
+        std::vector<std::string> stack{block};
         for (int i = start + 1; i < (int)lines.size(); ++i) {
-            std::string kw = classify(lines[i].text);
-            if (in(open, kw)) ++depth;
-            else if (in(close, kw)) { if (--depth == 0) return i; }
+            const std::string kw = classify(lines[i].text);
+            const std::string op = blockOfOpener(kw);
+            if (!op.empty()) { stack.push_back(op); continue; }
+            const std::string cl = blockOfCloser(kw);
+            if (cl.empty()) continue;
+            if (cl != "*" && cl != stack.back()) {
+                error(lines[i], "'" + kw + "' closes a " + cl + " block, but the open block here is a " +
+                                stack.back() + " — write '" + canonicalCloser(stack.back()) + "' or 'end'");
+                return -2;   // déjà diagnostiqué : l'appelant n'ajoute rien
+            }
+            stack.pop_back();
+            if (stack.empty()) return i;
         }
         return -1;
     }
@@ -766,7 +927,12 @@ private:
                 if (!label.empty()) emit(label + ":", raw);
                 auto parts = splitTopLevel(restAfterFirst(rest), ',');
                 std::string path = parts.empty() ? "" : parts[0];
-                if (path.size() >= 2 && (path[0] == '"' || path[0] == '\'')) path = path.substr(1, path.size() - 2);
+                // Lecteur partagé (ADR 0010) : un chemin entre quotes suit la même
+                // règle qu'une chaîne de « db » — sans quoi « include 'a"b.asm' »
+                // se lirait ici autrement qu'ailleurs.
+                const kw::Literal lit = kw::readLiteral(path, 0);
+                if (lit.present && lit.error.empty() && trim(path.substr(lit.end)).empty())
+                    path = lit.bytes;
                 std::string content;
                 if (!files || !files(path, content)) error(raw, "include not found: '" + path + "'");
                 else run(splitLines(content, path), env, depth + 1);
@@ -781,7 +947,10 @@ private:
                 if (eq != std::string::npos) { name = trim(a.substr(0, eq)); ev = trim(a.substr(eq + 1)); }
                 else { name = firstToken(a); ev = restAfterFirst(a); }
                 auto r = evalPP(ev, env);
+                std::string badLet = isIdentifier(name) ? kw::reservedName(name, "a symbol")
+                                                         : std::string();
                 if (!isIdentifier(name)) error(raw, "LET: invalid variable name");
+                else if (!badLet.empty()) error(raw, badLet);
                 else if (!r.ok) error(raw, r.error);
                 else ppvars[name] = r.real;
                 ++i; continue;
@@ -789,15 +958,17 @@ private:
 
             // --- IF / IFDEF / IFNDEF ---
             if (kw == "IF" || kw == "IFDEF" || kw == "IFNDEF") {
-                int endif = findMatching(lines, i, {"IF", "IFDEF", "IFNDEF"}, {"ENDIF"});
-                if (endif < 0) { error(raw, "IF without ENDIF"); return; }
+                int endif = findMatching(lines, i, "IF");
+                if (endif < 0) { if (endif == -1) error(raw, "IF without ENDIF or end"); return; }
                 // bornes des branches (profondeur 0)
+                // Profondeur comptée sur l'UNION des ouvreurs (ADR 0016) : un bloc
+                // imbriqué fermé par `end` ferait sinon perdre le ELSE de niveau 1.
                 std::vector<int> bounds = {i};
                 int d = 1;
                 for (int j = i + 1; j < endif; ++j) {
                     std::string k = classify(lines[j].text);
-                    if (k == "IF" || k == "IFDEF" || k == "IFNDEF") ++d;
-                    else if (k == "ENDIF") --d;
+                    if (!blockOfOpener(k).empty()) ++d;
+                    else if (!blockOfCloser(k).empty()) --d;
                     else if (d == 1 && (k == "ELSE" || k == "ELSEIF")) bounds.push_back(j);
                 }
                 bounds.push_back(endif);
@@ -823,27 +994,81 @@ private:
 
             // --- REPEAT count[,var] ... REND ---
             if (kw == "REPEAT") {
-                int rend = findMatching(lines, i, {"REPEAT"}, {"REND"});
-                if (rend < 0) { error(raw, "REPEAT without REND"); return; }
+                int rend = findMatching(lines, i, "REPEAT");
+                if (rend < 0) { if (rend == -1) error(raw, "REPEAT without ENDREPEAT or end"); return; }
                 if (!label.empty()) emit(label + ":", raw);
                 auto parts = splitTopLevel(restAfterFirst(rest), ',');
                 auto r = parts.empty() ? expr::Result{} : evalPP(parts[0], env);
                 std::string var = parts.size() > 1 ? trim(parts[1]) : "";
+                if (!var.empty()) {
+                    std::string bad = kw::reservedName(var, "a loop index");
+                    if (!bad.empty()) { error(raw, bad); var.clear(); }
+                }
+                // ADR 0016 : l'index vaut 0 au premier tour, contre 1 chez rasm. C'est
+                // la seule divergence du projet qu'aucune détection ne peut trouver — une
+                // table décalée d'un cran s'assemble parfaitement. Elle est donc rendue
+                // bruyante autrement : TOUT usage de la forme à index est signalé, sans
+                // faux positif possible puisque c'est la construction qu'on déprécie.
+                if (!var.empty())
+                    warning(raw, "the index of 'repeat' starts at 0 here, not at 1 as in rasm: "
+                                 "a source written for rasm must read '" + var + "+1' — prefer "
+                                 "'for " + var + " = 0 until <count>', where the bounds are written");
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + rend);
                 if (!r.ok) error(raw, "REPEAT: " + (parts.empty() ? "missing counter" : r.error));
                 else if (r.value < 0 || r.value > 1000000) error(raw, "REPEAT: counter out of range");
-                // Compteur 1-based (comme rasm) : "index" vaut 1 à la 1re itération, pas 0.
-                else for (int k = 1; k <= r.value; ++k) {
+                else for (int k = 0; k < r.value; ++k) {
                     Env ne = env; if (!var.empty()) ne.locals[var] = k;
                     run(renameLocals(body, ++uid), ne, depth);
                 }
                 i = rend + 1; continue;
             }
 
+            // --- FOR var = lo TO hi | UNTIL hi ... ENDFOR (ADR 0016) ---
+            // `to` inclut la borne haute, `until` l'exclut : aucune borne ne se devine,
+            // et « until n » fait exactement n tours, ce qui en fait le remplacement
+            // direct de « repeat n,var ».
+            if (kw == "FOR") {
+                int endfor = findMatching(lines, i, "FOR");
+                if (endfor < 0) { if (endfor == -1) error(raw, "FOR without ENDFOR or end"); return; }
+                if (!label.empty()) emit(label + ":", raw);
+                std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + endfor);
+                std::string head = restAfterFirst(rest);
+                size_t eq = findAssign(head);
+                if (eq == std::string::npos) {
+                    error(raw, "FOR: expected 'for <var> = <low> to <high>' (or 'until <high>')");
+                    i = endfor + 1; continue;
+                }
+                std::string var = trim(head.substr(0, eq));
+                std::string range = trim(head.substr(eq + 1));
+                bool inclusive = true;
+                size_t kwPos = findRangeKeyword(range, inclusive);
+                if (kwPos == std::string::npos) {
+                    error(raw, "FOR: missing 'to' or 'until' — write 'for " + var +
+                               " = 0 until <count>' (high bound excluded) or 'to <last>' (included)");
+                    i = endfor + 1; continue;
+                }
+                std::string badVar = !isIdentifier(var) ? "FOR: invalid loop index name"
+                                                        : kw::reservedName(var, "a loop index");
+                auto lo = evalPP(trim(range.substr(0, kwPos)), env);
+                auto hi = evalPP(trim(range.substr(kwPos + (inclusive ? 2 : 5))), env);
+                if (!badVar.empty()) error(raw, badVar);
+                else if (!lo.ok) error(raw, "FOR: " + lo.error);
+                else if (!hi.ok) error(raw, "FOR: " + hi.error);
+                else if (hi.value - lo.value > 1000000) error(raw, "FOR: range out of range");
+                else {
+                    const long last = inclusive ? hi.value : hi.value - 1;
+                    for (long k = lo.value; k <= last; ++k) {
+                        Env ne = env; ne.locals[var] = k;
+                        run(renameLocals(body, ++uid), ne, depth);
+                    }
+                }
+                i = endfor + 1; continue;
+            }
+
             // --- WHILE expr ... WEND ---
             if (kw == "WHILE") {
-                int wend = findMatching(lines, i, {"WHILE"}, {"WEND"});
-                if (wend < 0) { error(raw, "WHILE without WEND"); return; }
+                int wend = findMatching(lines, i, "WHILE");
+                if (wend < 0) { if (wend == -1) error(raw, "WHILE without ENDWHILE or end"); return; }
                 if (!label.empty()) emit(label + ":", raw);
                 std::string condRaw = restAfterFirst(rest);
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + wend);
@@ -860,8 +1085,8 @@ private:
 
             // --- définition de macro : "MACRO name p.." ou "name MACRO p.." ---
             if (kw == "MACRO" || secondUp == "MACRO") {
-                int endm = findMatching(lines, i, {"MACRO"}, {"ENDM", "MEND"});
-                if (endm < 0) { error(raw, "MACRO without ENDM"); return; }
+                int endm = findMatching(lines, i, "MACRO");
+                if (endm < 0) { if (endm == -1) error(raw, "MACRO without ENDMACRO or end"); return; }
                 Macro m;
                 std::string decl;
                 // "macro foo:" — le ':' de fin fait partie du style courant, il
@@ -869,7 +1094,14 @@ private:
                 // sous "foo:" et l'appel nu ne la trouve jamais.
                 if (kw == "MACRO") { m.name = firstToken(restAfterFirst(rest)); decl = restAfterFirst(restAfterFirst(rest)); }
                 else { m.name = firstToken(rest); decl = restAfterFirst(restAfterFirst(rest)); }
-                for (auto &p : splitTopLevel(decl, ',')) if (!p.empty()) m.params.push_back(p);
+                for (auto &p : splitTopLevel(decl, ',')) {
+                    if (p.empty()) continue;
+                    // Le paramètre refusé est CONSERVÉ : l'écarter changerait l'arité,
+                    // et chaque appel produirait une seconde erreur qui ne parle de rien.
+                    std::string bad = kw::reservedName(p, "a macro parameter");
+                    if (!bad.empty()) error(raw, bad);
+                    m.params.push_back(p);
+                }
                 for (int j = i + 1; j < endm; ++j) m.body.push_back(lines[j]);
                 if (!m.name.empty() && m.name.back() == ':') m.name.pop_back();
                 if (m.name.empty()) error(raw, "MACRO without a name");
@@ -909,8 +1141,8 @@ private:
             // --- STRUCT : déclaration (1 arg) ou instanciation (2+ args) ---
             if (kw == "STRUCT") {
                 if (countTokens(restAfterFirst(rest)) == 1) {
-                    int ends = findMatching(lines, i, {"STRUCT"}, {"ENDSTRUCT", "ENDS"});
-                    if (ends < 0) { error(raw, "STRUCT without ENDSTRUCT"); return; }
+                    int ends = findMatching(lines, i, "STRUCT");
+                    if (ends < 0) { if (ends == -1) error(raw, "STRUCT without ENDSTRUCT or end"); return; }
                     std::string sname = firstToken(restAfterFirst(rest));
                     std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + ends);
                     defineStruct(sname, body, env, raw);
@@ -966,9 +1198,55 @@ std::string Result::dump() const {
     return s;
 }
 
+std::string normalize(const std::string &src) {
+    std::string out;
+    out.reserve(src.size() + src.size() / 16);
+    size_t i = 0;
+    for (;;) {
+        const size_t nl = src.find('\n', i);
+        const size_t end = (nl == std::string::npos) ? src.size() : nl;
+        const std::string ln = src.substr(i, end - i);
+
+        const size_t cp = kw::commentPos(ln);
+        const std::string code = (cp == std::string::npos) ? ln : ln.substr(0, cp);
+        const std::string comment = (cp == std::string::npos) ? std::string() : ln.substr(cp);
+        const size_t ind = code.find_first_not_of(" \t");
+
+        // Ni code, ni forme jugeable : rendu à l'octet près.
+        if (ind == std::string::npos || code.find('{') != std::string::npos) out += ln;
+        else {
+            const std::string indent = code.substr(0, ind);
+            const std::string body = trim(code);
+            std::vector<std::string> canon;
+            for (const auto &stmt : splitStatements(body))
+                for (const auto &l : expandPushPop(canonicalizeSpelling(stmt)))
+                    canon.push_back(l);
+            if (canon.size() == 1 && canon[0] == body) out += ln;   // déjà canonique
+            else {
+                // Les lignes suivantes reprennent l'indentation de l'originale — sauf
+                // quand celle-ci est nulle parce que la ligne portait un label : une
+                // instruction en colonne 1 déclencherait l'avertissement de l'assembleur.
+                const std::string cont = indent.empty() ? "    " : indent;
+                for (size_t k = 0; k < canon.size(); ++k) {
+                    if (k) out += "\n";
+                    out += (k ? cont : indent) + canon[k];
+                    // Le commentaire de la ligne d'origine suit la PREMIÈRE
+                    // instruction : c'est là qu'il était, et le dupliquer serait
+                    // inventer une intention.
+                    if (k == 0 && !comment.empty()) out += " " + comment;
+                }
+            }
+        }
+        if (nl == std::string::npos) break;
+        out += '\n';
+        i = nl + 1;
+    }
+    return out;
+}
+
 Result preprocess(const std::string &mainContent, const std::string &mainFile,
-                  const FileProvider &files) {
-    PP pp(files);
+                  const FileProvider &files, bool strict) {
+    PP pp(files, strict);
     pp.runFile(mainContent, mainFile);
     return pp.result;
 }

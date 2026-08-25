@@ -78,6 +78,21 @@ int main() {
     // (360*1)/256 = 1.40625° -> sin -> *1000 -> round -> 25 (vérifié vs rasm)
     chk("division flottante avant sin", "sin((360*1)/256)*1000", 25);
 
+    // --- Litteraux de chaine (ADR 0010) ---
+    // Une expression rend un NOMBRE : seul un litteral d'un octet en a un, et
+    // les deux delimiteurs sont synonymes.
+    chk("litteral simple quote", "'A'", 65);
+    chk("litteral double quote", "\"A\"", 65);
+    chk("litteral dans une arithmetique", "'a'+1", 98);
+    chk("les deux delimiteurs se melangent", "'z'-\"a\"", 25);
+    chk("le delimiteur oppose est du contenu", "'\"'", 34);
+    chk("l'autre sens", "\"'\"", 39);
+    chkErr("deux octets n'ont pas de valeur", "'ab'");
+    chkErr("deux octets, delimiteur double", "\"ab\"");
+    chkErr("litteral vide n'a pas de valeur", "''");
+    chkErr("litteral vide, delimiteur double", "\"\"");
+    chkErr("litteral non termine", "'ab");
+
     printf("\n%d réussis, %d échoués\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

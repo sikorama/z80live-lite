@@ -30,7 +30,7 @@ std::string firstToken(const std::string &s) {
 // ligne — espacement interne, position du commentaire, espaces de fin, '\r'
 // éventuel — est recopié tel quel. C'est ce qui garantit l'invariant d'octets :
 // aucune réécriture d'opérande ne peut se glisser là.
-std::string line(const std::string &ln, kw::Phase ph) {
+std::string line(const std::string &ln, kw::Phase ph, bool detachLabels) {
     const size_t cp = kw::commentPos(ln);
     const std::string code = (cp == std::string::npos) ? ln : ln.substr(0, cp);
 
@@ -44,11 +44,20 @@ std::string line(const std::string &ln, kw::Phase ph) {
 
     if (!label.empty()) {
         // Règle 1 — et son garde-fou : SEUL sur sa ligne. Un label suivi de
-        // quelque chose est soit déjà `label: instruction` (rien à faire), soit
-        // un appel de macro qu'on n'a pas le droit de deviner.
+        // quelque chose est soit déjà `label: instruction` (règle 3), soit un
+        // appel de macro qu'on n'a pas le droit de deviner.
         if (!sawColon && rest.empty()) {
             const size_t at = ind + label.size();
             return ln.substr(0, at) + ":" + ln.substr(at);
+        }
+        // Règle 3 — détachement. Exige le DEUX-POINTS : sans lui, `sprite 4,12`
+        // serait coupé en deux alors que c'est peut-être un appel de macro, et
+        // rien dans le texte ne les distingue.
+        if (detachLabels && sawColon && !rest.empty()) {
+            const size_t cp2 = kw::commentPos(ln);
+            const std::string tail = (cp2 == std::string::npos) ? std::string() : ln.substr(cp2);
+            // Le commentaire suit le CODE, pas le label : c'est lui qu'il commente.
+            return label + ":\n" + INDENT + rest + (tail.empty() ? "" : " " + tail);
         }
         return ln;
     }
@@ -67,14 +76,14 @@ std::string line(const std::string &ln, kw::Phase ph) {
 
 } // namespace
 
-std::string apply(const std::string &src, kw::Phase ph) {
+std::string apply(const std::string &src, kw::Phase ph, bool detachLabels) {
     std::string out;
     out.reserve(src.size() + src.size() / 16);
     size_t i = 0;
     for (;;) {
         const size_t nl = src.find('\n', i);
         const size_t end = (nl == std::string::npos) ? src.size() : nl;
-        out += line(src.substr(i, end - i), ph);
+        out += line(src.substr(i, end - i), ph, detachLabels);
         if (nl == std::string::npos) break;
         out += '\n';
         i = nl + 1;
