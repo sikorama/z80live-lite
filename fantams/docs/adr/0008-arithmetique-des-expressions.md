@@ -32,10 +32,19 @@ Il est utilisé si souvent précisément parce que la division entière n'exista
 pas : qui veut `y/8` sur une adresse doit écrire `floor(y / 8)` pour obtenir une
 troncature au lieu d'un arrondi.
 
-**Le confort d'écriture** — ternaire `? :`, `min`, `max`, puissance. Rien dans le
-corpus ne les réclame ; ils sont retenus au titre du pouvoir d'expression, non
-d'un besoin constaté. `min` et `max` héritent de la règle ci-dessous sur le
-mélange des types.
+**Le confort d'écriture** — `min`, `max`, puissance `**`. Rien dans le corpus ne
+les réclame ; ils sont retenus au titre du pouvoir d'expression, non d'un besoin
+constaté. `min` et `max` héritent de la règle ci-dessous sur le mélange des types.
+
+La puissance s'écrit `**` : `^` est déjà le ou exclusif. Elle est plus liante que
+les unaires — `-2**2` vaut -4 — et associative à droite : `2**3**2` vaut `2**9`.
+
+**Le ternaire `? :` est retiré de cette décision.** Il y figurait, n'a jamais été
+implémenté, et il ne le sera pas. Deux raisons, dont la seconde suffit seule :
+`:` est déjà le séparateur d'instructions du préprocesseur autant que le suffixe
+d'un label, si bien que `1 ? 2 : 3` est coupé en deux avant même d'atteindre
+l'évaluateur ; et un `if` dit la même chose plus clairement, dans un langage où
+les blocs conditionnels existent déjà au temps préprocesseur.
 
 ## Ce qui ne change pas
 
