@@ -23,6 +23,10 @@ label:  instruction operands   ; comment
 - The **colon also separates instructions**: `ld a,1:inc a` contains
   two. This is a writing convenience, canonicalized to two lines by the
   preprocessor, and refused by `--strict`.
+- A reserved word before that colon is **never** a label: `nop:nop:nop`
+  assembles to three `nop`, because a mnemonic cannot name a label (ADR 0015).
+  It is flagged all the same — `nop:` *reads* like a label — so write
+  `nop : nop : nop` to say plainly what is meant.
 - A `label:` attached to its instruction is detached by `--beautify`
   (`--no-detach-labels` disables it).
 
@@ -86,7 +90,7 @@ are interchangeable, and `'A'` is in no way different from `"A"` (ADR 0010).
 
 | Function | Arguments | Note |
 |---|---|---|
-| `sin` `cos` | 1 | angles in **degrees** |
+| `sin` `cos` | 1 | angles in **radians** (diverges from rasm, ADR 0021) |
 | `abs` | 1 | |
 | `hi` `lo` | 1 | high / low byte of the integer value |
 | `floor` `ceil` `int` `round` | 1 | toward −∞ / +∞ / zero / nearest |
@@ -95,6 +99,9 @@ are interchangeable, and `'A'` is in no way different from `"A"` (ADR 0010).
 
 Rounding departs from zero on halves, a deliberate divergence from rasm
 (ADR 0009).
+
+`sin` and `cos` take **radians**, another deliberate divergence: rasm takes
+degrees (ADR 0021). Write `sin(a*3.14159265/180)` for a degree argument.
 
 ### What doesn't exist
 
@@ -127,6 +134,11 @@ plot:
 ```
 
 A **definition** interleaved (`delta equ 4`) does not change the owner.
+
+A label coming out of a **macro expansion** is a global label like any other, so it
+becomes the owner of the `.locals` that follow it: after `poke(…)` whose body
+defines `@retry`, a `.local` is qualified as `@retry__2.local`. The symbol table
+(`--sym`) is where this becomes visible.
 
 ### Reserved words
 
@@ -285,13 +297,31 @@ Braces are never a format prefix (ADR 0011).
 
 ### Scope
 
-Any label defined in a macro body is made **unique to each expansion**.
-`@@export name` exempts it:
+A label prefixed with **`@`** is made **unique to each expansion** — the rasm
+convention. A label without the prefix is **not renamed**: reused across two
+expansions, it stays a real collision, and the assembler says so
+(`duplicate symbol`).
+
+```
+macro poke addr,val
+    ld a,val
+@retry:                 ; -> @retry__1, @retry__2, … one per expansion
+    ld (addr),a
+    jr nz,@retry
+endmacro
+```
+
+The rule is the same for the iterations of `repeat` and `while`. `module`, on the
+other hand, renames **every** label of its body by prefixing it (`M.plain`).
+
+`@@export name` takes a label out of the renaming, so that every expansion shares
+one name. It therefore only concerns `@`-prefixed labels — on a plain label it has
+nothing to exempt:
 
 ```
 macro m
-@@export glob
-glob:   nop
+@@export @glob
+@glob:  nop            ; -> @glob in every expansion, hence a shared name
 endmacro
 ```
 
@@ -328,30 +358,81 @@ A block can open and close on one line: `repeat 3 : dw a,b : rend`.
 
 ## 11. Extended notations
 
-| Notation | Equals | Where |
-|---|---|---|
-| `push hl,de` · `pop af,bc` | one `push`/`pop` per register | preprocessor |
-| `ld a,1:inc a` | two lines | preprocessor |
-| `ld pc,hl` · `ld pc,ix` · `ld pc,iy` | `jp (hl)` etc. | assembler |
+### One-to-many — canonicalized by the preprocessor
 
-The first two are **one-to-many**: they live in the preprocessor
-so the unrolled source shows one instruction per line. The third is
-**one-for-one** — an orthography — so the assembler tolerates it directly
-(ADR 0017).
+The unrolled source shows one instruction per line, so these are expanded
+before the assembler sees them (ADR 0017).
+
+| Notation | Equals |
+|---|---|
+| `push hl,de` · `pop af,bc` | one `push`/`pop` per register |
+| `ld a,1:inc a` | two lines |
+| `ld de,hl` | `ld d,h` · `ld e,l` |
+| `ld hl,(ix+2)` | `ld h,(ix+3)` · `ld l,(ix+2)` |
+| `ld (iy-1),de` | `ld (iy+0),d` · `ld (iy-1),e` |
+
+`ld rr,rr'` works across **BC, DE, HL, IX, IY** in both directions, the index
+halves being the undocumented `hx`/`lx`/`hy`/`ly`. `ld hl,ix` and `ld ix,iy`
+do **not** exist — the DD prefix makes `h` the half of IX, so no instruction
+names H and IXH at once. Neither does `ld hl,sp`.
+
+`ld rr,(ix+d)` and `ld (ix+d),rr` cover **BC, DE, HL**. The low byte sits at the
+low address, so the **high** half takes `d+1` — the detail one writes backwards
+half the time by hand.
+
+### One-for-one — orthographies
+
+The assembler tolerates them; `--normalize` rewrites them; `--strict` refuses
+them; `--beautify` leaves them alone (it formats, it does not canonicalize).
+
+| Written | Canon |
+|---|---|
+| `ld pc,hl` · `jp hl` (idem `ix`, `iy`) | `jp (hl)` |
+| `ex hl,de` | `ex de,hl` |
+| `ex hl,(sp)` · `ex ix,(sp)` | `ex (sp),hl` · `ex (sp),ix` |
+| `ex af,af` | `ex af,af'` — **warned** |
+| `defb` `dm` `defm` → `db` · `defw` → `dw` · `defs` `rmb` → `ds` | |
+| `endm` `mend` → `endmacro` · `rend` → `endrepeat` · `wend` → `endwhile` · `ends` → `endstruct` | |
+
+`ex af,af` is the **only** tolerance that warns. Its literal reading denotes a
+*different* operation — exchanging AF with itself, which is a no-op — where every
+other one is merely unfashionable. The rule generalizes: fantams warns when the
+text lies, not when it is out of style (ADR 0020).
 
 `jp (hl)` remains the **canon**, despite parentheses suggesting a
 non-existent indirection: `ld pc,hl` is non-standard Z80 for everyone, and a
 canon that other assemblers refuse would lose what makes its value.
-`--normalize` thus rewrites `ld pc,hl` **to** `jp (hl)`, and `--strict` refuses it.
 
-`ld de,hl` is **not** accepted.
+### Repetition
 
-### Canonicalized orthographies
+A mnemonic that takes **no operand** may carry a count: `nop 32`, `ldi 16`,
+`halt 2`. It is shorthand for `repeat n : <mnemonic> : endrepeat`, and it follows
+that reading exactly.
 
-`defb` `dm` `defm` → `db` · `defw` → `dw` · `defs` `rmb` → `ds` · `endm` `mend` →
-`endmacro` · `rend` → `endrepeat` · `wend` → `endwhile` · `ends` → `endstruct`
+- This is **unrolling**, not canonicalization: `-E` expands it fully — all
+  1024 lines of `nop 1024` — while `--normalize`, which canonicalizes *without*
+  unrolling, leaves `nop 32` intact. `--strict` refuses it.
+- The count is a **preprocessor value**: a variable or an expression is fine,
+  an expression touching a **label** is not — at preprocessor time no address
+  exists. To reserve space measured on labels defined *above*, use `ds`.
+- `nop 0` is legal and emits nothing; a negative count is an error.
+- The rule covers **every** operand-less mnemonic, which is broader than rasm
+  (it hand-codes ten, so `cpi 4` and `ldir 2` are errors there). `ret` and `im`
+  are not operand-less, so a count on them is not a count.
 
-The assembler tolerates them; `--normalize` rewrites them; `--strict` refuses them.
+### What is refused, though rasm accepts it
+
+| Form | Why |
+|---|---|
+| `ld hl,sp` | rasm makes it `ld hl,0 : add hl,sp` — 4 bytes, and the carry is clobbered |
+| `rlc hl` · `rr de` · `srl8 de` | 2 to 4 `cb` operations: a routine, not an orthography — write a macro |
+| `rst z,#38` | 2 bytes that **overlap** — the `jr` displacement is itself the `rst` opcode — so no pair of canonical Z80 lines expresses it |
+| `inc hl,de` · `dec bc,de` | no idiom behind it, and it collides with `add hl,de`; multi-register lists stay on `push`/`pop`, which are a sequence by nature |
+
+`add a,b` and `add b` are **both** accepted (as are `and a,b`, `or a,b`,
+`xor a,b`, which rasm refuses). Neither is elected canon: both are one opcode in a
+standard spelling, so the difference is a taste, not a structure. `--normalize`
+leaves them, `--strict` takes both.
 
 ---
 

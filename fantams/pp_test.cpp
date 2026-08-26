@@ -248,6 +248,84 @@ int main() {
     chkStrict("strict refuse l'orthographe", " ld pc,hl\n", false);
     chkStrict("strict accepte la forme canonique", " jp (hl)\n", true);
 
+    // --- ADR 0020 : le sucre de rasm ---------------------------------------
+    //
+    // (1) « ld rr,rr' » : un-vers-plusieurs, donc canonisation. Le HAUT d'abord,
+    // comme rasm — et aucun recouvrement n'est possible, les paires etant
+    // disjointes.
+    chk("ld de,hl", " ld de,hl\n", "ld d,h\n    ld e,l\n");
+    chk("ld bc,de", " ld bc,de\n", "ld b,d\n    ld c,e\n");
+    chk("moities non documentees de IX", " ld bc,ix\n", "ld b,hx\n    ld c,lx\n");
+    chk("et dans l'autre sens", " ld ix,de\n", "ld hx,d\n    ld lx,e\n");
+    chk("la casse du mnemonique est gardee", " LD DE,HL\n", "LD d,h\n    LD e,l\n");
+    chk("un label devant est conserve", "cp16: ld de,hl\n", "cp16: ld d,h\n    ld e,l\n");
+    // H et IXH ne se nomment pas dans la meme instruction : le prefixe DD fait de
+    // « h » la moitie de IX. Contrainte de la machine, pas choix — rasm refuse aussi.
+    chk("ld hl,ix n'existe pas : laisse tel quel", " ld hl,ix\n", "ld hl,ix\n");
+    chk("ld ix,iy non plus", " ld ix,iy\n", "ld ix,iy\n");
+    chk("ld hl,sp n'est pas de cette famille", " ld hl,sp\n", "ld hl,sp\n");
+    chk("ld hl,hl ne se deplie pas", " ld hl,hl\n", "ld hl,hl\n");
+
+    // (2) « ld rr,(ix+d) » : l'octet BAS est a l'adresse basse, la moitie HAUTE
+    // prend donc d+1. C'est ce decalage, invisible sur la ligne ecrite, qui fait
+    // l'interet de la facilite — et le piege si on l'ecrit a la main.
+    chk("ld hl,(ix+2)", " ld hl,(ix+2)\n", "ld h,(ix+3)\n    ld l,(ix+2)\n");
+    chk("ld (iy-1),de", " ld (iy-1),de\n", "ld (iy+0),d\n    ld (iy-1),e\n");
+    chk("deplacement absent", " ld bc,(ix)\n", "ld b,(ix+1)\n    ld c,(ix+0)\n");
+    // Un deplacement ENTIER est plie ; une EXPRESSION est parenthesee, pour que la
+    // justesse ne depende pas de l'operateur ecrit (« 1 shl n » sinon).
+    chk("un deplacement calcule est parenthese",
+        " ld hl,(ix+n*2)\n", "ld h,(ix+(n*2)+1)\n    ld l,(ix+(n*2))\n");
+
+    // (3) Les orthographes de EX et « jp hl » : un pour un, un octet.
+    chk("ex hl,de -> ex de,hl", " ex hl,de\n", "ex de,hl\n");
+    chk("ex hl,(sp) -> ex (sp),hl", " ex hl,(sp)\n", "ex (sp),hl\n");
+    chk("ex ix,(sp) -> ex (sp),ix", " ex ix,(sp)\n", "ex (sp),ix\n");
+    chk("ex de,hl est deja canonique", " ex de,hl\n", "ex de,hl\n");
+    chk("jp hl -> jp (hl)", " jp hl\n", "jp (hl)\n");
+    chk("jp ix / jp iy", " jp ix\n jp iy\n", "jp (ix)\njp (iy)\n");
+    chk("jp nn n'est pas cette forme", " jp #1234\n", "jp #1234\n");
+    // La SEULE tolerance dont la lecture litterale designe une AUTRE operation :
+    // « ex af,af » dit « echanger AF avec lui-meme », c'est-a-dire rien. D'ou
+    // l'avertissement, que les autres orthographes n'ont pas.
+    chkWarn("ex af,af avertit", " ex af,af\n", "ex af,af'\n", true);
+    chkWarn("ex af,af' ne dit rien", " ex af,af'\n", "ex af,af'\n", false);
+    chkWarn("ex hl,de ne dit rien", " ex hl,de\n", "ex de,hl\n", false);
+
+    // (4) La repetition : du DEROULAGE, pas de la canonisation.
+    chk("nop 3", " nop 3\n", "nop\n    nop\n    nop\n");
+    chk("ldi 4", " ldi 4\n", "ldi\n    ldi\n    ldi\n    ldi\n");
+    // La regle porte sur TOUT mnemonique sans operande, plus large que les dix que
+    // rasm code a la main : « pourquoi ldi 4 et pas cpi 4 ? » n'a pas de reponse.
+    chk("cpi 4, que rasm refuse", " cpi 4\n", "cpi\n    cpi\n    cpi\n    cpi\n");
+    chk("ldir 2, que rasm refuse", " ldir 2\n", "ldir\n    ldir\n");
+    chk("nop 0 n'emet rien", " nop 0\n", "");
+    chk("le compteur est une expression", "n equ 2\n nop n*2\n",
+        "n equ 2\nnop\n    nop\n    nop\n    nop\n");
+    chk("le compteur suit une variable", "v=3\n nop v\n", "v=3\nnop\n    nop\n    nop\n");
+    chk("un label devant est conserve", "pause: nop 2\n", "pause: nop\n    nop\n");
+    // `ret` et `im` PRENNENT un operande : un compteur y serait ambigu.
+    chk("ret z n'est pas un compteur", " ret z\n", "ret z\n");
+    chk("im 2 n'est pas un compteur", " im 2\n", "im 2\n");
+    chkErr("compteur negatif", " nop -1\n");
+    // Le compteur est une valeur de preprocesseur, comme celui de `repeat` dont
+    // cette ecriture est le raccourci. Le refus en decoule au lieu d'etre un cas
+    // particulier — rasm, lui, l'accepte, sa repetition vivant dans l'assembleur.
+    chkErr("un compteur mesure sur des labels est refuse", "l1: nop\nl2:\n nop l2-l1\n");
+    chkStrict("strict refuse la repetition", " nop 3\n", false);
+    chkStrict("strict refuse ld de,hl", " ld de,hl\n", false);
+    chkStrict("strict refuse ex hl,de", " ex hl,de\n", false);
+    chkStrict("strict refuse jp hl", " jp hl\n", false);
+    chkStrict("strict accepte le canon", " ex de,hl\n ld d,h\n nop\n", true);
+
+    // `--normalize` canonise SANS derouler : « nop 3 » y survit intact, et sa
+    // promesse retrecie — un opcode par ligne — est tenue.
+    chkNorm("normalize deplie ld de,hl", " ld de,hl\n", " ld d,h\n ld e,l\n");
+    chkNorm("normalize reecrit ex hl,de", " ex hl,de\n", " ex de,hl\n");
+    chkNorm("normalize ne deroule PAS nop 3", " nop 3\n", " nop 3\n");
+    chkNormStable("normalize est idempotent sur le sucre deplie",
+                  " ld de,hl\n nop 3\n ex hl,de\n jp hl\n ld hl,(ix+2)\n");
+
     // --- appel parenthese (ADR 0018) ---------------------------------------
     chk("appel parenthese", "macro m2 a1,a2\n db {a1},{a2}\nendm\n m2(1,2)\n", "db 1,2\n");
     chk("appel nu toujours accepte", "macro m2 a1,a2\n db {a1},{a2}\nendm\n m2 1,2\n", "db 1,2\n");

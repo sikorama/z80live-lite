@@ -492,6 +492,38 @@ int main() {
             t.find(",\"mon,brouillon.asm\",2\n") != std::string::npos);
     }
 
+    // --- ADR 0020 : ce que l'assembleur TOLERE, et ce qu'il refuse -----------
+    //
+    // L'invariant de l'ADR 0017 : aucune source ne doit etre assemblable seulement
+    // apres passage par un outil de mise en forme. Ces formes arrivent donc ici
+    // SANS preprocesseur — c'est ce chemin direct qu'exerce asm_test — et
+    // l'assembleur doit les prendre telles quelles.
+    chk("ex hl,de tolere",   "  ex hl,de\n",   {0xEB});
+    chk("ex hl,(sp) tolere", "  ex hl,(sp)\n", {0xE3});
+    chk("ex ix,(sp) tolere", "  ex ix,(sp)\n", {0xDD, 0xE3});
+    chk("ex af,af tolere",   "  ex af,af\n",   {0x08});
+    chk("jp hl tolere",      "  jp hl\n",      {0xE9});
+    chk("jp ix tolere",      "  jp ix\n",      {0xDD, 0xE9});
+    chk("le canon marche toujours", "  ex de,hl\n  jp (hl)\n  ex af,af'\n", {0xEB, 0xE9, 0x08});
+    // L'avertissement de « ex af,af » appartient au preprocesseur, seul etage a voir
+    // la source telle qu'elle est ecrite (ADR 0017). Ici, silence — comme `defb`.
+    chkWarn("ex af,af ne dit rien a l'assembleur", "  ex af,af\n", false);
+
+    // Les refus. Chacun nomme sa raison plutot que « unrecognized form » : ces
+    // formes existent chez rasm, et celui qui les ecrit les croit valides.
+    chkErr("inc hl,de refuse", "  inc hl,de\n");   // rendait UN octet, en silence
+    chkErr("dec bc,de refuse", "  dec bc,de\n");
+    chkErr("ld hl,sp refuse",  "  ld hl,sp\n");    // arithmetique inventee, carry ecrase
+    chkErr("rlc hl refuse",    "  rlc hl\n");      // une routine, pas une orthographe
+    chkErr("srl de refuse",    "  srl de\n");
+    chkErr("rst z,#38 refuse", "  rst z,#38\n");   // deux instructions qui PARTAGENT un octet
+    // Les formes 8 bits voisines restent intactes : le refus ne mord pas au-dela.
+    chk("inc hl seul",   "  inc hl\n",   {0x23});
+    chk("rlc h",         "  rlc h\n",    {0xCB, 0x04});
+    chk("rlc (ix+1)",    "  rlc (ix+1)\n", {0xDD, 0xCB, 0x01, 0x06});
+    chk("rst #38",       "  rst #38\n",  {0xFF});
+    chk("ld hl,#1234",   "  ld hl,#1234\n", {0x21, 0x34, 0x12});
+
     printf("\n%d réussis, %d échoués\n", g_pass, g_fail);
     return g_fail ? 1 : 0;
 }

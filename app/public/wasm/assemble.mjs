@@ -141,7 +141,9 @@ function readOutput(FS, expected, exclude = []) {
 
 // Nom/chemin virtuel sous lequel une lib (is_include=1) est injectée dans le FS wasm :
 // `filename` fait autorité (ex. 'lib/toolbox.asm'), sinon slug(name)+'.asm' par défaut.
-function includePath(inc) {
+// Exportée : c'est aussi la clé qui permet à l'hôte de retrouver la SOURCE derrière le
+// chemin qu'un assembleur cite dans un diagnostic.
+export function includePath(inc) {
   let p = String(inc.filename || inc.name || 'lib').trim().replace(/^\/+/, '');
   if (!/\.[A-Za-z0-9]+$/.test(p)) p += '.asm';
   return '/' + p;
@@ -198,8 +200,13 @@ async function runModule(factory, args, sourceText, expectedOut, includes, dump,
 }
 
 // ---- Mise en forme du source (ADR 0013) ----
-// Appelle « fantams --beautify » : ni preprocesseur, ni assemblage. Le tampon de
-// l'editeur garde donc ses macros, ses includes et sa ligne « ; z80: ».
+// Appelle « fantams --beautify » : rien n'est deroule, le tampon de l'editeur
+// garde ses macros, ses includes et sa ligne « ; z80: ».
+//
+// Les includes sont ecrits dans le FS virtuel comme pour assemble() : fantams y
+// fait tourner son preprocesseur pour en tirer la table des macros, seule facon
+// de savoir qu'un « fill_screen » nu est un APPEL et non un label. Sans eux, une
+// macro de bibliotheque redeviendrait indiscernable d'un label.
 //
 // Deux differences deliberees avec assemble() : aucun en-tete n'est injecte (on
 // rend le texte de l'AUTEUR, pas celui qu'on fabrique autour), et les accents ne
@@ -208,9 +215,9 @@ async function runModule(factory, args, sourceText, expectedOut, includes, dump,
 //
 // Rend { ok, code, log, error }. Sur echec, `code` est null : rien n'est
 // remplace a moitie.
-export async function beautifySource(code = '', factories) {
+export async function beautifySource(code = '', factories, includes = []) {
   const r = await runModule(factories.createFantams,
-    ['/in.asm', '--beautify', '-o', '/out.fmt'], code, '/out.fmt', []);
+    ['/in.asm', '--beautify', '-o', '/out.fmt'], code, '/out.fmt', includes);
   let text = null;
   try { text = r.data ? new TextDecoder().decode(r.data) : null; } catch { text = null; }
   const ok = r.exitCode === 0 && text !== null;

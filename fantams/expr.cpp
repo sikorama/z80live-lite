@@ -223,7 +223,8 @@ struct Parser {
         }
         return (double)v;
     }
-    // Fonctions rasm reconnues (angles en degrés pour sin/cos, comme rasm).
+    // Fonctions rasm reconnues, à une divergence près : les angles de sin/cos sont
+    // en RADIANS, pas en degrés comme rasm (ADR 0021).
     // hi()/lo() opèrent sur la valeur convertie en entier (extraction d'octet).
     bool callBuiltin(const std::string &upperName, double &out) {
         static const std::set<std::string> unary1 = {
@@ -243,8 +244,8 @@ struct Parser {
         double b = 0;
         if (is2) { if (!eat(",")) fail(upperName + ": expected ',' (2 arguments)"); b = logOr(); }
         if (!eat(")")) fail("expected ')'");
-        if (upperName == "SIN") out = std::sin(a * M_PI / 180.0);
-        else if (upperName == "COS") out = std::cos(a * M_PI / 180.0);
+        if (upperName == "SIN") out = std::sin(a);        // radians (ADR 0021)
+        else if (upperName == "COS") out = std::cos(a);   // radians (ADR 0021)
         else if (upperName == "ABS") out = std::fabs(a);
         else if (upperName == "HI") out = (double)((toInt(a) >> 8) & 0xFF);
         else if (upperName == "LO") out = (double)(toInt(a) & 0xFF);

@@ -28,9 +28,23 @@ const LIST_COLS_S = LIST_COLS.replace(/\b(\w+)\b/g, 's.$1'); // colonnes qualifi
 const q = {
   list: db.prepare(`SELECT ${LIST_COLS} FROM sources ORDER BY updated_at DESC LIMIT $limit OFFSET $offset`),
   listMode: db.prepare(`SELECT ${LIST_COLS} FROM sources WHERE buildmode = $mode ORDER BY updated_at DESC LIMIT $limit OFFSET $offset`),
-  search: db.prepare(`SELECT ${LIST_COLS_S} FROM sources s
-      JOIN sources_fts f ON f.rowid = s.rowid
-      WHERE sources_fts MATCH $q ORDER BY rank LIMIT $limit OFFSET $offset`),
+  // `filename` n'est pas dans l'index FTS (db/schema.sql) : chercher « toolbox.asm » ne
+  // trouvait que les sources qui l'INCLUENT, jamais la librairie elle-même. Les
+  // correspondances de nom/nom de fichier passent devant — c'est ce que veut qui tape un
+  // nom de fichier — puis viennent les correspondances de code, par rang FTS.
+  search: db.prepare(`SELECT ${LIST_COLS} FROM (
+        SELECT ${LIST_COLS_S}, 0 AS pri, 0.0 AS rk FROM sources s
+         WHERE s.name LIKE $like OR s.filename LIKE $like
+        UNION ALL
+        SELECT ${LIST_COLS_S}, 1 AS pri, f.rank AS rk FROM sources s
+         JOIN sources_fts f ON f.rowid = s.rowid
+         WHERE sources_fts MATCH $q
+           AND s.name NOT LIKE $like AND (s.filename IS NULL OR s.filename NOT LIKE $like)
+      ) ORDER BY pri, rk LIMIT $limit OFFSET $offset`),
+  // Repli quand MATCH lève (opérateurs FTS mal formés dans la requête de l'utilisateur).
+  searchLike: db.prepare(`SELECT ${LIST_COLS} FROM sources
+      WHERE name LIKE $like OR filename LIKE $like OR author LIKE $like OR description LIKE $like
+      ORDER BY updated_at DESC LIMIT $limit OFFSET $offset`),
   get: db.prepare(`SELECT ${FULL_COLS} FROM sources WHERE id = $id`),
   includes: db.prepare(`SELECT id, name, filename, code FROM sources WHERE is_include = 1 ORDER BY name`),
   count: db.prepare(`SELECT COUNT(*) c FROM sources`),
@@ -129,7 +143,11 @@ const server = createServer(async (req, res) => {
       const search = url.searchParams.get('q');
       const mode = url.searchParams.get('buildmode');
       let rows;
-      if (search) rows = q.search.all({ q: search, limit, offset });
+      if (search) {
+        const like = `%${search}%`;
+        try { rows = q.search.all({ q: search, like, limit, offset }); }
+        catch { rows = q.searchLike.all({ like, limit, offset }); }
+      }
       else if (mode) rows = q.listMode.all({ mode, limit, offset });
       else rows = q.list.all({ limit, offset });
       return json(res, 200, { total: q.count.get().c, count: rows.length, offset, items: rows });

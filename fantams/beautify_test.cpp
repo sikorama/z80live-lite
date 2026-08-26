@@ -283,6 +283,20 @@ int main() {
     keep("« ld pc,hl » n'est pas de la mise en forme : le beautify n'y touche pas",
          "    ld pc,hl\n");
 
+    // --- Le sucre de rasm n'est pas de la mise en forme non plus (ADR 0020) --
+    //
+    // Le beautify ne connaît que deux règles — le deux-points d'un label et
+    // l'indentation d'une instruction en colonne 1. Tendre vers le canon est le
+    // travail de `--normalize`, qui est un AUTRE outil : il change le nombre de
+    // lignes, ce que le beautify ne fait jamais. Confondre les deux ferait d'un
+    // outil cosmétique une étape de compilation déguisée.
+    keep("« ex hl,de » n'est pas de la mise en forme", "    ex hl,de\n");
+    keep("« ex af,af » non plus, malgré l'avertissement", "    ex af,af\n");
+    keep("« jp hl » non plus", "    jp hl\n");
+    keep("« ld de,hl » non plus : ce serait deux lignes", "    ld de,hl\n");
+    keep("« nop 3 » non plus : ce serait trois lignes", "    nop 3\n");
+    chk("mais l'indentation, oui", "ld de,hl\n", "    ld de,hl\n");
+
     // --- préservation du texte --------------------------------------------
     keep("pas de saut de ligne final : rien n'est ajouté", "start:\n    nop");
     chk("saut de ligne final unique conservé", "nop\n", "    nop\n");

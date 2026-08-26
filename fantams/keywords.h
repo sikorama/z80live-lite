@@ -101,7 +101,28 @@ bool parenCall(const std::string &s, std::string &name, std::string &args);
 // y suggerent une indirection qui n'existe pas. Mais `ld pc,hl` n'est du Z80
 // standard pour personne, et un canon que les autres assembleurs refusent perd
 // ce qui fait sa valeur.
+// Couvre aussi « jp hl » (idem ix, iy), la forme de rasm sans parentheses.
 std::string canonicalJump(const std::string &stmt);
+
+// Les orthographes de `EX`, ou la chaine inchangee :
+//   « ex hl,de » -> « ex de,hl »        (l'instruction est symetrique)
+//   « ex hl,(sp) » -> « ex (sp),hl »    (idem ix, iy)
+//   « ex af,af » -> « ex af,af' »       (l'apostrophe oubliee)
+std::string canonicalEx(const std::string &stmt);
+
+// « ex af,af » sans son apostrophe. La SEULE tolerance dont la lecture litterale
+// designe une autre operation — echanger AF avec lui-meme, c'est-a-dire rien.
+// Le preprocesseur l'avertit a ce titre ; les autres orthographes sont muettes.
+bool isMissingPrimeEx(const std::string &stmt);
+
+// Toutes les orthographes a plusieurs mots, en une passe. C'est le point
+// d'entree unique dont l'assembleur se sert pour les TOLERER (ADR 0017) : il
+// n'a pas a savoir combien il y en a.
+std::string canonicalOrthography(const std::string &stmt);
+
+// Un mnemonique qui ne prend aucun operande — donc un qui accepte un COMPTEUR
+// de repetition (« nop 32 », « ldi 16 »). `RET` et `IM` n'en sont pas.
+bool isOperandLessMnemonic(const std::string &upperTok);
 
 // « b12 » : une reference de banque, telle qu'elle prefixe une adresse dans
 // « org b4:0x4000 » (ADR 0005). Le numero n'est pas borne ici — c'est a

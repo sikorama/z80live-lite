@@ -187,6 +187,16 @@ bool encodeAlu(IAsmContext &ctx, int idx, const Operand &src) {
 // Rotation/décalage sur r8/(HL)/(IX+d) : préfixe CB (ordre spécial si indexé)
 bool encodeRot(IAsmContext &ctx, int idx, const Operand &tgt) {
     Emitter e{ctx};
+    // « rlc hl », « rr de » : rasm les accepte et les déplie en deux à QUATRE
+    // opérations `cb`. Refusées (ADR 0020) : ce ne sont pas des orthographes mais
+    // des ROUTINES. Le lecteur ne peut lire ni leur taille ni l'ordre dans lequel
+    // les drapeaux sont touchés, et une routine mérite le nom que son auteur lui
+    // a choisi — donc une macro.
+    if (tgt.kind == Operand::Kind::Reg && is16bit(tgt.reg)) {
+        ctx.error("there is no 16-bit rotate/shift on the Z80 — rasm synthesizes it from 2 to 4 "
+                  "'cb' operations, whose flag effects the line does not show; write a macro");
+        return false;
+    }
     R8 t = asR8(tgt);
     if (!t.ok) { ctx.error("invalid rotate/shift target"); return false; }
     e.prefix(t.prefix);
@@ -285,6 +295,16 @@ bool encodeLD(IAsmContext &ctx, const Operand &A, const Operand &B) {
         else { e.op(0xED); e.op((uint8_t)(0x43 + rr * 16)); }
         e.imm16(ctx.eval(A.expr)); return true;
     }
+    // « ld hl,sp » : rasm l'accepte et produit « ld hl,0 : add hl,sp ». Refusée
+    // (ADR 0020) parce qu'elle n'est pas un réarrangement d'un transfert mais une
+    // ARITHMÉTIQUE inventée : quatre octets, et le carry est écrasé. Toutes les
+    // autres facilités de la table rendent exactement ce que l'auteur aurait tapé.
+    if (A.kind == Operand::Kind::Reg && B.kind == Operand::Kind::Reg && B.reg == Reg::SP &&
+        (A.reg == Reg::HL || A.reg == Reg::IX || A.reg == Reg::IY)) {
+        ctx.error("LD: there is no 16-bit load from SP — rasm writes it 'ld hl,0 : add hl,sp', "
+                  "which costs 4 bytes and clobbers the carry; write those two lines yourself");
+        return false;
+    }
     ctx.error("unrecognized LD form");
     return false;
 }
@@ -292,8 +312,22 @@ bool encodeLD(IAsmContext &ctx, const Operand &A, const Operand &B) {
 // ---------------------------------------------------------------------------
 // INC / DEC (8 ou 16 bits)
 // ---------------------------------------------------------------------------
-bool encodeIncDec(IAsmContext &ctx, Mnemo m, const Operand &A) {
+bool encodeIncDec(IAsmContext &ctx, Mnemo m, const Operand &A, const Operand &B) {
     Emitter e{ctx};
+    // « inc hl,de » : rasm en fait deux instructions, fantams le refuse (ADR 0020).
+    // Le refus est explicite parce que le silence était pire : le second opérande
+    // était simplement ignoré, et la ligne rendait UN octet sans rien dire.
+    //
+    // La liste multi-registres reste réservée à `push`/`pop`, qui sont par nature
+    // une SÉQUENCE — personne n'écrit « push hl,de » en pensant à un seul push de
+    // 32 bits. `inc hl,de` n'a pas cet idiome derrière lui, et il se confond avec
+    // `add hl,de`, qui existe et fait tout autre chose.
+    if (B.kind != Operand::Kind::None) {
+        ctx.error(std::string(m == Mnemo::INC ? "INC" : "DEC") +
+                  " takes a single operand: a multi-register list is accepted only on "
+                  "PUSH/POP — write one per line (and mind 'add hl,de', which is not this)");
+        return false;
+    }
     if (A.kind == Operand::Kind::Reg && is16bit(A.reg) && A.reg != Reg::AF) {
         uint8_t p = 0; int rr = reg16code(A.reg, p);
         e.prefix(p);
@@ -384,7 +418,7 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
         }
 
         case Mnemo::INC: case Mnemo::DEC:
-            return encodeIncDec(ctx, in.mnemo, A);
+            return encodeIncDec(ctx, in.mnemo, A, B);
 
         case Mnemo::RLC: case Mnemo::RRC: case Mnemo::RL: case Mnemo::RR:
         case Mnemo::SLA: case Mnemo::SRA: case Mnemo::SLL: case Mnemo::SRL:
@@ -437,6 +471,17 @@ bool encode(IAsmContext &ctx, const Instruction &in) {
         }
 
         case Mnemo::RST: {
+            // « rst z,#38 » : rasm rend DEUX octets, 28 FF, où le FF est à la fois le
+            // déplacement du `jr z` et l'opcode `rst #38` sur lequel ce `jr` retombe.
+            // Refusée (ADR 0020) : les deux instructions PARTAGENT un octet, donc
+            // aucune paire de lignes Z80 canoniques ne la reproduit, et `-E` ne
+            // saurait l'écrire sans mentir sur le programme.
+            if (A.kind == Operand::Kind::Cond) {
+                ctx.error("there is no conditional RST — rasm encodes it as a 2-byte overlap "
+                          "(the 'jr' displacement is itself the 'rst' opcode), which no pair of "
+                          "canonical Z80 lines can express; write the 'jr' and the 'rst'");
+                return false;
+            }
             if (A.kind != Operand::Kind::Imm) { ctx.error("RST: expected vector"); return false; }
             int64_t n = ctx.eval(A.expr);
             if (n < 0 || n > 0x38 || (n & 7)) ctx.error("RST: invalid vector (00,08,...,38)");

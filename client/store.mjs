@@ -46,12 +46,25 @@ export function createLocalStore(db, { hasFts = true } = {}) {
     finally { st.free(); }
   };
   const one = (sql, params) => rows(sql, params)[0] || null;
-  // Repli sans FTS : LIKE sur nom/auteur/description.
+  // Repli sans FTS : LIKE sur nom/nom de fichier/auteur/description.
   const likeSearch = (q, limit, offset) => rows(
     `SELECT ${LIST_COLS} FROM sources
-     WHERE name LIKE $q OR author LIKE $q OR description LIKE $q
+     WHERE name LIKE $q OR filename LIKE $q OR author LIKE $q OR description LIKE $q
      ORDER BY updated_at DESC LIMIT $l OFFSET $o`,
     { $q: `%${q}%`, $l: limit, $o: offset });
+  // `filename` n'est PAS dans l'index FTS (cf. db/schema.sql) : chercher « toolbox.asm »
+  // ne trouvait donc que les sources qui l'INCLUENT, jamais la librairie elle-même.
+  // On préfixe les correspondances de nom/nom de fichier — c'est l'intention la plus
+  // probable de qui tape un nom de fichier — et l'index FTS fournit le reste, par rang.
+  const searchSql = `SELECT ${LIST_COLS} FROM (
+      SELECT ${LIST_COLS_S}, 0 AS pri, 0.0 AS rk FROM sources s
+       WHERE s.name LIKE $like OR s.filename LIKE $like
+      UNION ALL
+      SELECT ${LIST_COLS_S}, 1 AS pri, f.rank AS rk FROM sources s
+       JOIN sources_fts f ON f.rowid = s.rowid
+       WHERE sources_fts MATCH $q
+         AND s.name NOT LIKE $like AND (s.filename IS NULL OR s.filename NOT LIKE $like)
+    ) ORDER BY pri, rk LIMIT $l OFFSET $o`;
   return {
     mode: 'local',
     canWrite: false,
@@ -59,12 +72,10 @@ export function createLocalStore(db, { hasFts = true } = {}) {
     list({ q, buildmode, limit = 50, offset = 0 } = {}) {
       if (q) {
         if (!hasFts) return likeSearch(q, limit, offset);
-        try {
-          return rows(
-            `SELECT ${LIST_COLS_S} FROM sources s JOIN sources_fts f ON f.rowid = s.rowid
-             WHERE sources_fts MATCH $q ORDER BY rank LIMIT $l OFFSET $o`,
-            { $q: q, $l: limit, $o: offset });
-        } catch { return likeSearch(q, limit, offset); }
+        // MATCH lève sur une requête aux opérateurs FTS mal formés : le repli LIKE
+        // couvre alors nom et nom de fichier, qui sont l'essentiel de ce qu'on tape.
+        try { return rows(searchSql, { $q: q, $like: `%${q}%`, $l: limit, $o: offset }); }
+        catch { return likeSearch(q, limit, offset); }
       }
       if (buildmode) return rows(
         `SELECT ${LIST_COLS} FROM sources WHERE buildmode = $m ORDER BY updated_at DESC LIMIT $l OFFSET $o`,

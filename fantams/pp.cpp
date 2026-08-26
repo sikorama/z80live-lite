@@ -191,6 +191,116 @@ std::vector<std::string> expandPushPop(const std::string &stmt) {
     return out;
 }
 
+// Les deux moitiés 8 bits d'une paire 16 bits, ou false si la paire n'en a pas
+// (`SP` et `AF` ne sont pas adressables par moitiés).
+//
+// Les moitiés de IX/IY sont NON DOCUMENTÉES mais assemblées par fantams comme par
+// rasm. Elles restent du Z80 canonique au sens de l'ADR 0017 — un opcode, une
+// ligne — ce qui est la seule condition qu'une règle de canonisation doive tenir.
+bool reg16Halves(const std::string &R, std::string &hi, std::string &lo) {
+    if (R == "BC") { hi = "b";  lo = "c";  return true; }
+    if (R == "DE") { hi = "d";  lo = "e";  return true; }
+    if (R == "HL") { hi = "h";  lo = "l";  return true; }
+    if (R == "IX") { hi = "hx"; lo = "lx"; return true; }
+    if (R == "IY") { hi = "hy"; lo = "ly"; return true; }
+    return false;
+}
+inline bool isIndexPair(const std::string &R) { return R == "IX" || R == "IY"; }
+
+// « ld de,hl » -> « ld d,h » / « ld e,l », et « ld hl,(ix+n) » -> deux lignes
+// indexées. Sucre un-vers-plusieurs, donc canonisation de préprocesseur
+// (ADR 0017/0020) : la source déroulée doit montrer les deux opcodes.
+//
+// L'ordre est HAUT puis BAS, comme rasm. Aucun recouvrement n'est possible : les
+// deux paires sont disjointes (le cas dest == src est écarté), donc la moitié
+// haute écrite n'est jamais la moitié basse encore à lire.
+//
+// `ld hl,ix` et ses semblables n'existent pas, et c'est une contrainte de la
+// machine, pas un choix : le préfixe DD fait de `h` la moitié de IX, si bien
+// qu'aucune instruction ne nomme H et IXH à la fois. Deux paires d'index non
+// plus, pour la même raison. rasm les refuse aussi.
+std::vector<std::string> expandLd16(const std::string &stmt) {
+    std::string label, rest; peelLabel(stmt, label, rest);
+    const std::string mnTok = firstToken(rest);
+    if (upper(mnTok) != "LD") return {stmt};
+    const auto ops = splitTopLevel(restAfterFirst(rest), ',');
+    if (ops.size() != 2) return {stmt};
+    const std::string A = upper(trim(ops[0])), B = upper(trim(ops[1]));
+
+    const std::string head = label.empty() ? std::string() : label + ": ";
+    auto two = [&](const std::string &h, const std::string &l) {
+        return std::vector<std::string>{head + mnTok + " " + h, mnTok + " " + l};
+    };
+
+    std::string ah, al, bh, bl;
+    // (1) paire <- paire
+    if (reg16Halves(A, ah, al) && reg16Halves(B, bh, bl)) {
+        if (A == B) return {stmt};
+        if (isIndexPair(A) && isIndexPair(B)) return {stmt};   // DD et FD s'excluent
+        if ((A == "HL" && isIndexPair(B)) || (isIndexPair(A) && B == "HL")) return {stmt};
+        return two(ah + "," + bh, al + "," + bl);
+    }
+    // (2) paire <- (ix+d) et (ix+d) <- paire. L'octet BAS est à l'adresse basse :
+    // la moitié haute prend donc d+1, et c'est ce décalage — invisible sur la
+    // ligne écrite — qui rend cette facilité utile.
+    // La casse du DÉPLACEMENT est celle de la source : il porte des noms de
+    // symboles, et « (ix+monOffset) » ne survivrait pas à une mise en majuscules.
+    auto idxDisp = [](const std::string &op, std::string &xy, std::string &disp) {
+        const std::string t = trim(op);
+        if (t.size() < 4 || t.front() != '(' || t.back() != ')') return false;
+        const std::string inner = trim(t.substr(1, t.size() - 2));
+        const std::string head2 = upper(inner.substr(0, 2));
+        if (head2 != "IX" && head2 != "IY") return false;
+        if (inner.size() > 2 && isIdentChar(inner[2])) return false;
+        xy = inner.substr(0, 2);
+        disp = trim(inner.substr(2));
+        if (disp.empty()) disp = "+0";
+        return disp[0] == '+' || disp[0] == '-';
+    };
+    std::string xy, disp;
+    // Le déplacement est PARENTHÉSÉ avant qu'on lui ajoute 1. Sans ça
+    // « ld hl,(ix+n-1) » rendrait « ld h,(ix+n-1+1) », qui se trouve juste, et
+    // « ld hl,(ix+1 shl n) » rendrait « ix+1 shl n+1 », qui ne l'est pas : la
+    // justesse ne doit pas dépendre de l'opérateur que l'auteur a écrit.
+    // Un déplacement ENTIER est plié : « (ix+2) » rend « (ix+3) » et non
+    // « (ix+(2)+1) ». C'est le cas de la quasi-totalité des lignes écrites, et la
+    // source déroulée est un livrable qu'on lit — les parenthèses de sûreté n'y
+    // ont leur place que là où elles servent, c'est-à-dire sur une expression.
+    auto lowHigh = [&](std::string &low, std::string &high) {
+        const std::string sign = disp.substr(0, 1), d = trim(disp.substr(1));
+        const bool literal = !d.empty() &&
+                             d.find_first_not_of("0123456789") == std::string::npos;
+        if (literal) {
+            const long v = (sign == "-" ? -1 : 1) * std::stol(d);
+            auto fmt = [&](long n) {
+                return "(" + xy + (n < 0 ? "-" : "+") + std::to_string(n < 0 ? -n : n) + ")";
+            };
+            low = fmt(v); high = fmt(v + 1);
+            return;
+        }
+        low  = "(" + xy + sign + "(" + d + "))";
+        high = "(" + xy + sign + "(" + d + ")+1)";
+    };
+    if (reg16Halves(A, ah, al) && !isIndexPair(A) && idxDisp(ops[1], xy, disp)) {
+        std::string low, high; lowHigh(low, high);
+        return two(ah + "," + high, al + "," + low);
+    }
+    if (reg16Halves(B, bh, bl) && !isIndexPair(B) && idxDisp(ops[0], xy, disp)) {
+        std::string low, high; lowHigh(low, high);
+        return two(high + "," + bh, low + "," + bl);
+    }
+    return {stmt};
+}
+
+// Toute la canonisation un-vers-plusieurs, en un point. `emit()` et `normalize()`
+// doivent en voir exactement la même, sans quoi `-E` et `--normalize` divergent.
+std::vector<std::string> expandSugar(const std::string &stmt) {
+    std::vector<std::string> out;
+    for (const auto &s : expandPushPop(stmt))
+        for (const auto &l : expandLd16(s)) out.push_back(l);
+    return out;
+}
+
 // Position du mot-clé de plage (`to` ou `until`) dans l'en-tête d'un FOR, au
 // niveau supérieur et en JETON entier — un symbole nommé « stop » contient « to »,
 // et le chercher en sous-chaîne le couperait en deux. `inclusive` dit lequel a été
@@ -250,9 +360,9 @@ inline std::string matchCase(const std::string &orig, const std::string &canonLo
 // Réécrit le mot de tête d'une instruction (label éventuel conservé) dans son
 // orthographe canonique. Rend `stmt` inchangé si elle l'est déjà.
 std::string canonicalizeSpelling(const std::string &stmt) {
-    // « ld pc,hl » -> « jp (hl) » : une orthographe comme les autres (ADR 0017),
-    // simplement portée par deux mots au lieu d'un.
-    const std::string jz = kw::canonicalJump(stmt);
+    // « ld pc,hl » -> « jp (hl) », « ex hl,de » -> « ex de,hl » : des orthographes
+    // comme les autres (ADR 0017), simplement portées par deux mots au lieu d'un.
+    const std::string jz = kw::canonicalOrthography(stmt);
     if (jz != stmt) return jz;
     std::string label, rest; peelLabel(stmt, label, rest);
     if (rest.empty()) return stmt;
@@ -707,7 +817,52 @@ private:
         return out;
     }
 
-    void emit(const std::string &code, const SrcLine &src) {
+    // « nop 32 », « ldi 16 » : un mnémonique sans opérande suivi d'un COMPTEUR.
+    // C'est du DÉROULAGE, pas de la canonisation (CONTEXT.md : le déroulage
+    // « multiplie les lignes par répétition ») — donc `-E` le déroule et
+    // `--normalize`, qui canonise SANS dérouler, le laisse tel quel.
+    //
+    // Le compteur suit exactement les règles de `repeat n`, dont cette écriture
+    // est le raccourci : résoluble au temps préprocesseur, donc jamais dépendant
+    // d'un label. Aucune règle de résolution nouvelle, et le refus de
+    // « nop fin-debut » en découle au lieu d'être un cas particulier.
+    //
+    // La règle porte sur TOUT mnémonique sans opérande, plus large que les dix
+    // que rasm code à la main : « pourquoi `ldi 4` et pas `cpi 4` ? » n'a pas de
+    // réponse, et une règle sans exception coûte moins cher à retenir (ADR 0015).
+    bool repetitionCount(const std::string &stmt, const Env &env, const SrcLine &src,
+                         std::string &one, long &count) {
+        std::string label, rest; peelLabel(stmt, label, rest);
+        const std::string mnTok = firstToken(rest);
+        if (!kw::isOperandLessMnemonic(upper(mnTok))) return false;
+        const std::string tail = restAfterFirst(rest);
+        if (tail.empty()) return false;
+        const expr::Result r = evalPP(tail, env);
+        if (!r.ok) {
+            // Le cas qui vaut d'être nommé : un compteur mesuré sur des labels.
+            // `ds` fait ce travail, dans l'assembleur, là où les adresses existent
+            // — mais seulement vers l'ARRIÈRE, `ds` déplaçant lui-même l'adresse.
+            error(src, "'" + mnTok + " " + tail + "': " + r.error +
+                       "; a repetition count is a preprocessor value, like the one of "
+                       "'repeat' — to reserve space measured on labels defined ABOVE, "
+                       "use 'ds' instead");
+            one.clear(); count = 0;
+            return true;
+        }
+        if (r.value < 0 || r.value > 1000000) {
+            error(src, "'" + mnTok + " " + tail + "': repetition count out of range");
+            one.clear(); count = 0;
+            return true;
+        }
+        // Le mnémonique SEUL : un label ne se répète pas. « pause: nop 2 » définit
+        // un label et deux `nop`, pas deux fois le même label — et le redéfinir
+        // aurait été une erreur d'assemblage sur une ligne que personne n'a écrite.
+        one = mnTok;
+        count = (long)r.value;
+        return true;
+    }
+
+    void emit(const std::string &code, const SrcLine &src, const Env *env = nullptr) {
         std::string t = trim(expandSizeof(code, src));
         if (t.empty()) return;
         // ':' -> retour à la ligne ; push/pop multi-registres -> une instruction chacun.
@@ -728,18 +883,56 @@ private:
                 std::string l0, r0, l1, r1;
                 peelLabel(stmt, l0, r0);
                 peelLabel(canon, l1, r1);
-                // « ld pc,hl » porte son orthographe sur DEUX mots : nommer le seul
-                // « ld » ferait chercher une faute qui n'est pas là.
-                if (kw::canonicalJump(stmt) != stmt)
+                // « ld pc,hl », « ex hl,de » portent leur orthographe sur DEUX mots :
+                // nommer le seul « ld » ou le seul « ex » ferait chercher une faute qui
+                // n'est pas là — et pour `ex` la phrase devenait « write 'ex' ».
+                // Le critère est donc le mot de tête, pas la famille : s'il ne change
+                // pas, c'est la ligne entière qu'il faut montrer.
+                if (firstToken(r0) == firstToken(r1))
                     strictErr(src, "strict: '" + r0 + "' is a non-canonical spelling — write '" + r1 + "'");
                 else
                 strictErr(src, "strict: '" + firstToken(r0) + "' is a non-canonical spelling — write '" +
                                firstToken(r1) + "'");
             }
-            const std::vector<std::string> expanded = expandPushPop(canon);
+            // ADR 0020 : la seule tolérance dont la lecture littérale désigne une
+            // AUTRE opération. Le préprocesseur est le seul étage à voir la source
+            // telle qu'elle est écrite, donc le seul qui puisse le dire.
+            if (kw::isMissingPrimeEx(stmt))
+                warning(src, "'ex af,af' reads literally as exchanging AF with itself, which is a "
+                             "no-op — the apostrophe of 'ex af,af'' names the shadow register, and "
+                             "that is the whole instruction");
+
+            // Le déroulage vient APRÈS la canonisation : « nop 4 » n'a pas
+            // d'orthographe à corriger, mais l'ordre inverse ferait dépendre le
+            // canon du compteur.
+            std::string one; long count = 0;
+            if (env && repetitionCount(canon, *env, src, one, count)) {
+                if (strict_ && !one.empty()) {
+                    std::string l0, r0; peelLabel(canon, l0, r0);
+                    strictErr(src, "strict: '" + trim(r0) + "' is a writing facility, not canonical "
+                                   "Z80 — write 'repeat " + trim(restAfterFirst(r0)) + " : " +
+                                   firstToken(r0) + " : endrepeat'");
+                }
+                std::string lbl, body; peelLabel(canon, lbl, body);
+                // Un compteur nul n'émet aucune instruction — mais le label, lui,
+                // a été écrit et doit exister : « fin: nop 0 » nomme une adresse.
+                if (count == 0 && !lbl.empty()) {
+                    result.lines.push_back({lbl + ":", src.file, src.line, src.col0});
+                    first = false;
+                }
+                for (long k = 0; k < count; ++k) {
+                    const std::string line = (k == 0 && !lbl.empty()) ? lbl + ": " + one : one;
+                    result.lines.push_back({first ? line : "    " + line, src.file, src.line,
+                                            first && src.col0});
+                    first = false;
+                }
+                continue;
+            }
+
+            const std::vector<std::string> expanded = expandSugar(canon);
             if (strict_ && expanded.size() > 1)
-                strictErr(src, "strict: a multi-register '" + firstToken(canon) +
-                               "' is a writing facility, not canonical Z80 — write one per line");
+                strictErr(src, "strict: '" + canon + "' is a writing facility, not canonical Z80 "
+                               "— write one instruction per line");
             for (const auto &line : expanded) {
                 result.lines.push_back({first ? line : "    " + line, src.file, src.line, first && src.col0});
                 first = false;
@@ -1302,7 +1495,10 @@ private:
             }
 
             // --- ligne ordinaire : passe-plat ---
-            emit(substituteVars(code, env, &raw), raw);
+            // L'env n'est passé QU'ICI : c'est la seule ligne qui vienne de la source.
+            // Les autres appels à emit() synthétisent des directives (`EQU`, `ds`) où
+            // un compteur de répétition n'a pas de sens et où l'env n'existe pas.
+            emit(substituteVars(code, env, &raw), raw, &env);
             ++i;
         }
     }
@@ -1336,8 +1532,13 @@ std::string normalize(const std::string &src) {
             const std::string indent = code.substr(0, ind);
             const std::string body = trim(code);
             std::vector<std::string> canon;
+            // `--normalize` canonise SANS dérouler : « nop 32 » y survit intact, et
+            // ce n'est pas une lacune (ADR 0020). Sa promesse rétrécie — un opcode
+            // par ligne, plus d'orthographe obsolète — est tenue : « nop 32 » porte
+            // bien un seul opcode sur sa ligne. C'est `-E` qui répond en une
+            // commande à ce que cette ligne devient.
             for (const auto &stmt : splitStatements(body))
-                for (const auto &l : expandPushPop(canonicalizeSpelling(stmt)))
+                for (const auto &l : expandSugar(canonicalizeSpelling(stmt)))
                     canon.push_back(l);
             if (canon.size() == 1 && canon[0] == body) out += ln;   // déjà canonique
             else {

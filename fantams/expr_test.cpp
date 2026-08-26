@@ -76,20 +76,24 @@ int main() {
     chk("flottant simple", "0.5*10", 5);
     chk("flottant dans expression", "1 + 0.2*10", 3); // 1+2.0=3.0
 
-    // --- fonctions : sin/cos (degrés) / abs / hi / lo ---
-    // valeurs vérifiées empiriquement contre rasm (wasm), voir historique du commit.
-    chk("sin(90)", "sin(90)", 1);
-    chk("sin(90)*100", "sin(90)*100", 100);
+    // --- fonctions : sin/cos (RADIANS, ADR 0021) / abs / hi / lo ---
+    chk("sin(0)", "sin(0)", 0);
+    chk("sin(1)*1000", "sin(1)*1000", 841);
     chk("cos(0)*100", "cos(0)*100", 100);
-    chk("sin(45)*1000 mod 256 (comme db)", "(sin(45)*1000) & 255", 195);
+    chk("cos(1)*1000", "cos(1)*1000", 540);
+    chk("sin(pi) ~ 0", "sin(3.14159265)*1000", 0);
+    chk("cos(pi) = -1", "cos(3.14159265)*100", -100);
+    chk("sin(1)*1000 mod 256 (comme db)", "(sin(1)*1000) & 255", 73);
+    // 90 est un angle en radians, pas un quart de tour : sin(90 rad) = 0.894
+    chk("l'argument n'est pas en degrés", "sin(90)*1000", 894);
     chk("abs négatif", "abs(-5)", 5);
     chk("abs positif", "abs(5)", 5);
     chk("hi", "hi(#1234)", 0x12);
     chk("lo", "lo(#1234)", 0x34);
-    chk("expression complète (rasm réel)", "20 + 10 * sin(90)", 30);
+    chk("expression complète", "20 + 10 * sin(1)", 28);
     // division réelle avant sin (pas de troncature entière intermédiaire) :
-    // (360*1)/256 = 1.40625° -> sin -> *1000 -> round -> 25 (vérifié vs rasm)
-    chk("division flottante avant sin", "sin((360*1)/256)*1000", 25);
+    // (2*pi)/256 = 0.0245 rad -> sin -> *1000 -> round -> 25
+    chk("division flottante avant sin", "sin((6.28318530*1)/256)*1000", 25);
 
     // --- Litteraux de chaine (ADR 0010) ---
     // Une expression rend un NOMBRE : seul un litteral d'un octet en a un, et

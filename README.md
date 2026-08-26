@@ -32,7 +32,7 @@ Requires Node ≥ 22.5 (`node:sqlite`). Compatible with Bun (`bun:sqlite`).
 
 ```bash
 npm run import              # (re)generates db/z80live.sqlite from ../export_full.json
-(cd app && npm install && npm run build)   # builds the SPA -> app/dist
+(cd app && npm install) && npm run build   # builds the WASM + the SPA -> app/dist
 npm run serve               # API + SPA on http://localhost:3000
 ```
 
@@ -85,7 +85,7 @@ The SQLite database can be **embedded in the client** and read locally (sql.js):
 The full version (with API) serves as the editing instance; a static snapshot is **exported** from it.
 
 ```bash
-(cd app && npm run build)   # up-to-date SPA
+npm run build               # up-to-date WASM + SPA
 npm run export:lite         # generates ../dist-lite/  (~7.4 MB: SPA + assemblers + emulator + gzipped database)
 cd ../dist-lite && npx serve   # or any static host / CDN
 ```

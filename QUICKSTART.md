@@ -19,7 +19,7 @@ ls db/z80live.sqlite          # doit exister
 
 ```bash
 npm run import                             # (ré)génère db/z80live.sqlite depuis ../export_full.json
-(cd app && npm install && npm run build)   # compile la SPA -> app/dist
+(cd app && npm install) && npm run build   # compile le WASM + la SPA -> app/dist
 npm run serve                              # API + SPA sur http://localhost:3000
 ```
 
@@ -36,7 +36,7 @@ C'est un serveur Node classique, sans dépendance (`node:http` + `node:sqlite`) 
 process à garder en vie derrière un reverse proxy (nginx/caddy) ou un supervisor (systemd, pm2).
 
 ```bash
-(cd app && npm install && npm run build)   # build la SPA une fois pour toutes
+(cd app && npm install) && npm run build   # build le WASM + la SPA une fois pour toutes
 PORT=8080 DB=/chemin/persistant/z80live.sqlite Z80_WRITE_TOKEN=un-secret \
   node --experimental-sqlite server/api.mjs
 ```
@@ -56,7 +56,9 @@ Points d'attention en prod :
 - Définir `Z80_WRITE_TOKEN` dès que l'instance est exposée publiquement en écriture ouverte.
 - Le process n'a pas de daemon intégré : le superviser (systemd `Restart=always`, pm2, docker
   `restart: unless-stopped`…) pour qu'il redémarre après un crash ou un reboot.
-- Rebuild `app/dist` (`cd app && npm run build`) à chaque changement du front avant de redéployer.
+- Rebuild (`npm run build`, à la racine) à chaque changement du front **ou de `fantams/*.cpp`** avant
+  de redéployer. Depuis la racine seulement : `cd app && npm run build` ne reconstruit que la SPA et
+  laisse `wasm/fantams.wasm` en arrière, si bien qu'on teste un assembleur périmé sans le voir.
 
 Exemple d'unité systemd minimale :
 
@@ -84,7 +86,7 @@ Pas de serveur du tout : un instantané de la base est embarqué en SQLite gzipp
 via sql.js dans le navigateur. Pratique pour un hébergement statique (Netlify, Pages, S3+CDN…).
 
 ```bash
-(cd app && npm run build)      # SPA à jour
+npm run build                  # WASM + SPA à jour
 npm run export:lite            # génère ../dist-lite/ (~7,4 Mo)
 ```
 

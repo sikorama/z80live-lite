@@ -1,8 +1,9 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { openStore } from '../../client/store.mjs';
-  import { assemble, beautifySource, parseDirectives, upsertDirectives } from '../../wasm/assemble.mjs';
+  import { assemble, beautifySource, parseDirectives, upsertDirectives, includePath } from '../../wasm/assemble.mjs';
   import { makeEditor, makeViewer } from './lib/editor.js';
+  import { ANSI, severity, parseSourceRef, matchInclude } from './lib/diagnostics.js';
   import { ping as pingAmspirit, injectSna } from './lib/amspirit.js';
 
   let store = $state(null);
@@ -18,7 +19,22 @@
   let isInclude = $state(false), incFilename = $state(''); // fichier librairie (sans point d'entrée), injecté dans le FS wasm des autres sources
   let includeCache = null; // liste des sources is_include=1 ({id,name,filename,code}), rafraîchie à chaque run()
   let logLines = $state([]);
+  // Journal d'assemblage : logé sous l'éditeur par défaut, mais déplacé dans la colonne de
+  // l'émulateur quand celle-ci est vide (échec d'assemblage) ou sur demande (bouton 🗒),
+  // pour lire les erreurs sans rogner l'éditeur.
+  let logBig = $state(false);
+  let logH = $state(120);            // hauteur (px) du journal quand il reste sous l'éditeur
+  let showWarnings = $state(true);   // les avertissements sont masquables : sur une source qui en
+                                     // crache trente, ils noient les deux lignes qui comptent
   let lineOffset = 0; // nb de lignes d'en-tête injectées avant le code utilisateur par le dernier build
+  // Identité de la source ASSEMBLÉE par le dernier run(). Le journal peut survivre à un
+  // changement de source (on ouvre l'include fautif sans réassembler) : sans ça, une ligne
+  // pointant sur le fichier principal n'aurait plus rien à quoi revenir.
+  let mainId = null, mainName = $state('');
+  // Historique des sources ouvertes : [{ id, name, line }], `line` = où était le curseur en
+  // partant, pour revenir à l'endroit quitté et pas en tête de fichier.
+  let history = $state([]);
+  let pendingNav = $state(null); // { ref, back } — navigation suspendue à une confirmation
   let emuUrl = $state('');
   let busy = $state(false);
   let dlUrl = $state('');
@@ -45,17 +61,26 @@
   let collapsed = $state({});
   const GROUP_LABEL = { author: 'auteur inconnu', group_name: '(sans groupe)', buildmode: '(type ?)', assembler: 'rasm (défaut)', genre: '(non classé)' };
 
+  // Les librairies (is_include) forment toujours leur propre groupe, en queue de liste, quel
+  // que soit le critère : ce ne sont pas des programmes, on ne les ouvre pas pour les lancer.
+  // Réparties par auteur ou par genre, elles diluaient les sources exécutables — et elles
+  // sont nombreuses. En bloc et repliable, elles se sortent du chemin d'un seul clic.
+  const LIB_GROUP = '🧩 librairies';
+
   const groups = $derived.by(() => {
-    if (!groupBy) return [{ key: null, items: sources }];
+    const libs = sources.filter((s) => s.is_include);
+    const rest = sources.filter((s) => !s.is_include);
+    const tail = libs.length ? [{ key: LIB_GROUP, items: libs }] : [];
+    if (!groupBy) return [...(rest.length ? [{ key: null, items: rest }] : []), ...tail];
     const map = new Map();
-    for (const s of sources) {
+    for (const s of rest) {
       const k = s[groupBy] || GROUP_LABEL[groupBy] || '(vide)';
       if (!map.has(k)) map.set(k, []);
       map.get(k).push(s);
     }
-    return [...map.entries()]
+    return [...[...map.entries()]
       .sort((a, b) => String(a[0]).localeCompare(String(b[0]), 'fr'))
-      .map(([key, items]) => ({ key, items }));
+      .map(([key, items]) => ({ key, items })), ...tail];
   });
   const toggle = (k) => { collapsed = { ...collapsed, [k]: !collapsed[k] }; };
 
@@ -88,6 +113,8 @@
   let amspiritEnabled = $state(false);
   let amspiritUrl = $state('http://127.0.0.1:8765');
   let amspiritConnected = $state(false);
+  const emuCol = $derived(!(amspiritEnabled && amspiritConnected)); // la colonne de droite existe-t-elle ?
+  const logAside = $derived(emuCol && (logBig || !emuUrl));  // journal déplacé à droite
   let amspiritTimer;
 
   function loadSettings() {
@@ -154,21 +181,34 @@
     createFantams: async (o) => (await loadWasm('fantams.mjs')).default(o),
   };
 
-  // Numéro de ligne (1-indexé) dans la source *assemblée* (avec en-tête), pour les 3 formats
-  // d'erreur rencontrés : rasm "[fichier:12]", sjasmplus "fichier(12):", fantams "fichier:12:".
-  function parseSourceLine(text) {
-    let m = /\[[^\]]*:(\d+)\]/.exec(text);
-    if (!m) m = /^[^\s:()]+\((\d+)\):/.exec(text);
-    if (!m) m = /^[^\s:()]+:(\d+):/.exec(text);
-    return m ? parseInt(m[1], 10) : null;
+  // Traduit le fichier cité par un diagnostic en SOURCE de la base. Les librairies sont
+  // écrites dans le FS wasm sous includePath(), le fichier principal sous '/in.asm' — c'est
+  // le seul à porter l'en-tête injecté, donc le seul auquel `lineOffset` s'applique. Un
+  // fichier inconnu retombe sur la source courante, comme avant.
+  function resolveRef(text) {
+    const r = parseSourceRef(text);
+    if (!r) return null;
+    const inc = matchInclude(r.file, includeCache, includePath);
+    if (inc) return { srcId: inc.id, name: inc.name, line: r.line, file: r.file };
+    return { srcId: mainId, name: mainName, line: r.line - lineOffset, file: r.file };
   }
 
-  // `srcLine` : numéro de ligne dans la source assemblée (avec en-tête), si applicable — recalé
-  // sur la ligne de l'éditeur (sans en-tête) via lineOffset avant d'être stocké.
-  const log = (m, cls = '', srcLine = null) => {
-    const editorLine = srcLine != null ? srcLine - lineOffset : null;
-    logLines = [...logLines, { m: m.replace(/\x1b\[[0-9;]*m/g, ''), cls, line: editorLine > 0 ? editorLine : null }];
+  // `ref` : { srcId, name, line, file } déjà recalé sur les lignes de l'ÉDITEUR (resolveRef a
+  // retiré l'en-tête injecté). Une ligne <= 0 désigne l'en-tête lui-même, que l'auteur n'a pas
+  // écrit : elle n'est pas cliquable.
+  const log = (m, cls = '', ref = null) => {
+    logLines = [...logLines, { m: m.replace(ANSI, ''), cls, ref: ref && ref.line > 0 ? ref : null }];
   };
+
+  // Le compte ne porte que sur les diagnostics de l'ASSEMBLEUR ('err'/'warn'). Les échecs
+  // propres à l'application (injection, service worker) sont en 'fail' : rouges eux aussi,
+  // mais hors décompte — annoncer « 2 erreurs » pour une seule erreur de source et son
+  // résumé ferait chercher au lecteur une deuxième ligne qui n'existe pas.
+  const errCount  = $derived(logLines.filter((l) => l.cls === 'err').length);
+  const warnCount = $derived(logLines.filter((l) => l.cls === 'warn').length);
+  // Le filtre ne touche QUE les avertissements : masquer une erreur laisserait un journal
+  // qui ment sur l'échec qu'il rapporte.
+  const shownLines = $derived(showWarnings ? logLines : logLines.filter((l) => l.cls !== 'warn'));
 
   async function initSW() {
     if (!('serviceWorker' in navigator)) return;
@@ -209,7 +249,14 @@
     sources = await store.list({ q: query || undefined, buildmode: 'sna', limit: 300 });
   }
 
-  async function selectSource(id) {
+  // `run` : assembler après l'ouverture (le geste « je choisis cette source »). Une navigation
+  // depuis le journal passe run:false — réassembler effacerait justement le journal qui a
+  // envoyé le lecteur ici. `line` place le curseur, `push` empile la source quittée.
+  async function selectSource(id, { run: doRun = true, line = null, push = true } = {}) {
+    if (push && selected?.id && selected.id !== id) {
+      const prev = { id: selected.id, name: selected.name, line: editor?.cursorLine || 1 };
+      history = [...history, prev].slice(-20);
+    }
     const s = await store.get(id);
     selected = s;
     setCode(s.code || '');
@@ -221,7 +268,45 @@
     entry = d.entryPoint || s.entry_point || '';
     base = d.base && d.base !== 'none' ? d.base : '';
     isInclude = !!s.is_include; incFilename = s.filename || '';
-    await run(); // charge -> assemble -> envoie à l'émulateur en un clic
+    if (line != null) { await tick(); editor.gotoLine(line); }
+    if (doRun) await run(); // charge -> assemble -> envoie à l'émulateur en un clic
+  }
+
+  // ---- Navigation depuis le journal (l'erreur est souvent dans un fichier inclus) ----
+
+  // Clic sur une ligne du journal. Même fichier : simple saut. Autre fichier : ouverture —
+  // précédée d'une confirmation si le tampon courant a des modifications non enregistrées,
+  // parce que changer de source remplace le tampon.
+  async function gotoRef(ref) {
+    if (!ref) return;
+    if (!ref.srcId || ref.srcId === selected?.id) { editor.gotoLine(ref.line); return; }
+    await navigate(ref, { back: false });
+  }
+
+  async function navigate(ref, { back = false } = {}) {
+    if (dirty) { pendingNav = { ref, back }; return; }
+    pendingNav = null;
+    if (back) history = history.slice(0, -1);
+    await selectSource(ref.srcId, { run: false, line: ref.line, push: !back });
+  }
+
+  // Retour au fichier précédent, à la ligne d'où on était parti. Dépile : re-empiler ferait
+  // de la flèche une bascule entre deux fichiers au lieu d'un historique.
+  const goBack = () => {
+    const prev = history[history.length - 1];
+    if (prev) navigate({ srcId: prev.id, name: prev.name, line: prev.line }, { back: true });
+  };
+
+  // Réponses de la popup de confirmation.
+  async function navSave() {
+    const p = pendingNav; pendingNav = null;
+    try { await save(); } catch (e) { log('⚠ sauvegarde impossible : ' + (e?.message || e), 'fail'); return; }
+    if (p) { dirty = false; await navigate(p.ref, { back: p.back }); }
+  }
+  async function navDiscard() {
+    const p = pendingNav; pendingNav = null;
+    dirty = false; // l'abandon est explicite : sans ça, navigate() redemanderait
+    if (p) await navigate(p.ref, { back: p.back });
   }
 
   function newSource() {
@@ -232,9 +317,19 @@
     isInclude = false; incFilename = '';
   }
 
+  // Redimensionnement du journal (quand il est sous l'éditeur) : on suit le pointeur.
+  function startResize(e) {
+    e.preventDefault();
+    const y0 = e.clientY, h0 = logH;
+    const move = (ev) => { logH = Math.max(60, Math.min(window.innerHeight - 200, h0 + (y0 - ev.clientY))); };
+    const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+    window.addEventListener('pointermove', move); window.addEventListener('pointerup', up);
+  }
+
   async function run() {
     savedListScroll = listEl ? listEl.scrollTop : 0; // à préserver malgré le lancement de l'émulateur
     busy = true; logLines = []; log('Assemblage…');
+    mainId = selected?.id ?? null; mainName = selected?.name || 'source courante';
     const cfg = { assembler: asm || undefined, buildmode, entryPoint: entry || undefined,
                   base: base || undefined };
     const up = upsertDirectives(editor.value, cfg);  // maintien de la ligne ;z80:
@@ -251,9 +346,13 @@
       lineOffset = res.lineOffset || 0;
       const built = res.ok && !!res.output;
       applyStatus(built); // met à jour l'indicateur (liste + source courante, + base en mode complet)
-      for (const l of res.log.slice(-12)) log(l, 'muted', parseSourceLine(l));
-      if (res.error) log('⚠ ' + res.error, 'err', parseSourceLine(res.error));
-      if (!built) { log(`❌ Échec (${res.assembler}) — ${dt} ms`, 'err'); busy = false; return; }
+      for (const l of res.log.slice(built ? -12 : -400)) log(l, severity(l), resolveRef(l)); // en cas d'échec, tout garder
+      if (res.error) log('⚠ ' + res.error, 'err', resolveRef(res.error));
+      if (!built) {
+        log(`❌ Échec (${res.assembler}) — ${dt} ms`, 'fail');
+        emuUrl = ''; // l'émulateur affichait le binaire précédent : on libère la colonne pour le journal
+        busy = false; return;
+      }
       log(`✔ ${res.assembler} → .${res.ext} ${res.output.length} o en ${dt} ms`, 'ok');
       if (dlUrl) URL.revokeObjectURL(dlUrl);
       dlExt = res.ext || 'sna';
@@ -265,14 +364,14 @@
           log('✔ injecté dans AMSpiriT', 'ok');
         } catch (e) {
           amspiritConnected = false; // la sonde périodique retentera la connexion
-          log('⚠ injection AMSpiriT échouée : ' + (e?.message || e), 'err');
+          log('⚠ injection AMSpiriT échouée : ' + (e?.message || e), 'fail');
         }
       } else {
         const url = await feedEmulator(res.output, res.ext);
         if (url) emuUrl = `/emu/tiny8bit/cpc.html?file=${encodeURIComponent(url)}`;
-        else log('Service Worker indisponible — utilisez le téléchargement.', 'err');
+        else log('Service Worker indisponible — utilisez le téléchargement.', 'fail');
       }
-    } catch (e) { log('Erreur: ' + (e?.message || e), 'err'); }
+    } catch (e) { log('Erreur: ' + (e?.message || e), 'fail'); emuUrl = ''; }
     busy = false;
     await tick(); restoreListScroll(); // rétablit la position des vignettes après le rendu du panneau/iframe
   }
@@ -316,21 +415,48 @@
     const before = editor.value;
     busy = true;
     try {
-      const r = await beautifySource(before, factories);
+      // Les mêmes includes que pour l'assemblage : la mise en forme a besoin de
+      // leurs macros pour ne pas prendre un appel nu pour un label. Le cache n'est
+      // rempli que par run() — sans ce repli, mettre en forme avant d'avoir
+      // assemblé une fois se ferait à l'aveugle sur les bibliothèques.
+      if (!includeCache) {
+        try { includeCache = await store.listIncludes(); } catch { includeCache = []; }
+      }
+      const incs = (includeCache || []).filter((i) => i.id !== selected?.id);
+      const r = await beautifySource(before, factories, incs);
       if (!r.ok || r.code === null) {
-        log('⚠ Mise en forme impossible : ' + (r.error || r.log.slice(-1)[0] || 'échec de fantams'), 'err');
+        log('⚠ Mise en forme impossible : ' + (r.error || r.log.slice(-1)[0] || 'échec de fantams'), 'fail');
         return;
       }
       if (r.code === before) { log('Déjà en forme.', 'muted'); return; }
-      const line = editor.cursorLine;      // la mise en forme préserve les lignes…
+      // La règle 3 du beautify détache « label: instruction » en deux lignes
+      // (ADR 0017), donc la mise en forme n'est plus bijective sur les lignes :
+      // le curseur descend d'autant de lignes qu'il y a de labels collés AU-DESSUS
+      // de la sienne. Rien d'autre n'en dépend — l'assembleur travaille sur la
+      // provenance des lignes préprocessées, pas sur ce texte.
+      const line = editor.cursorLine;
       editor.value = r.code;
-      editor.gotoLine(line);               // …donc le curseur retrouve la sienne
+      editor.gotoLine(line + countDetachedBefore(before, line));
       log('Mis en forme.', 'ok');
     } catch (e) {
-      log('⚠ Mise en forme impossible : ' + (e?.message || e), 'err');
+      log('⚠ Mise en forme impossible : ' + (e?.message || e), 'fail');
     } finally {
       busy = false;
     }
+  }
+
+  // Lignes que le détachement va couper, strictement avant `line1` (1-indexée).
+  // Miroir de la règle 3 : un identifiant, son deux-points, puis du code — le
+  // deux-points est ce qui lève le doute avec un appel de macro (« sprite 4,12 »).
+  const GLUED_LABEL = /^\s*[A-Za-z_.@][\w.@]*\s*:\s*\S/;
+  function countDetachedBefore(text, line1) {
+    const lines = text.split('\n');
+    let n = 0;
+    for (let i = 0; i < Math.min(line1 - 1, lines.length); i++) {
+      const code = lines[i].split(';')[0];
+      if (GLUED_LABEL.test(code)) n++;
+    }
+    return n;
   }
 
   async function openPre() {
@@ -340,7 +466,7 @@
     if (preEl) { preViewer?.destroy(); preViewer = makeViewer(preEl, preText); }
   }
   function closePre() { showPre = false; preViewer?.destroy(); preViewer = null; }
-  async function copyPre() { try { await navigator.clipboard.writeText(preText); log('Copié.', 'ok'); } catch { log('Copie refusée par le navigateur.', 'err'); } }
+  async function copyPre() { try { await navigator.clipboard.writeText(preText); log('Copié.', 'ok'); } catch { log('Copie refusée par le navigateur.', 'fail'); } }
 
   onMount(async () => {
     // --- DIAGNOSTIC TEMPORAIRE : trace la cause d'un rechargement de page ---
@@ -407,6 +533,26 @@
   {#if canWrite}<button onclick={newSource}>+ Nouveau</button>{/if}
 </header>
 
+<!-- Le journal vit à deux endroits (sous l'éditeur, ou dans la colonne de l'émulateur) :
+     un seul snippet, pour que le compte et le filtre soient les mêmes des deux côtés. -->
+{#snippet logPane(style)}
+  <div class="logwrap" style={style}>
+    {#if errCount || warnCount}
+      <div class="logbar">
+        {#if errCount}<span class="err">❌ {errCount} erreur{errCount > 1 ? 's' : ''}</span>{/if}
+        {#if warnCount}
+          <span class="warn">⚠ {warnCount} avertissement{warnCount > 1 ? 's' : ''}</span>
+          <button class="flt" class:off={!showWarnings} onclick={() => showWarnings = !showWarnings}
+            title="Masquer les avertissements pour ne garder que les erreurs">{showWarnings ? 'masquer' : 'afficher'}</button>
+        {/if}
+      </div>
+    {/if}
+    <pre class="log">{#each shownLines as l}<span class={l.cls} class:goto={!!l.ref} class:other={!!l.ref && l.ref.srcId && l.ref.srcId !== selected?.id}
+      title={l.ref ? (l.ref.srcId && l.ref.srcId !== selected?.id ? `Ouvrir « ${l.ref.name} » ligne ${l.ref.line}` : `Aller ligne ${l.ref.line}`) : null}
+      onclick={() => gotoRef(l.ref)}>{l.m}</span>{'\n'}{/each}</pre>
+  </div>
+{/snippet}
+
 <main class:no-list={!showList} class:no-emu={amspiritEnabled && amspiritConnected}>
   <button class="listtoggle" onclick={() => showList = !showList}
     title={showList ? 'Masquer la liste des sources' : 'Afficher la liste des sources'}>{showList ? '⟨' : '⟩'}</button>
@@ -447,6 +593,7 @@
         <button class="ico" class:dirty onclick={save} title={dirty ? 'Sauvegarder (modifications non enregistrées)' : 'Sauvegarder'}>💾</button>
         {#if selected?.id}<button class="ico" onclick={fork} title="Forker">⑂</button>{/if}
       {/if}
+      <button class="ico" class:primary={logBig} onclick={() => logBig = !logBig} title="Agrandir le journal d'assemblage (colonne de droite)">🗒</button>
       <button class="ico" onclick={beautify} disabled={busy} title="Mettre en forme (Alt+Maj+F)">¶</button>
       {#if preText}<button class="ico" onclick={openPre} title="Code après préprocesseur">⧉</button>{/if}
       {#if dlUrl}<a class="ico dl" href={dlUrl} download={dlName} title="Télécharger le .{dlExt}">⬇</a>{/if}
@@ -456,6 +603,10 @@
       <div class="meta">
         <span class="st" class:ok={selected.build_status === 'ok'} class:ko={selected.build_status === 'fail'}
           title="État d'assemblage">{isInclude ? '🧩 librairie (incluse par les autres sources)' : selected.build_status === 'ok' ? '✅ assemble' : selected.build_status === 'fail' ? '❌ échoue' : selected.build_status === 'external-dep' ? '📦 dépend. externe' : '— non testé'}</span>
+        {#if history.length}
+          <button class="back" onclick={goBack}
+            title={`Revenir à « ${history[history.length - 1].name} » (ligne ${history[history.length - 1].line})`}>←</button>
+        {/if}
         <span class="t">{selected.name}</span>
         <span class="by">{selected.author ? 'par ' + selected.author : 'auteur inconnu'}</span>
         {#if selected.owner && selected.owner !== selected.author}<span class="tags">(owner: {selected.owner})</span>{/if}
@@ -471,16 +622,46 @@
 
     <div class="editor" bind:this={editorEl}></div>
 
-    <pre class="log">{#each logLines as l}<span class={l.cls} class:goto={l.line != null} onclick={() => l.line != null && editor.gotoLine(l.line)}>{l.m}</span>{'\n'}{/each}</pre>
+    {#if !logAside}
+      <div class="split" role="separator" aria-orientation="horizontal" tabindex="-1" onpointerdown={startResize} title="Glisser pour redimensionner le journal"></div>
+      {@render logPane(`flex: 0 0 ${logH}px`)}
+    {/if}
   </section>
 
-  {#if !(amspiritEnabled && amspiritConnected)}
+  {#if emuCol}
   <section class="emu">
-    {#if emuUrl}<iframe title="émulateur" src={emuUrl} allow="autoplay; gamepad" onload={restoreListScroll}></iframe>
-    {:else}<div class="ph">L'émulateur s'affichera ici après l'assemblage.</div>{/if}
+    {#if logAside}
+      {@render logPane('flex: 1; min-height: 0')}
+      {#if emuUrl}<button class="ico" onclick={() => logBig = false}>↩ revenir à l'émulateur</button>{/if}
+    {/if}
+    <!-- l'iframe reste montée (masquée) : la démonter relancerait l'émulateur à chaque bascule -->
+    {#if emuUrl}<iframe class:hidden={logAside} title="émulateur" src={emuUrl} allow="autoplay; gamepad" onload={restoreListScroll}></iframe>
+    {:else if !logAside}<div class="ph">L'émulateur s'affichera ici après l'assemblage.</div>{/if}
   </section>
   {/if}
 </main>
+
+<!-- Changer de source remplace le tampon de l'éditeur : quand il porte des modifications non
+     enregistrées, la navigation s'arrête ici plutôt que de les perdre en silence. -->
+{#if pendingNav}
+<div class="modal" onclick={() => pendingNav = null} role="presentation">
+  <div class="dialog small" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dhead"><span>Modifications non enregistrées</span></div>
+    <div class="confirm">
+      <p>
+        « {selected?.name || 'la source courante'} » a des modifications non enregistrées.
+        Ouvrir « {pendingNav.ref.name} »{#if pendingNav.ref.line} ligne {pendingNav.ref.line}{/if} les perdra.
+      </p>
+      <div class="actions">
+        <button onclick={() => pendingNav = null}>Annuler</button>
+        <span class="grow"></span>
+        <button onclick={navDiscard}>Ouvrir sans sauvegarder</button>
+        {#if canWrite}<button class="primary" onclick={navSave}>Sauvegarder et ouvrir</button>{/if}
+      </div>
+    </div>
+  </div>
+</div>
+{/if}
 
 {#if showSettings && selected}
 <div class="modal" onclick={applySettings} role="presentation">
@@ -626,10 +807,28 @@
   .editor { flex: 1; min-height: 0; overflow: hidden; border: 1px solid #333; border-radius: 6px; }
   :global(.editor .cm-editor) { height: 100%; }
   :global(.editor .cm-scroller) { overflow: auto; } /* le défilement du code reste dans l'éditeur */
-  .log { flex: 0 0 120px; overflow: auto; margin: 0; background: #0d0f10; border: 1px solid #333; border-radius: 6px; padding: 6px; font-size: 11.5px; white-space: pre-wrap; }
-  .log .ok { color: #7f7; } .log .err { color: #f88; } .log .muted { color: #89a; }
+  .split { flex: 0 0 6px; cursor: row-resize; border-radius: 3px; background: #2a2f34; }
+  .split:hover { background: #3d6; }
+  .logwrap { display: flex; flex-direction: column; min-height: 0; gap: 4px; }
+  /* La barre annonce le compte AVANT le filtre : masquer les avertissements ne doit jamais
+     donner l'impression qu'il n'y en avait pas. */
+  .logbar { display: flex; align-items: center; gap: 10px; font-size: 11.5px; }
+  .logbar .err { color: #f88; } .logbar .warn { color: #fc6; }
+  .flt { background: none; border: 1px solid #444; border-radius: 4px; color: #89a; cursor: pointer; font-size: 10.5px; padding: 1px 6px; }
+  .flt:hover { border-color: #666; color: #cde; }
+  .flt.off { border-color: #fc6; color: #fc6; }
+  .log { flex: 1; overflow: auto; margin: 0; background: #0d0f10; border: 1px solid #333; border-radius: 6px; padding: 6px; font-size: 11.5px; white-space: pre-wrap; }
+  .log .ok { color: #7f7; } .log .err, .log .fail { color: #f88; } .log .warn { color: #fc6; } .log .muted { color: #89a; }
   .log .goto { cursor: pointer; text-decoration: underline dotted; text-decoration-color: currentColor; }
+  /* Une ligne qui MÈNE AILLEURS se distingue : le clic va changer le contenu de l'éditeur. */
+  .log .goto.other { text-decoration-style: solid; }
+  .back { background: none; border: 1px solid #444; border-radius: 4px; color: #89a; cursor: pointer; font-size: 12px; line-height: 1; padding: 1px 5px; margin-right: 4px; }
+  .back:hover { border-color: #7cf; color: #7cf; }
+  .confirm { padding: .8rem; display: flex; flex-direction: column; gap: .8rem; font-size: 13px; }
+  .confirm p { margin: 0; color: #cfe3ff; }
+  .confirm .actions { display: flex; align-items: center; gap: .5rem; }
   .log .goto:hover { background: #ffffff12; }
+  .emu iframe.hidden { display: none; }
   .emu iframe { flex: 1; width: 100%; height: 100%; border: 1px solid #333; border-radius: 6px; background: #000; }
   .emu .ph { flex: 1; display: grid; place-items: center; color: #567; border: 1px dashed #334; border-radius: 6px; }
   .modal { position: fixed; inset: 0; background: #000a; display: grid; place-items: center; z-index: 50; }

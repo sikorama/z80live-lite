@@ -106,21 +106,98 @@ bool isBankRef(const std::string &tok) {
     return true;
 }
 
-std::string canonicalJump(const std::string &stmt) {
+// Découpe « mn a,b » en son mnémonique (casse d'origine), son label éventuel et
+// ses deux opérandes en MAJUSCULES. Rend false si la forme n'est pas celle-là.
+// Les quatre orthographes à deux mots ci-dessous en ont toutes besoin.
+namespace {
+bool peelBinary(const std::string &stmt, const std::string &upperMnemo,
+                std::string &head, std::string &mnemoTok,
+                std::string &A, std::string &B) {
     std::string label, rest;
     peelLabel(stmt, label, rest, Phase::Assembly);
-    if (upper(firstToken(rest)) != "LD") return stmt;
-    const std::string ops = trim(rest.substr(firstToken(rest).size()));
+    mnemoTok = firstToken(rest);
+    if (upper(mnemoTok) != upperMnemo) return false;
+    const std::string ops = trim(rest.substr(mnemoTok.size()));
     const size_t comma = ops.find(',');
-    if (comma == std::string::npos) return stmt;
-    if (upper(trim(ops.substr(0, comma))) != "PC") return stmt;
-    const std::string src = upper(trim(ops.substr(comma + 1)));
-    if (src != "HL" && src != "IX" && src != "IY") return stmt;
-    const std::string head = label.empty() ? std::string() : label + ": ";
-    // La casse suit celle du « ld » d'origine, comme les autres orthographes.
-    const bool up = firstToken(rest) == upper(firstToken(rest));
-    std::string lo = src; for (char &ch : lo) ch = (char)std::tolower((unsigned char)ch);
-    return head + (up ? "JP (" + src + ")" : "jp (" + lo + ")");
+    if (comma == std::string::npos) return false;
+    A = upper(trim(ops.substr(0, comma)));
+    B = upper(trim(ops.substr(comma + 1)));
+    head = label.empty() ? std::string() : label + ": ";
+    return true;
+}
+// La casse du canon épouse celle du mnémonique d'origine, comme partout ailleurs.
+std::string casedAs(const std::string &mnemoTok, const std::string &canonUpper) {
+    if (mnemoTok == upper(mnemoTok)) return canonUpper;
+    std::string lo = canonUpper;
+    for (char &ch : lo) ch = (char)std::tolower((unsigned char)ch);
+    return lo;
+}
+} // namespace
+
+std::string canonicalJump(const std::string &stmt) {
+    std::string head, mnemoTok, A, B;
+    // « ld pc,hl » : l'orthographe porte sur DEUX mots.
+    if (peelBinary(stmt, "LD", head, mnemoTok, A, B) && A == "PC" &&
+        (B == "HL" || B == "IX" || B == "IY"))
+        return head + casedAs(mnemoTok, "JP (" + B + ")");
+    // « jp hl » : la forme de rasm, sans les parenthèses. Un pour un lui aussi,
+    // et le canon reste `jp (hl)` pour la raison dite dans l'en-tête.
+    {
+        std::string label, rest;
+        peelLabel(stmt, label, rest, Phase::Assembly);
+        const std::string tok = firstToken(rest);
+        if (upper(tok) == "JP") {
+            const std::string op = upper(trim(rest.substr(tok.size())));
+            if (op == "HL" || op == "IX" || op == "IY")
+                return (label.empty() ? std::string() : label + ": ") +
+                       casedAs(tok, "JP (" + op + ")");
+        }
+    }
+    return stmt;
+}
+
+// Les orthographes de `EX`. Trois d'entre elles sont un simple échange de
+// l'ordre des opérandes — l'instruction est symétrique, la notation ne l'est
+// pas — et la quatrième est l'apostrophe oubliée de `ex af,af'`.
+//
+// Cette dernière est la seule tolérance du projet dont la lecture littérale
+// désigne une AUTRE opération : « ex af,af » dit « échanger AF avec lui-même »,
+// c'est-à-dire un `nop`. C'est pourquoi elle est la seule à être signalée par un
+// avertissement (le préprocesseur s'en charge, seul étage à voir la source telle
+// qu'elle est écrite) : on avertit quand le texte ment, pas quand il se démode.
+std::string canonicalEx(const std::string &stmt) {
+    std::string head, mnemoTok, A, B;
+    if (!peelBinary(stmt, "EX", head, mnemoTok, A, B)) return stmt;
+    if (A == "HL" && B == "DE")    return head + casedAs(mnemoTok, "EX DE,HL");
+    if (A == "HL" && B == "(SP)")  return head + casedAs(mnemoTok, "EX (SP),HL");
+    if (A == "IX" && B == "(SP)")  return head + casedAs(mnemoTok, "EX (SP),IX");
+    if (A == "IY" && B == "(SP)")  return head + casedAs(mnemoTok, "EX (SP),IY");
+    if (A == "AF" && B == "AF")    return head + casedAs(mnemoTok, "EX AF,AF'");
+    return stmt;
+}
+
+bool isMissingPrimeEx(const std::string &stmt) {
+    std::string head, mnemoTok, A, B;
+    return peelBinary(stmt, "EX", head, mnemoTok, A, B) && A == "AF" && B == "AF";
+}
+
+std::string canonicalOrthography(const std::string &stmt) {
+    const std::string j = canonicalJump(stmt);
+    if (j != stmt) return j;
+    return canonicalEx(stmt);
+}
+
+// Les mnémoniques SANS opérande. `RET` et `IM` n'en sont pas : ils en prennent
+// un (une condition, un mode), et un compteur y serait ambigu.
+bool isOperandLessMnemonic(const std::string &upperTok) {
+    static const std::set<std::string> s = {
+        "NOP", "HALT", "DI", "EI", "EXX",
+        "LDI", "LDIR", "LDD", "LDDR", "CPI", "CPIR", "CPD", "CPDR",
+        "INI", "INIR", "IND", "INDR", "OUTI", "OTIR", "OUTD", "OTDR",
+        "RLCA", "RRCA", "RLA", "RRA", "RLD", "RRD",
+        "DAA", "CPL", "NEG", "CCF", "SCF", "RETI", "RETN",
+    };
+    return s.count(upperTok) != 0;
 }
 
 bool parenCall(const std::string &s, std::string &name, std::string &args) {

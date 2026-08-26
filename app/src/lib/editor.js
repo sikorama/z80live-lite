@@ -3,6 +3,32 @@ import { EditorView, basicSetup } from 'codemirror';
 import { EditorState } from '@codemirror/state';
 import { StreamLanguage } from '@codemirror/language';
 import { z80 } from '@codemirror/legacy-modes/mode/z80';
+
+// Le mode amont ne reconnait comme litteral que "..." ; il ne matche pour '
+// qu'un caractere unique (/\\?.'/), qu'il colorise en NOMBRE, et laisse le
+// flux AU MILIEU d'un 'hello' — d'ou une ligne mal tokenisee en cascade.
+//
+// Dans fantams les deux delimiteurs designent le meme objet (ADR 0010), donc
+// la meme couleur. On traite les litteraux nous-memes et on delegue le reste
+// tel quel : forker la table de mnemoniques amont ne se justifierait pas.
+const z80Strings = {
+  ...z80,
+  token(stream, state) {
+    const q = stream.peek();
+    if (q === '"' || q === "'") {
+      stream.next();
+      // Un litteral court jusqu'a la prochaine occurrence de SON delimiteur ;
+      // l'autre y est un caractere ordinaire.
+      let c;
+      while ((c = stream.next()) != null) {
+        if (c === q) break;
+        if (c === '\\') stream.next();
+      }
+      return 'string'; // non termine compris : la couleur montre l'oubli
+    }
+    return z80.token(stream, state);
+  },
+};
 import { keymap } from '@codemirror/view';
 import { insertTab, indentLess } from '@codemirror/commands';
 
@@ -26,7 +52,7 @@ export function makeEditor(parent, doc, onChange) {
     extensions: [
       basicSetup,
       tabKeymap,
-      StreamLanguage.define(z80),
+      StreamLanguage.define(z80Strings),
       dark,
       EditorView.updateListener.of((u) => { if (u.docChanged && onChange) onChange(view.state.doc.toString()); }),
     ],
@@ -34,8 +60,9 @@ export function makeEditor(parent, doc, onChange) {
   return {
     get value() { return view.state.doc.toString(); },
     set value(v) { view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: v || '' } }); },
-    // Ligne 1-indexée du curseur. La mise en forme étant bijective sur les lignes
-    // (ADR 0013), c'est ce qu'il suffit de retenir pour y revenir après.
+    // Ligne 1-indexée du curseur. La mise en forme n'est plus bijective sur les
+    // lignes depuis qu'elle détache les labels (ADR 0017) : l'appelant corrige le
+    // décalage, cf. `countDetachedBefore` dans App.svelte.
     get cursorLine() {
       return view.state.doc.lineAt(view.state.selection.main.head).number;
     },
@@ -58,7 +85,7 @@ export function makeViewer(parent, doc) {
     doc: doc || '',
     extensions: [
       basicSetup,
-      StreamLanguage.define(z80),
+      StreamLanguage.define(z80Strings),
       dark,
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),

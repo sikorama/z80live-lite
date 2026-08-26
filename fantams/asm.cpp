@@ -600,9 +600,14 @@ private:
         if (!label.empty() && label[0] != '.' && !isDefinition) currentGlobal_ = label;
 
         // L'assembleur TOLÈRE des orthographes, jamais des structures (ADR 0017) :
-        // « ld pc,hl » est acceptée ici au même titre que « defb », sans que la
-        // canonisation ait eu à passer. Un pour un, un octet, aucune adresse.
-        parser::Result pr = parser::parseLine(kw::canonicalJump(code));
+        // « ld pc,hl », « jp hl », « ex hl,de » sont acceptées ici au même titre que
+        // « defb », sans que la canonisation ait eu à passer. Un pour un, un octet,
+        // aucune adresse.
+        //
+        // Elles sont muettes ici, y compris `ex af,af'` sans son apostrophe :
+        // l'avertissement appartient au préprocesseur, seul étage à voir la source
+        // telle qu'elle est écrite (ADR 0017, même argument que pour `--strict`).
+        parser::Result pr = parser::parseLine(kw::canonicalOrthography(code));
         if (pr.isInstruction) {
             if (!label.empty()) defineLabel(label);
             else if (cur_.col0)

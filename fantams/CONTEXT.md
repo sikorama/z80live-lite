@@ -118,8 +118,11 @@ pris un à un.
 ### Portée
 
 **Scope auto-local** :
-Règle rendant unique, à chaque expansion, tout label défini dans un corps de
-macro ou une itération de boucle. `@@export` y fait exception.
+Règle rendant unique, à chaque expansion, un label **préfixé par `@`** défini dans
+un corps de macro ou une itération de boucle. Un label sans le préfixe n'est pas
+renommé : réutilisé d'une expansion à l'autre, il reste une vraie collision.
+`@@export` sort un label du renommage, pour que toutes les expansions partagent un
+seul nom — il ne concerne donc que les labels préfixés.
 _Éviter_ : scope local, renommage
 
 **Module** :
@@ -241,6 +244,14 @@ et la table des symboles en sont aussi.
 _Éviter_ : sortie, output, binaire
 
 ### Diagnostics
+
+**Diagnostic** :
+Une erreur, un avertissement ou un `PRINT` émis sur stderr, une ligne par
+diagnostic, au format `fichier:ligne: gravité: message`. La gravité est un
+**mot**, jamais une couleur : fantams n'émet aucune séquence ANSI, parce que sa
+sortie est lue autant par un hôte — le journal de z80 live, une CI — que par un
+terminal, et qu'un hôte qui veut colorer le fait à partir du mot.
+_Éviter_ : log, message d'erreur (qui exclut les deux autres gravités)
 
 **Listing** :
 La correspondance, ligne de source par ligne de source, entre banque, adresse
