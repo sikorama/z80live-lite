@@ -30,11 +30,7 @@ std::string trim(const std::string &s) {
     while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
     return s.substr(a, b - a);
 }
-bool isIdentifier(const std::string &s) {
-    if (s.empty() || std::isdigit((unsigned char)s[0])) return false;
-    for (char c : s) if (!isIdentChar(c)) return false;
-    return true;
-}
+using kw::isIdentifier;   // vit dans keywords.h, aux côtés de isIdentChar
 // Retire les commentaires bloc /* ... */ (peuvent s'étendre sur plusieurs lignes),
 // hors chaînes/caractères. Les '\n' à l'intérieur du bloc sont préservés pour ne
 // pas décaler la numérotation des lignes dans les diagnostics.
@@ -102,26 +98,6 @@ void peelLabel(const std::string &code, std::string &label, std::string &rest,
               const std::function<bool(const std::string &)> &isMacro = nullptr) {
     kw::peelLabel(code, label, rest, kw::Phase::Preprocess, nullptr, isMacro);
 }
-// Position d'un '=' d'assignation (pas ==, <=, >=, !=), hors chaîne.
-// Même règle qu'asm.cpp : les deux étages doivent s'accorder sur ce qui est une
-// définition, sans quoi le préprocesseur et l'assembleur liraient des sources
-// différentes. À factoriser dans un en-tête commun le jour où un troisième
-// appelant apparaît.
-size_t findAssign(const std::string &s) {
-    bool inStr = false; char q = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (inStr) { if (c == q) inStr = false; continue; }
-        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
-        if (c == '=') {
-            char prev = i > 0 ? s[i - 1] : 0, next = i + 1 < s.size() ? s[i + 1] : 0;
-            if (prev == '<' || prev == '>' || prev == '!' || prev == '=') continue;
-            if (next == '=') continue;
-            return i;
-        }
-    }
-    return std::string::npos;
-}
 // Découpe en respectant () [] {} "" ''.
 std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
     std::vector<std::string> out;
@@ -139,12 +115,20 @@ std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
     return out;
 }
 // Remplace `from` par `to`, uniquement sur des mots entiers.
+//
+// Un '.' qui SUIT le mot ne le prolonge pas : « plot.x » est une référence au local
+// « .x » du global « plot », pas un troisième identifiant. Renommer « plot » doit donc
+// l'emporter avec lui — sans quoi, sous MODULE, le label devient « gfx.plot.x » tandis
+// que « ld (plot.x+1),a » reste tel quel, et l'assembleur ne trouve plus rien.
+// Un '.' qui PRÉCÈDE, lui, prolonge bien : dans « a.plot », « plot » est le local de
+// « a » et n'a rien à voir avec le global du même nom.
 std::string replaceWord(const std::string &text, const std::string &from, const std::string &to) {
     std::string out; size_t i = 0;
     while (i < text.size()) {
         if (text.compare(i, from.size(), from) == 0 &&
             (i == 0 || !isIdentChar(text[i - 1])) &&
-            (i + from.size() >= text.size() || !isIdentChar(text[i + from.size()]))) {
+            (i + from.size() >= text.size() || !isIdentChar(text[i + from.size()]) ||
+             text[i + from.size()] == '.')) {
             out += to; i += from.size();
         } else out += text[i++];
     }
@@ -168,6 +152,19 @@ std::vector<std::string> splitStatements(const std::string &s, std::vector<std::
         if (c == ')' || c == ']' || c == '}') { if (depth > 0) --depth; cur += c; continue; }
         if (c == ':' && depth == 0) {
             std::string ident = trim(cur);
+            // « org b4:0x4000 » : ce ':' appartient a l'OPERANDE, pas au decoupage
+            // (ADR 0005). Sans ce test la ligne est coupee en « org b4: » et
+            // « 0x4000 », et le diagnostic parle d'une directive inconnue au lieu
+            // de parler de banques.
+            //
+            // Le prefixe se porte sur le parametre de RANGEMENT, donc le dernier :
+            // « org 0x4000,b4:0x3000 ». C'est le champ qui precede le ':' qu'il
+            // faut regarder, et non l'operande entiere — sinon la forme a deux
+            // parametres est coupee en « org 0x4000,b4: » et « 0x3000 ».
+            if (upper(firstToken(ident)) == "ORG") {
+                auto fields = splitTopLevel(restAfterFirst(ident), ',');
+                if (!fields.empty() && kw::isBankRef(trim(fields.back()))) { cur += c; continue; }
+            }
             bool glued = firstColon && !cur.empty() && isIdentChar(cur.back()) && isIdentifier(ident);
             if (glued && !isReservedWord(upper(ident))) {
                 cur += c; firstColon = false; continue; // vrai label collé : conservé
@@ -253,6 +250,10 @@ inline std::string matchCase(const std::string &orig, const std::string &canonLo
 // Réécrit le mot de tête d'une instruction (label éventuel conservé) dans son
 // orthographe canonique. Rend `stmt` inchangé si elle l'est déjà.
 std::string canonicalizeSpelling(const std::string &stmt) {
+    // « ld pc,hl » -> « jp (hl) » : une orthographe comme les autres (ADR 0017),
+    // simplement portée par deux mots au lieu d'un.
+    const std::string jz = kw::canonicalJump(stmt);
+    if (jz != stmt) return jz;
     std::string label, rest; peelLabel(stmt, label, rest);
     if (rest.empty()) return stmt;
     const std::string tok = firstToken(rest);
@@ -267,57 +268,34 @@ std::string canonicalizeSpelling(const std::string &stmt) {
 // Un bloc a un OUVREUR, une fermeture CANONIQUE et d'éventuelles fermetures
 // TOLÉRÉES, héritées de rasm et conservées en silence : elles sont omniprésentes
 // et, la correspondance étant désormais vérifiée, elles ne sont plus ambiguës.
-// `END` ferme le bloc ouvert le plus interne, quel qu'il soit.
-//
-// MODULE n'y figure pas : il bascule le module actif, il n'ouvre pas un bloc.
-struct BlockKind {
-    const char *kind;                  // nom du bloc dans les diagnostics
-    std::vector<const char *> openers; // mots qui l'ouvrent
-    std::vector<const char *> closers; // canonique en tête, puis les tolérées
-};
-
-const std::vector<BlockKind> &blockKinds() {
-    static const std::vector<BlockKind> t = {
-        {"IF",      {"IF", "IFDEF", "IFNDEF"}, {"ENDIF"}},
-        {"REPEAT",  {"REPEAT"},                {"ENDREPEAT", "REND"}},
-        {"WHILE",   {"WHILE"},                 {"ENDWHILE", "WEND"}},
-        {"FOR",     {"FOR"},                   {"ENDFOR"}},
-        {"MACRO",   {"MACRO"},                 {"ENDMACRO", "ENDM", "MEND"}},
-        {"STRUCT",  {"STRUCT"},                {"ENDSTRUCT", "ENDS"}},
-    };
-    return t;
-}
-
-// Le bloc qu'ouvre ce mot-clé, ou "".
-std::string blockOfOpener(const std::string &kw) {
-    for (const auto &b : blockKinds())
-        for (const char *o : b.openers) if (kw == o) return b.kind;
-    return "";
-}
-
-// Le bloc que ferme ce mot-clé, "*" pour `END` qui ferme n'importe lequel, ou "".
-std::string blockOfCloser(const std::string &kw) {
-    if (kw == "END") return "*";
-    for (const auto &b : blockKinds())
-        for (const char *c : b.closers) if (kw == c) return b.kind;
-    return "";
-}
-
-// La fermeture canonique d'un bloc, pour les diagnostics.
-std::string canonicalCloser(const std::string &kind) {
-    for (const auto &b : blockKinds()) if (kind == b.kind) return b.closers.front();
-    return "END";
-}
-
 struct Macro {
     std::string name;
     std::vector<std::string> params;
     std::vector<SrcLine> body;
 };
 
+// Un argument de macro, tel que l'ADR 0014 le veut : le TEXTE brut, que `{nom}`
+// substitue, et une VALEUR optionnelle calculee AU SITE D'APPEL, que la forme nue
+// lit. C'est la difference entre appel par nom et appel par valeur, et elle est
+// observable : dans une boucle qui modifie `n`, `m(n)` vaut trois fois 5 sous la
+// forme nue, et 5, 4, 3 sous `{}`.
+struct Arg {
+    std::string text;
+    bool hasValue = false;
+    double value = 0;
+    // Le repli sur le texte AVERTIT quand l'argument est une expression que
+    // l'assembleur saura resoudre mais pas le preprocesseur (« n equ buffer+2 ») :
+    // le repli change le MOMENT de la resolution, ce qui peut surprendre. Il est
+    // silencieux quand l'argument n'a pas de valeur par nature — un registre,
+    // « (ix+2) », une chaine de plus d'un octet — sans quoi « macro savereg r /
+    // push r » deviendrait impossible sans accolades.
+    bool warnFallback = false;
+};
+
 struct Env {
-    std::map<std::string, std::string> args;   // arguments de macro (texte brut)
+    std::map<std::string, Arg> args;            // arguments de macro
     std::map<std::string, int64_t> locals;      // variables de boucle (REPEAT/WHILE)
+    std::string callSite;                       // « fichier:ligne » de l'appel, pour les diagnostics
 };
 
 // Champ / définition de structure
@@ -424,6 +402,42 @@ private:
             else cur += c;
         }
         if (!out.empty() && out.back().text.empty()) out.pop_back();
+        return splitBlockLines(out);
+    }
+
+    // La structure des blocs se lit AVANT toute expansion, LIGNE À LIGNE : un mot-clé
+    // caché derrière un ':' (« repeat nbr : dw a,b : rend ») est invisible pour
+    // findMatching, qui annonce alors « REPEAT without ENDREPEAT » alors que la
+    // fermeture est là, sur la même ligne. On éclate donc en amont les SEULES lignes
+    // concernées : celles dont une instruction ouvre ou ferme un bloc. Les autres
+    // restent entières — c'est emit() qui les déroulera, et le mode strict doit
+    // continuer d'y voir « plusieurs instructions sur une ligne ».
+    std::vector<SrcLine> splitBlockLines(const std::vector<SrcLine> &lines) {
+        std::vector<SrcLine> out;
+        for (const auto &l : lines) {
+            const std::string code = trim(stripComment(l.text));
+            std::vector<std::string> stmts = code.empty() ? std::vector<std::string>()
+                                                          : splitStatements(code);
+            bool hasBlock = stmts.size() > 1;
+            if (hasBlock) {
+                hasBlock = false;
+                for (const auto &st : stmts) {
+                    const std::string k = classify(st);
+                    if (!kw::blockOfOpener(k).empty() || !kw::blockOfCloser(k).empty()) { hasBlock = true; break; }
+                }
+            }
+            if (!hasBlock) { out.push_back(l); continue; }
+            // Le commentaire de fin de ligne est perdu : il ne survit de toute façon
+            // à aucune ligne (stripComment est appliqué partout en amont d'emit).
+            if (strict_)
+                strictErr(l, "strict: several instructions on one line is a writing facility, "
+                             "not canonical Z80 — write one instruction per line");
+            bool first = true;
+            for (const auto &st : stmts) {
+                out.push_back({first ? st : "    " + st, l.file, l.line, first && l.col0});
+                first = false;
+            }
+        }
         return out;
     }
 
@@ -447,8 +461,11 @@ private:
         auto resolver = [&](const std::string &name, double &out) -> bool {
             auto l = env.locals.find(name); if (l != env.locals.end()) { out = (double)l->second; return true; }
             auto p = ppvars.find(name); if (p != ppvars.end()) { out = p->second; return true; }
+            // La valeur a ete calculee au site d'appel (ADR 0014) : la reevaluer ici
+            // avec un resolveur vide etait la source de l'asymetrie — « MAC high »
+            // echouait la ou « repeat high » marche hors macro.
             auto a = env.args.find(name);
-            if (a != env.args.end()) { auto r = expr::eval(a->second, {}); if (r.ok) { out = r.real; return true; } }
+            if (a != env.args.end() && a->second.hasValue) { out = a->second.value; return true; }
             auto v = asmvars.find(name);
             if (v != asmvars.end()) { readAtPP.insert(name); out = v->second; return true; }
             if (asmDeferred.count(name)) deferred = name;
@@ -470,12 +487,19 @@ private:
     // l'assembleur qui définit réellement le symbole, le préprocesseur ne fait
     // que le lire au passage.
     void noteAsmDefinition(const std::string &name, const std::string &ev,
-                           const Env &env, const SrcLine &raw) {
+                           const Env &env, const SrcLine &raw, bool isConst) {
         if (!isIdentifier(name)) return;
         // Ambiguïté réelle : le PP a déjà utilisé cette valeur plus haut et elle
-        // change ici. L'assembleur, lui, résout les EQU/= jusqu'à point fixe et
-        // retiendra la dernière — les deux étages ne verraient pas la même chose.
-        if (readAtPP.count(name)) {
+        // change ici. L'assembleur, lui, résout les CONSTANTES (EQU) jusqu'à point
+        // fixe et retiendra la dernière — les deux étages ne verraient pas la même chose.
+        //
+        // Une VARIABLE ('=') ne pose pas ce problème : l'assembleur la lit
+        // séquentiellement (asm.cpp, defineSymbol reassignable), exactement comme le
+        // préprocesseur. « v=15 ... v=v-1 » dans un REPEAT est l'idiome même des tables
+        // générées : les deux étages y voient la même valeur en chaque point, et le
+        // signaler était un faux positif — d'autant plus bruyant qu'il se répétait à
+        // chaque tour de boucle.
+        if (isConst && readAtPP.count(name)) {
             auto prev = asmvars.find(name);
             warning(raw, "'" + name + "' was already used by the preprocessor" +
                          (prev != asmvars.end() ? " with value " + fmtNum(prev->second) : "") +
@@ -519,7 +543,7 @@ private:
                     auto r = evalPP(trim(inner.substr(1)), env);
                     if (!r.ok) error(sl, r.error); else out += fmtNum(r.real);
                 } else if (isIdentifier(inner) && env.args.count(inner)) {
-                    out += env.args.at(inner);
+                    out += env.args.at(inner).text;
                 } else {
                     auto r = evalPP(inner, env);
                     if (!r.ok) error(sl, r.error); else out += fmtNum(r.real);
@@ -565,8 +589,9 @@ private:
     // ici elles n'existent qu'au préprocesseur, d'où cette substitution textuelle.
     // Chaînes et littéraux caractère sont recopiés tels quels, et un identifiant collé
     // à un préfixe numérique (#FF, $1A, %10, 0x1F) n'est pas un symbole.
-    std::string substituteVars(const std::string &code, const Env &env) {
-        if (env.locals.empty() && ppvars.empty()) return code;
+    std::string substituteVars(const std::string &code, const Env &env,
+                               const SrcLine *site = nullptr) {
+        if (env.locals.empty() && ppvars.empty() && env.args.empty()) return code;
         size_t op = operandStart(code);
         std::string mnemo = upper(trim(code.substr(0, op)));
         size_t sp = mnemo.rfind(' ');
@@ -601,8 +626,20 @@ private:
                 std::string name = text.substr(i, j - i);
                 auto l = env.locals.find(name);
                 bool has = false; double val = 0;
+                std::string asText;   // repli : le texte de l'argument
                 if (l != env.locals.end()) { val = (double)l->second; has = true; }
-                else { auto p = ppvars.find(name); if (p != ppvars.end()) { val = p->second; has = true; } }
+                else if (auto p = ppvars.find(name); p != ppvars.end()) { val = p->second; has = true; }
+                else if (auto a = env.args.find(name); a != env.args.end()) {
+                    // La forme NUE d'un argument de macro (ADR 0014) : sa valeur,
+                    // capturee au site d'appel. Sans valeur, on se replie sur le
+                    // texte — que l'assembleur resoudra — en le signalant quand le
+                    // repli deplace le moment de la resolution.
+                    if (a->second.hasValue) { val = a->second.value; has = true; }
+                    else {
+                        asText = a->second.text;
+                        if (a->second.warnFallback && site) noteArgFallback(*site, env, name);
+                    }
+                }
                 // opérande entier d'une instruction = registre/condition, jamais un symbole
                 bool whole = false;
                 if (instr && kw::isMachineWord(upper(name))) {
@@ -612,6 +649,7 @@ private:
                             (next == 0 || next == ',' || next == ')');
                 }
                 if (has && !whole) out += fmtNum(val);
+                else if (!asText.empty() && !whole) out += asText;
                 else out += name;
                 i = j;
                 continue;
@@ -690,6 +728,11 @@ private:
                 std::string l0, r0, l1, r1;
                 peelLabel(stmt, l0, r0);
                 peelLabel(canon, l1, r1);
+                // « ld pc,hl » porte son orthographe sur DEUX mots : nommer le seul
+                // « ld » ferait chercher une faute qui n'est pas là.
+                if (kw::canonicalJump(stmt) != stmt)
+                    strictErr(src, "strict: '" + r0 + "' is a non-canonical spelling — write '" + r1 + "'");
+                else
                 strictErr(src, "strict: '" + firstToken(r0) + "' is a non-canonical spelling — write '" +
                                firstToken(r1) + "'");
             }
@@ -781,13 +824,13 @@ private:
         std::vector<std::string> stack{block};
         for (int i = start + 1; i < (int)lines.size(); ++i) {
             const std::string kw = classify(lines[i].text);
-            const std::string op = blockOfOpener(kw);
+            const std::string op = kw::blockOfOpener(kw);
             if (!op.empty()) { stack.push_back(op); continue; }
-            const std::string cl = blockOfCloser(kw);
+            const std::string cl = kw::blockOfCloser(kw);
             if (cl.empty()) continue;
             if (cl != "*" && cl != stack.back()) {
                 error(lines[i], "'" + kw + "' closes a " + cl + " block, but the open block here is a " +
-                                stack.back() + " — write '" + canonicalCloser(stack.back()) + "' or 'end'");
+                                stack.back() + " — write '" + kw::canonicalCloser(stack.back()) + "' or 'end'");
                 return -2;   // déjà diagnostiqué : l'appelant n'ajoute rien
             }
             stack.pop_back();
@@ -796,8 +839,40 @@ private:
         return -1;
     }
 
+    // La cle est (ligne du CORPS, site d'appel) : un avertissement par probleme
+    // distinct, et non un par tour de boucle. La ligne du corps est celle ou
+    // s'ecrit la correction ; le site d'appel est d'ou vient le fait.
+    std::set<std::string> warnedArgFallback_;
+
+    void noteArgFallback(const SrcLine &body, const Env &env, const std::string &name) {
+        const std::string key = body.file + ":" + std::to_string(body.line) + "|" +
+                                env.callSite + "|" + name;
+        if (!warnedArgFallback_.insert(key).second) return;
+        warning(body, "'" + name + "' has no preprocessor value at the call site (" +
+                      (env.callSite.empty() ? std::string("?") : env.callSite) +
+                      "); falling back to its text, which the assembler resolves later — "
+                      "write '{" + name + "}' to ask for that on purpose");
+    }
+
+    std::set<std::string> warnedBareCall_;   // une alerte par macro, pas par site
+    std::set<std::string> warnedNameFirst_;  // idem pour « nom MACRO p,q »
+
+    // Un token du vocabulaire de la machine quelque part dans le texte : registre,
+    // paire ou condition. C'est ce qui distingue « (ix+2) », qui n'a pas de valeur
+    // par nature, d'un « buffer+2 » que l'assembleur resoudra tres bien.
+    static bool mentionsMachineWord(const std::string &t) {
+        size_t i = 0;
+        while (i < t.size()) {
+            if (!isIdentChar(t[i]) || std::isdigit((unsigned char)t[i])) { ++i; continue; }
+            size_t j = i; while (j < t.size() && isIdentChar(t[j])) ++j;
+            if (kw::isMachineWord(upper(t.substr(i, j - i)))) return true;
+            i = j;
+        }
+        return false;
+    }
+
     void expandMacro(const Macro &m, const std::string &argstr,
-                     const SrcLine &sl, int depth) {
+                     const SrcLine &sl, int depth, const Env &caller) {
         if (depth > 200) { error(sl, "macro nesting too deep (recursive?)"); return; }
         std::vector<std::string> args = splitTopLevel(argstr, ',');
         if (args.size() != m.params.size()) {
@@ -806,7 +881,20 @@ private:
             return;
         }
         Env ne;
-        for (size_t k = 0; k < m.params.size(); ++k) ne.args[m.params[k]] = args[k];
+        ne.callSite = sl.file + ":" + std::to_string(sl.line);
+        for (size_t k = 0; k < m.params.size(); ++k) {
+            Arg a;
+            a.text = args[k];
+            // AVIDE, et dans l'environnement de l'APPELANT : un argument arrive
+            // deja resolu ou ne le sera jamais. Le corollaire est que la portee
+            // lexicale des macros n'est pas ouverte — c'est l'argument qui est
+            // resolu avant l'entree, pas la macro qui voit son appelant.
+            const expr::Result r = evalPP(a.text, caller);
+            if (r.ok) { a.hasValue = true; a.value = r.real; }
+            else a.warnFallback = !mentionsMachineWord(a.text) &&
+                                  r.error.find("has no value") == std::string::npos;
+            ne.args[m.params[k]] = a;
+        }
         std::vector<SrcLine> scoped = renameLocals(m.body, ++uid);
         run(scoped, ne, depth + 1);
     }
@@ -967,8 +1055,8 @@ private:
                 int d = 1;
                 for (int j = i + 1; j < endif; ++j) {
                     std::string k = classify(lines[j].text);
-                    if (!blockOfOpener(k).empty()) ++d;
-                    else if (!blockOfCloser(k).empty()) --d;
+                    if (!kw::blockOfOpener(k).empty()) ++d;
+                    else if (!kw::blockOfCloser(k).empty()) --d;
                     else if (d == 1 && (k == "ELSE" || k == "ELSEIF")) bounds.push_back(j);
                 }
                 bounds.push_back(endif);
@@ -1033,7 +1121,7 @@ private:
                 if (!label.empty()) emit(label + ":", raw);
                 std::vector<SrcLine> body(lines.begin() + i + 1, lines.begin() + endfor);
                 std::string head = restAfterFirst(rest);
-                size_t eq = findAssign(head);
+                size_t eq = kw::findAssign(head);
                 if (eq == std::string::npos) {
                     error(raw, "FOR: expected 'for <var> = <low> to <high>' (or 'until <high>')");
                     i = endfor + 1; continue;
@@ -1092,7 +1180,13 @@ private:
                 // "macro foo:" — le ':' de fin fait partie du style courant, il
                 // n'appartient pas au nom. Sans ce retrait, la macro s'enregistre
                 // sous "foo:" et l'appel nu ne la trouve jamais.
-                if (kw == "MACRO") { m.name = firstToken(restAfterFirst(rest)); decl = restAfterFirst(restAfterFirst(rest)); }
+                if (kw == "MACRO") {
+                    // « macro nom(p,q) » aussi bien que « macro nom p,q » (ADR 0018).
+                    const std::string after = trim(restAfterFirst(rest));
+                    std::string dn, dp;
+                    if (kw::parenCall(after, dn, dp)) { m.name = dn; decl = dp; }
+                    else { m.name = firstToken(after); decl = restAfterFirst(after); }
+                }
                 else { m.name = firstToken(rest); decl = restAfterFirst(restAfterFirst(rest)); }
                 for (auto &p : splitTopLevel(decl, ',')) {
                     if (p.empty()) continue;
@@ -1105,7 +1199,17 @@ private:
                 for (int j = i + 1; j < endm; ++j) m.body.push_back(lines[j]);
                 if (!m.name.empty() && m.name.back() == ':') m.name.pop_back();
                 if (m.name.empty()) error(raw, "MACRO without a name");
-                else macros[upper(m.name)] = m;
+                else {
+                    // « nom MACRO p,q » : graphie rasm héritée. Elle est la seule
+                    // raison d'une exception dans peelLabel — un nom en tête de ligne
+                    // qui n'est pas un label — et rien ne la distingue d'un appel de
+                    // macro sans la connaître. Avertie une fois, comme l'appel nu.
+                    if (kw != "MACRO" && warnedNameFirst_.insert(upper(m.name)).second)
+                        warning(raw, "'" + m.name + " MACRO ...' is an inherited spelling; "
+                                     "write 'macro " + m.name + " ...'");
+                    macros[upper(m.name)] = m;
+                    result.macroNames.push_back(upper(m.name));
+                }
                 i = endm + 1; continue;
             }
 
@@ -1159,32 +1263,46 @@ private:
             // --- @@export hors macro : ignorer ---
             if (kw == "@@EXPORT") { ++i; continue; }
 
-            // --- appel de macro ---
-            auto mit = macros.find(upper(firstToken(rest)));
+            // --- appel de macro : « nom args » ou « nom(args) » (ADR 0018) ---
+            std::string pcName, pcArgs;
+            const bool paren = kw::parenCall(rest, pcName, pcArgs);
+            auto mit = macros.find(upper(paren ? pcName : firstToken(rest)));
             if (mit != macros.end()) {
                 if (!label.empty()) emit(label + ":", raw);
+                // La forme nue reste licite, mais elle est indiscernable d'un label
+                // pour qui ne connaît pas la macro — d'où l'avertissement. Une fois
+                // par macro, et non par site : un appel dans un REPEAT est traversé
+                // à chaque tour, et « compter les appels » n'aurait pas de sens.
+                if (!paren && warnedBareCall_.insert(mit->first).second)
+                    warning(raw, "'" + firstToken(rest) + "' is called without parentheses; "
+                                 "write '" + firstToken(rest) + "(...)' — the bare form cannot "
+                                 "be told from a label until the macro is known");
                 // Les arguments sont evalues dans la portee de l'APPELANT : sans ce
                 // substituteVars, un compteur de REPEAT passe a une macro
                 // ("repeat 3,k / poke k*2") traversait l'expansion tel quel et
                 // echouait plus tard en "unknown symbol 'k'". Le nom de la macro
                 // n'etant pas un mnemonique Z80, la protection des noms de
                 // registres ne s'applique pas ici — c'est le comportement voulu.
-                expandMacro(mit->second, restAfterFirst(substituteVars(rest, env)), raw, depth);
+                const std::string sub = substituteVars(rest, env);
+                std::string argstr, n2, a2;
+                if (paren && kw::parenCall(sub, n2, a2)) argstr = a2;
+                else argstr = restAfterFirst(sub);
+                expandMacro(mit->second, argstr, raw, depth, env);
                 ++i; continue;
             }
 
             // --- constante EQU / variable '=' : observée, pas consommée ---
             if (!label.empty()) {
-                if (kw == "EQU") noteAsmDefinition(label, restAfterFirst(rest), env, raw);
+                if (kw == "EQU") noteAsmDefinition(label, restAfterFirst(rest), env, raw, /*isConst=*/true);
                 else {
-                    size_t eq = findAssign(rest);
+                    size_t eq = kw::findAssign(rest);
                     if (eq != std::string::npos && trim(rest.substr(0, eq)).empty())
-                        noteAsmDefinition(label, trim(rest.substr(eq + 1)), env, raw);
+                        noteAsmDefinition(label, trim(rest.substr(eq + 1)), env, raw, /*isConst=*/false);
                 }
             }
 
             // --- ligne ordinaire : passe-plat ---
-            emit(substituteVars(code, env), raw);
+            emit(substituteVars(code, env, &raw), raw);
             ++i;
         }
     }

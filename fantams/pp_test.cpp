@@ -95,6 +95,17 @@ static void chkWarn(const char *desc, const std::string &src, const std::string 
     } else ++g_pass;
 }
 
+// Compte les avertissements d'un source (ADR 0014 : le repli sur le texte).
+static void chkWarnCount(const char *desc, const std::string &src, size_t expected) {
+    pp::Result r = pp::preprocess(src, "test.asm", provider);
+    if (r.warnings.size() != expected) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s : %zu avertissement(s), attendu %zu\n",
+               desc, r.warnings.size(), expected);
+        for (auto &w : r.warnings) printf("    warn %s:%d %s\n", w.file.c_str(), w.line, w.message.c_str());
+    } else ++g_pass;
+}
+
 int main() {
     printf("Tests préprocesseur\n");
 
@@ -172,6 +183,82 @@ int main() {
         " repeat 2\n nop\n endrepeat\n", "nop\nnop\n");
     chk("formes courtes tolerees en silence",
         "macro m\n nop\nmend\n m\n", "nop\n");
+
+    // --- arguments de macro : forme nue vs accolades (ADR 0014) -------------
+    // La forme NUE capture la VALEUR au site d'appel ; « {} » substitue le TEXTE,
+    // que l'assembleur resout au point d'emission. C'est appel par valeur contre
+    // appel par nom, et la difference est observable.
+    chk("forme nue : la valeur, capturee a l'appel",
+        "n = 5\n macro m x\n repeat 3\n db x\n n = n - 1\n rend\n endm\n m(n)\n",
+        "n = 5\ndb 5\nn = n - 1\ndb 5\nn = n - 1\ndb 5\nn = n - 1\n");
+    chk("accolades : le texte, resolu a l'emission",
+        "n = 5\n macro m x\n repeat 3\n db {x}\n n = n - 1\n rend\n endm\n m(n)\n",
+        "n = 5\ndb n\nn = n - 1\ndb n\nn = n - 1\ndb n\nn = n - 1\n");
+    chk("forme nue dans une ligne EMISE (le manque d'hier)",
+        " macro m val\n db val\n endm\n m(3)\n", "db 3\n");
+    // « 1+1 » substitue TEXTUELLEMENT dans « db n2*2 » donnerait « db 1+1*2 », soit
+    // 3 au lieu de 4 — un bug silencieux de precedence. C'est la VALEUR qui est
+    // posee, donc « db 2*2 », que l'assembleur lit 4.
+    chk("l'argument est evalue, jamais substitue textuellement",
+        " macro m n2\n db n2*2\n endm\n m(1+1)\n", "db 2*2\n");
+    chk("forme nue dans une expression du PP",
+        " macro m cnt\n repeat cnt\n nop\n rend\n endm\n m(2)\n", "nop\nnop\n");
+    // Repli SILENCIEUX : un fragment sans valeur par nature.
+    chk("repli : un registre reste un registre",
+        " macro savereg reg\n push reg\n pop reg\n endm\n savereg(hl)\n",
+        "push hl\npop hl\n");
+    chk("repli : (ix+2) n'a pas de valeur",
+        " macro poke adr,v\n ld adr,a\n endm\n poke((ix+2),7)\n", "ld (ix+2),a\n");
+    chk("repli : une chaine de plus d'un octet",
+        " macro dire txt\n db txt\n endm\n dire(\"ab\")\n", "db \"ab\"\n");
+    // Un argument d'un octet, lui, A une valeur (ADR 0010) : la forme nue la prend.
+    chk("une chaine d'UN octet a une valeur",
+        " macro m ch\n db ch\n endm\n m('A')\n", "db 65\n");
+
+    // Repli AVERTI : l'argument depend d'un label, donc l'assembleur le resoudra
+    // mais pas le preprocesseur. Le repli deplace le MOMENT de la resolution.
+    chkWarnCount("repli sur un label : avertit une fois",
+                 " macro m x\n ld hl,x\n endm\n m(buffer+2)\nbuffer: nop\n", 1);
+    // La cle de deduplication est (ligne du corps, site d'appel) : cinq tours de
+    // boucle sur le MEME appel ne font qu'un avertissement...
+    chkWarnCount("un appel dans une boucle : toujours un seul",
+                 " macro m x\n ld hl,x\n endm\n repeat 5\n m(buffer+2)\n rend\nbuffer: nop\n", 1);
+    // ...mais deux sites distincts sont deux problemes distincts.
+    chkWarnCount("deux sites d'appel : deux avertissements",
+                 " macro m x\n ld hl,x\n endm\n m(buffer+2)\n m(buffer+3)\nbuffer: nop\n", 2);
+    // Les replis silencieux ne doivent RIEN dire : sans quoi « push reg » crierait
+    // a chaque usage d'un idiome majoritaire.
+    chkWarnCount("un registre ne dit rien",
+                 " macro savereg reg\n push reg\n endm\n savereg(hl)\n", 0);
+    chkWarnCount("(ix+2) ne dit rien",
+                 " macro poke adr\n ld adr,a\n endm\n poke((ix+2))\n", 0);
+    chkWarnCount("une chaine longue ne dit rien",
+                 " macro dire txt\n db txt\n endm\n dire(\"ab\")\n", 0);
+    chkWarnCount("un argument resolu ne dit rien",
+                 " macro m val\n db val\n endm\n m(3)\n", 0);
+
+    // --- « ld pc,rr » : une orthographe (ADR 0017) --------------------------
+    chk("ld pc,hl est canonise en jp (hl)", " ld pc,hl\n", "jp (hl)\n");
+    chk("ld pc,ix / ld pc,iy", " ld pc,ix\n ld pc,iy\n", "jp (ix)\njp (iy)\n");
+    chk("la casse est epousee", " LD PC,HL\n", "JP (HL)\n");
+    chk("ld pc,de n'est pas cette forme : laisse tel quel", " ld pc,de\n", "ld pc,de\n");
+    // Le dump du preprocesseur garde « label: instruction » sur une ligne ; c'est
+    // la mise en forme, en aval, qui detache (ADR 0017, regle 3).
+    chk("un label devant est conserve", "saut: ld pc,hl\n", "saut: jp (hl)\n");
+    chkStrict("strict refuse l'orthographe", " ld pc,hl\n", false);
+    chkStrict("strict accepte la forme canonique", " jp (hl)\n", true);
+
+    // --- appel parenthese (ADR 0018) ---------------------------------------
+    chk("appel parenthese", "macro m2 a1,a2\n db {a1},{a2}\nendm\n m2(1,2)\n", "db 1,2\n");
+    chk("appel nu toujours accepte", "macro m2 a1,a2\n db {a1},{a2}\nendm\n m2 1,2\n", "db 1,2\n");
+    chk("appel sans argument : nom()", "macro m\n nop\nendm\n m()\n", "nop\n");
+    chk("definition parenthesee", "macro m2(a1,a2)\n db {a1},{a2}\nendm\n m2(3,4)\n", "db 3,4\n");
+    chk("definition parenthesee, appel nu", "macro m2(a1,a2)\n db {a1},{a2}\nendm\n m2 3,4\n", "db 3,4\n");
+    // La parenthese COLLEE et la fermeture en DERNIER : c'est ce qui permet a un
+    // argument d'etre lui-meme parenthese sans ambiguite.
+    chk("premier argument parenthese", "macro m2 a1,a2\n db {a1},{a2}\nendm\n m2((5),6)\n", "db (5),6\n");
+    chk("appel nu dont un argument est parenthese",
+        "macro m2 a1,a2\n db {a1},{a2}\nendm\n m2 (5),6\n", "db (5),6\n");
     chkErr("fermeture croisee refusee",
            "macro m\n repeat 2\n nop\n endm\n end\n m\n");
     chkErr("bloc non ferme", " repeat 2\n nop\n");

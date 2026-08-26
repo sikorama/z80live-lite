@@ -153,8 +153,26 @@ bytes with value 1 then three with value 2.
 | Directive | Effect |
 |---|---|
 | `org [b<n>:]address` | sets the assembly address and storage bank |
+| `org logical,[b<n>:]storage` | assembles for one address, stores at another |
 | `align n` | aligns to a multiple of `n` |
 | `run address` | entry point |
+
+### Displaced blocks
+
+`org #A600,#100` assembles for `#A600` — labels take that value — and **stores** the
+bytes at `#100`. It is code meant to be **copied** to its logical address before it
+runs; a loader elsewhere does the copying (ADR 0005).
+
+- `run` takes the **logical** address, because `run label` must equal `label`. The
+  `PC` therefore lands on memory nothing has loaded yet: this **warns**.
+- `align` aligns the **logical** address, the one the code will run at. The storage
+  address shifts by the same amount and is not aligned.
+- The displacement is **not persistent**: a bare `org` resets it.
+- `loadAddress` and the binary's extent describe the **storage** address, so a raw
+  binary no longer loads at the address of its labels.
+- The bank prefix qualifies the **storage** address, so it goes on the **last**
+  parameter: `org #4000,b4:#100`. On the first parameter of a two-parameter form it
+  is **refused**, naming the replacement.
 
 ### Banks
 
@@ -385,3 +403,11 @@ rasm headers with no effect here.
 | `--strict` | refuses anything not canonical Z80 |
 | `--no-detach-labels` | keeps `label: instruction` on one line |
 | `--no-indent-blocks` | does not indent block bodies |
+| `--sym[=file]` | writes the **symbol table** (CSV) for a disassembler or emulator |
+
+`--sym` writes one line per **label and constant** — name, type, logical value,
+storage bank and address, origin file and line (ADR 0019). Not a listing: one line
+per *name*, and no bytes. Variables (`=`) are left out. The default path derives
+from `-o`, so the file travels next to the binary it describes. It refuses to
+combine with `--beautify` and `--normalize`, which never reach the assembler, and
+cohabits with `-E`. For a human reading a terminal, `-s` prints the table instead.

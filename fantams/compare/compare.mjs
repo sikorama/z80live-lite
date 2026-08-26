@@ -6,7 +6,7 @@
 // Pour chaque source :
 //   1. assemble avec rasm (wasm, via wasm/assemble.mjs) -> SNA de référence
 //   2. assemble avec fantams (binaire natif ./fantams)   -> SNA candidat
-//   3. compare le dump RAM (offset 0x100..0x100+65536) octet à octet
+//   3. compare le dump RAM (banques 0..7, 128K) octet à octet
 //
 // Rapport : sources OK / sources où fantams échoue à l'assemblage (hors périmètre,
 // probablement directive non supportée) / sources où ça diverge (bug à corriger).
@@ -123,20 +123,38 @@ function decodeRLE(buf) {
   return out;
 }
 
+// Rend TOUJOURS 128K (banques 0..7), quelle que soit la forme du fichier : c'est
+// ce qui rend deux snapshots d'étendues différentes comparables sans traitement
+// particulier. Un source qui n'écrit que dans les 64K de base laisse la moitié
+// haute à zéro des deux côtés, et la comparaison est inchangée.
+//
+// Trois formes possibles : dump plat de 64K, dump plat de 128K (ce que fantams
+// produit dès qu'une banque 4..7 est écrite), ou chunks "MEMx" compressés RLE
+// (ce que rasm produit). Ne PAS reconnaître l'une d'elles rendrait un tampon de
+// zéros, et la comparaison déclarerait conformes des octets jamais lus.
+const RAM_SIZE = 131072;
+
 function ramDump(sna) {
-  // en-tête SNA = 256 octets, puis soit un dump RAM 64K brut (V2/V3 non compressé),
-  // soit des chunks "MEMx" (V3 compressé RLE, ex: peu de mémoire utilisée). On ne
-  // reconstruit que MEM0 (les 64K de base) : fantams ne gère pas le multi-bank.
-  if (sna.length === 256 + 65536) return sna.subarray(256, 256 + 65536);
-  let off = 256;
+  const out = Buffer.alloc(RAM_SIZE);
+  const flat = sna.length - 256;
+  if (flat === 65536 || flat === RAM_SIZE) {
+    sna.copy(out, 0, 256, 256 + flat);
+    return out;
+  }
+  let off = 256, found = false;
   while (off + 8 <= sna.length) {
     const id = sna.toString('ascii', off, off + 4);
     const size = sna.readUInt32LE(off + 4);
     const data = sna.subarray(off + 8, off + 8 + size);
-    if (id === 'MEM0') return decodeRLE(data);
+    const m = /^MEM(\d)$/.exec(id);
+    if (m) {
+      const base = Number(m[1]) * 65536;
+      if (base < RAM_SIZE) { decodeRLE(data).copy(out, base); found = true; }
+    }
     off += 8 + size;
   }
-  return Buffer.alloc(65536); // pas de MEM0 trouvé : ne devrait pas arriver
+  if (!found) throw new Error(`snapshot illisible : ni dump plat 64K/128K, ni chunk MEMx (${sna.length} octets)`);
+  return out;
 }
 
 function firstDiff(a, b) {

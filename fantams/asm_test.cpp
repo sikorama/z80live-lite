@@ -1,5 +1,6 @@
 // asm_test.cpp - Tests de l'assembleur 2 passes
 #include "asm.h"
+#include "sym.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +43,26 @@ static void chkSym(const char *desc, const std::string &src, const char *sym, in
     } else ++g_pass;
 }
 
+// Compte les lignes d'un CSV, en-tete comprise.
+static size_t csvLines(const std::string &t) {
+    size_t n = 0;
+    for (char c : t) if (c == '\n') ++n;
+    return n;
+}
+
+// La ligne de la table qui commence par « nom, ». Chaine vide si absente.
+static std::string symRow(const std::string &table, const std::string &name) {
+    const std::string key = name + ",";
+    size_t p = 0;
+    while (p < table.size()) {
+        size_t e = table.find('\n', p);
+        if (e == std::string::npos) e = table.size();
+        if (table.compare(p, key.size(), key) == 0) return table.substr(p, e - p);
+        p = e + 1;
+    }
+    return std::string();
+}
+
 static void chkErr(const char *desc, const std::string &src) {
     asmb::Output o = asmb::assembleText(src, "t.asm");
     if (o.ok) { ++g_fail; printf("  \033[31mFAIL\033[0m %s (aurait dû échouer)\n", desc); }
@@ -56,6 +77,20 @@ static void chkWarn(const char *desc, const std::string &src, bool expectWarning
         ++g_fail;
         printf("  \033[31mFAIL\033[0m %s : ok=%d warnings=%zu (attendu=%d)\n",
                desc, o.ok, o.warnings.size(), expectWarning);
+    } else ++g_pass;
+}
+
+// --- Banques (ADR 0005 / ADR 0006) ------------------------------------------
+static void chkBank(const char *desc, const std::string &src,
+                    std::initializer_list<int> expectedExtra) {
+    asmb::Output o = asmb::assembleText(src, "t.asm");
+    std::vector<int> exp(expectedExtra);
+    if (!o.ok || o.banksWritten != exp) {
+        ++g_fail;
+        printf("  \033[31mFAIL\033[0m %s : ok=%d banksWritten={", desc, o.ok);
+        for (size_t k = 0; k < o.banksWritten.size(); ++k) printf("%s%d", k ? "," : "", o.banksWritten[k]);
+        printf("}\n");
+        for (auto &e : o.errors) printf("    err %s:%d %s\n", e.file.c_str(), e.line, e.message.c_str());
     } else ++g_pass;
 }
 
@@ -248,6 +283,11 @@ int main() {
         chkErr("refus : PRINT n'accepte pas une chaine decalee",
                "  org #8000\n  print 'hello'-'a'\n");
         chkErr("refus : CHARSET", "  org #8000\n  charset '0123',0\n");
+        // Une expression qui echoue a deja produit son erreur : PRINT ne doit pas
+        // afficher en plus une valeur fabriquee, que le lecteur prendrait pour un
+        // resultat.
+        chkErr("refus : PRINT sur expression invalide", "  org #8000\n  print 1+\n");
+        chkErr("refus : PRINT sur symbole inconnu", "  org #8000\n  print nexistepas\n");
     }
     {
         // Le choix du delimiteur n'est pas un avertissement : il ne nomme
@@ -285,6 +325,172 @@ int main() {
 
     chkSym("label local non concerné", "g: nop\n.b: nop\n", "g.b", 1);
 
+
+    {
+        // --- « org b<n>:adresse » (ADR 0005) --------------------------------
+        // Le prefixe designe le RANGEMENT, le nombre qui suit reste l'adresse
+        // LOGIQUE : c'est elle que prend le label.
+        chkSym("b2 : le label prend l'adresse logique",
+               "  org b2:#8000\nlab: db 1\n", "lab", 0x8000);
+        chkSym("b4 : idem hors des 64K de base",
+               "  org b4:#4000\nlab: db 1\n", "lab", 0x4000);
+        chk("banque de base : le binaire est inchange",
+            "  org b2:#8000\n  db 1,2,3\n", {1, 2, 3}, 0x8000);
+        // L'offset vaut « adresse & 0x3FFF » : b2:#8000 range au meme endroit que
+        // le #8000 nu, puisque 0x8000 >> 14 vaut 2.
+        chk("b2:#8000 equivaut au #8000 nu", "  org #8000\n  db 9\n", {9}, 0x8000);
+        // `banksWritten` liste TOUTES les banques ecrites : c'est l'appelant qui en
+        // tire la taille du dump (64 ou 128 Ko) et le refus au-dela de la 7.
+        chkBank("banque de base", "  org b2:#8000\n  db 1\n", {2});
+        chkBank("sans prefixe, la banque suit l'adresse", "  org #8000\n  db 1\n", {2});
+        chkBank("banque haute", "  org b4:#4000\n  db 1\n", {4});
+        chkBank("plusieurs banques, triees",
+                "  org b5:#4000\n  db 1\n  org b4:#4000\n  db 2\n", {4, 5});
+        chkBank("base et extension melangees",
+                "  org #0000\n  db 1\n  org b6:#4000\n  db 2\n", {0, 6});
+        // Au-dela de la banque 7, l'assemblage marche : c'est l'EXPORT qui refuse.
+        chkBank("banque 8 : assemblee quand meme", "  org b8:#4000\n  db 1\n", {8});
+
+        // L'image porte les banques 0..7 a plat : (banque, offset) -> b*0x4000+o.
+        {
+            asmb::Output o = asmb::assembleText("  org b5:#4000\n  db #AB\n", "t.asm");
+            okc("image : 128K", o.image.size() == 131072);
+            okc("image : l'octet est en banque 5, offset 0", o.image[5 * 0x4000] == 0xAB);
+            okc("image : la coverage suit", o.coverage[5 * 0x4000] != 0);
+            okc("image : rien ailleurs", o.coverage[0x4000] == 0);
+        }
+
+        // La banque est REMANENTE, et un ORG nu qui en herite une haute avertit :
+        // un prefixe oublie deplacerait le bloc sans aucun diagnostic.
+        chkWarn("ORG nu heritant une banque haute : avertit",
+                "  org b4:#4000\n  db 1\n  org #c000\n  db 2\n", true);
+        chkWarn("ORG nu sans banque explicite : rien",
+                "  org #4000\n  db 1\n  org #c000\n  db 2\n", false);
+        chkWarn("b0 ramene dans les 64K de base, sans avertir",
+                "  org b4:#4000\n  db 1\n  org b0:#0000\n  db 2\n", false);
+
+        // Le cout du masquage, assume par l'ADR 0005 : b4:#4000 et b4:#8000 se
+        // rangent au meme offset. C'est le detecteur de recouvrement qui le dit.
+        chkWarn("masquage : deux adresses logiques, un seul rangement",
+                "  org b4:#4000\n  db 1\n  org b4:#8000\n  db 2\n", true);
+
+        chkErr("prefixe qui n'est pas une banque", "  org x2:#4000\n  db 1\n");
+        chkErr("prefixe sans adresse", "  org b4:\n  db 1\n");
+    }
+
+
+    // --- ORG a deux parametres : logique et rangement (ADR 0005) --------------
+    //
+    // Semantique rasm, mesuree contre rasm : le PREMIER parametre est l'adresse
+    // logique — celle des labels, celle pour laquelle le code est assemble — et le
+    // SECOND l'adresse de rangement, ou les octets sont reellement ecrits en
+    // attendant qu'un chargeur les recopie.
+    printf("\n-- ORG deplace (logique, rangement) --\n");
+    {
+        const char *src = "  org #2000,#3000\nstart:\n  ld hl,start\n";
+        asmb::Output o = asmb::assembleText(src, "t.asm");
+        okc("deplace : le label vaut l'adresse LOGIQUE", o.symbols["start"] == 0x2000);
+        okc("deplace : l'octet est range a l'adresse de RANGEMENT",
+            o.image[0x3000] == 0x21 && o.image[0x3001] == 0x00 && o.image[0x3002] == 0x20);
+        okc("deplace : rien a l'adresse logique", o.coverage[0x2000] == 0);
+        okc("deplace : loadAddress est le rangement", o.loadAddress == 0x3000);
+    }
+    // ALIGN aligne le LOGIQUE (comme rasm) : c'est l'adresse ou le code tournera
+    // apres recopie. Le rangement suit du meme ecart, donc n'est pas aligne.
+    chkSym("deplace : ALIGN aligne le logique",
+           "  org #2000,#3000\n  nop\n  align 16\naligned:\n  nop\n", "aligned", 0x2010);
+    // Le deplacement N'EST PAS REMANENT : un ORG nu le remet a zero (comme rasm).
+    {
+        asmb::Output o = asmb::assembleText("  org #2000,#3000\n  nop\n  org #5000\n  db #42\n", "t.asm");
+        okc("deplace : un ORG nu remet le deplacement a zero", o.image[0x5000] == 0x42);
+        okc("deplace : et n'ecrit pas a l'ancien ecart", o.coverage[0x6000] == 0);
+    }
+    // Le chevauchement se produit AU RANGEMENT : c'est la que les octets s'ecrasent.
+    chkWarn("deplace : le chevauchement est detecte au rangement",
+            "  org #2000,#3000\n  db 1\n  org #3000\n  db 2\n", true);
+    // Un RUN qui tombe dans un bloc deplace demarre sur de la memoire vide : le PC
+    // reste celui que la source demande, mais le silence serait une panne sans
+    // diagnostic.
+    chkWarn("deplace : RUN dans un bloc deplace avertit",
+            "  org #2000,#3000\nstart:\n  nop\n  run start\n", true);
+    chkWarn("deplace : RUN hors bloc deplace n'avertit pas",
+            "  org #2000,#3000\n  nop\n  org #4000\nboot:\n  nop\n  run boot\n", false);
+    // Le prefixe de banque qualifie le RANGEMENT : il se porte donc sur le DERNIER
+    // parametre. Sur le premier d'une forme a deux, il est refuse — le rangement
+    // serait decrit de part et d'autre de l'adresse logique.
+    {
+        asmb::Output o = asmb::assembleText("  org #4000,b4:#100\n  db #AB\n", "t.asm");
+        okc("deplace : prefixe sur le rangement", o.ok && o.image[4 * 0x4000 + 0x100] == 0xAB);
+    }
+    chkErr("deplace : prefixe sur le premier parametre", "  org b4:#4000,#100\n  db 1\n");
+    chkErr("deplace : deux prefixes", "  org b4:#4000,b5:#100\n  db 1\n");
+    chkErr("deplace : trois parametres", "  org #4000,#100,#200\n  db 1\n");
+
+    // --- Table des symboles (ADR 0019) ---------------------------------------
+    printf("\n-- Table des symboles (--sym) --\n");
+    {
+        const std::string src =
+            "SCREEN equ #C000\n"
+            "BIG    equ 1<<20\n"
+            "MINUS  equ -1\n"
+            "count = 1\n"
+            "count = 5\n"
+            "  org #8000\n"
+            "main:\n"
+            "  nop\n"
+            "  org #4000,b4:#100\n"
+            "far:\n"
+            "  nop\n";
+        asmb::Output o = asmb::assembleText(src, "t.asm");
+        const std::string t = sym::format(o);
+
+        // L'en-tete est une VRAIE ligne CSV : les noms de colonnes SONT la version.
+        okc("sym : en-tete exacte", t.rfind("name,type,value,bank,store,file,line\n", 0) == 0);
+        // 5 symboles : 2 labels + 3 constantes. La variable 'count' n'y est PAS.
+        okc("sym : une ligne par symbole, plus l'en-tete", csvLines(t) == 6);
+        okc("sym : la variable n'est pas exportee", symRow(t, "count").empty());
+
+        okc("sym : un label porte son type, sa valeur et son rangement",
+            symRow(t, "main") == "main,label,0x8000,2,0x8000,t.asm,7");
+        // Bloc deplace ET en banque : la valeur reste logique, le rangement suit.
+        okc("sym : un label deplace separe valeur et rangement",
+            symRow(t, "far") == "far,label,0x4000,4,0x100,t.asm,10");
+        // Une constante n'habite nulle part : ni banque ni rangement.
+        okc("sym : une constante n'a ni banque ni rangement",
+            symRow(t, "SCREEN") == "SCREEN,const,0xC000,-,-,t.asm,1");
+        // Non masquee, et signee : c'est la valeur que l'assembleur a utilisee.
+        okc("sym : une constante n'est pas masquee en 16 bits",
+            symRow(t, "BIG") == "BIG,const,0x100000,-,-,t.asm,2");
+        okc("sym : une constante negative garde son signe",
+            symRow(t, "MINUS") == "MINUS,const,-0x1,-,-,t.asm,3");
+
+        // Tri : banque, puis rangement, puis nom ; les constantes en QUEUE. Un
+        // consommateur qui lit jusqu'a la premiere banque « - » a tous les
+        // symboles adressables.
+        const size_t pMain = t.find("\nmain,"), pFar = t.find("\nfar,"),
+                     pBig = t.find("\nBIG,"), pMinus = t.find("\nMINUS,");
+        okc("sym : tri par banque puis rangement", pMain < pFar);
+        okc("sym : les constantes forment la queue", pFar < pBig);
+        okc("sym : les constantes sont triees par nom", pBig < pMinus);
+    }
+    {
+        // Les noms sont ceux que l'assembleur connait, sans retouche. Ici le cas
+        // QUALIFIE : « .inner » sort en « top.inner ». Le cas MANGLE (« @retry__2 »)
+        // se produit au preprocesseur, que `assembleText` ne fait pas tourner — il
+        // se verifie de bout en bout au CLI, pas ici.
+        asmb::Output o = asmb::assembleText(
+            "  org #8000\n@loop:\n  nop\ntop:\n.inner:\n  nop\n", "t.asm");
+        const std::string t = sym::format(o);
+        okc("sym : un label local sort qualifie", !symRow(t, "top.inner").empty());
+    }
+    {
+        // Le champ fichier est guillemete SEULEMENT s'il en a besoin : sans ca, un
+        // chemin a virgule produirait une ligne a huit champs dans un fichier a sept.
+        asmb::Output o = asmb::assembleText("  org #8000\nmain:\n  nop\n", "mon,brouillon.asm");
+        const std::string t = sym::format(o);
+        okc("sym : un chemin a virgule est guillemete",
+            t.find(",\"mon,brouillon.asm\",2\n") != std::string::npos);
+    }
 
     printf("\n%d réussis, %d échoués\n", g_pass, g_fail);
     return g_fail ? 1 : 0;

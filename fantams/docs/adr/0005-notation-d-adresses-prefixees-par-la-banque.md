@@ -69,8 +69,51 @@ ce qui rend l'héritage consultable. Le préprocesseur, lui, n'interprète pas
 `ORG` : la source déroulée ne peut pas porter cette garantie.
 
 Le second paramètre d'`ORG` conserve sa sémantique rasm — délier complètement
-rangement et adresse logique, comme `org 0x2000,0x3000`. Il n'est pas implémenté
-pour l'instant : une seule source du corpus l'utilise.
+rangement et adresse logique, comme `org 0x2000,0x3000`. Il est **implémenté**, et
+sa sémantique a été mesurée contre rasm plutôt que devinée : le **premier**
+paramètre est l'adresse **logique**, celle que prennent les labels et pour laquelle
+le code est assemblé ; le **second** est l'adresse de **rangement**, où les octets
+sont réellement écrits. Un bloc `org #A600,#100` est donc du code stocké en `#100`
+et destiné à tourner en `#A600` — c'est exactement ce que fait la seule source du
+corpus qui l'utilise : elle recopie le bloc avant de l'appeler.
+
+Trois conséquences sont alignées sur rasm, mesure à l'appui :
+
+- **`RUN` prend l'adresse logique.** `run label` doit valoir ce que vaut `label`,
+  sinon `run label` et `run #A600` donneraient deux `PC` différents pour la même
+  adresse et plus rien n'est prévisible. Le `PC` tombe donc sur de la mémoire pas
+  encore chargée : c'est **averti**, pour la même raison que la banque rémanente
+  l'est — sans diagnostic, c'est une panne à l'exécution sans explication.
+- **`ALIGN` aligne le logique.** C'est l'adresse où le code tournera après recopie ;
+  aligner le rangement alignerait une position dans un tampon qui sera déplacé,
+  donc désaligné à l'arrivée. Corollaire assumé : le rangement, lui, ne l'est pas.
+- **Le déplacement n'est pas rémanent** : un `ORG` sans second paramètre le remet à
+  zéro. Asymétrique avec la banque, qui est rémanente *et* avertit — parce que
+  c'est l'héritage silencieux qui est risqué, pas la remise à zéro, laquelle remet
+  le bloc là où son `ORG` le dit.
+
+`loadAddress` et l'étendue du binaire décrivent le **rangement** : le `.bin` brut
+cesse donc de se charger à l'adresse des labels. C'est correct, et surprenant. Le
+diagnostic de chevauchement nomme lui aussi le rangement — c'est là que les octets
+s'écrasent réellement.
+
+### Où se porte le préfixe de banque
+
+Le préfixe qualifie le **rangement**, il se porte donc sur le **paramètre de
+rangement** : le dernier. `org 0x4000,b4:0x3000`. En forme à un paramètre,
+l'unique adresse fait les deux offices et le préfixe s'y porte comme avant :
+`org b4:0x4000`.
+
+Le préfixe sur le premier paramètre d'une forme à deux est **refusé**, avec un
+message nommant le remplaçant. Sans cette règle, le rangement serait décrit de part
+et d'autre de l'adresse logique — banque en position 1, offset en position 3, le
+logique au milieu. Aucune source n'écrit `b<n>:` aujourd'hui, cette notation étant
+une invention de fantams remplaçant `BANK` : placer le préfixe sur le second
+paramètre ne casse donc rien, c'est de la syntaxe neuve.
+
+L'ordre rasm est conservé. L'inverser — rangement d'abord — aurait mis le préfixe
+sur le bon paramètre, mais aurait réinterprété la source existante à l'envers, en
+silence.
 
 ## Graphie
 

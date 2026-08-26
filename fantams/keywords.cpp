@@ -1,6 +1,8 @@
 // keywords.cpp - Vocabulaire réservé indexé par phase (voir keywords.h)
 #include "keywords.h"
 
+#include <vector>
+
 #include "z80.h"
 
 #include <cctype>
@@ -90,6 +92,57 @@ bool isIdentChar(char c) {
     return std::isalnum((unsigned char)c) || c == '_' || c == '.' || c == '@';
 }
 
+bool isIdentifier(const std::string &s) {
+    if (s.empty() || std::isdigit((unsigned char)s[0])) return false;
+    for (char c : s) if (!isIdentChar(c)) return false;
+    return true;
+}
+
+bool isBankRef(const std::string &tok) {
+    if (tok.size() < 2) return false;
+    if (tok[0] != 'b' && tok[0] != 'B') return false;
+    for (size_t k = 1; k < tok.size(); ++k)
+        if (!std::isdigit((unsigned char)tok[k])) return false;
+    return true;
+}
+
+std::string canonicalJump(const std::string &stmt) {
+    std::string label, rest;
+    peelLabel(stmt, label, rest, Phase::Assembly);
+    if (upper(firstToken(rest)) != "LD") return stmt;
+    const std::string ops = trim(rest.substr(firstToken(rest).size()));
+    const size_t comma = ops.find(',');
+    if (comma == std::string::npos) return stmt;
+    if (upper(trim(ops.substr(0, comma))) != "PC") return stmt;
+    const std::string src = upper(trim(ops.substr(comma + 1)));
+    if (src != "HL" && src != "IX" && src != "IY") return stmt;
+    const std::string head = label.empty() ? std::string() : label + ": ";
+    // La casse suit celle du « ld » d'origine, comme les autres orthographes.
+    const bool up = firstToken(rest) == upper(firstToken(rest));
+    std::string lo = src; for (char &ch : lo) ch = (char)std::tolower((unsigned char)ch);
+    return head + (up ? "JP (" + src + ")" : "jp (" + lo + ")");
+}
+
+bool parenCall(const std::string &s, std::string &name, std::string &args) {
+    const std::string t = trim(s);
+    if (t.empty() || t.back() != ')') return false;
+    const size_t p = t.find('(');
+    if (p == 0 || p == std::string::npos) return false;
+    name = t.substr(0, p);
+    if (!isIdentifier(name)) return false;
+    int d = 0; bool inStr = false; char q = 0;
+    for (size_t i = p; i < t.size(); ++i) {
+        const char c = t[i];
+        if (inStr) { if (c == q) inStr = false; continue; }
+        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
+        if (c == '(') ++d;
+        else if (c == ')' && --d == 0 && i != t.size() - 1) return false;
+    }
+    if (d != 0) return false;
+    args = trim(t.substr(p + 1, t.size() - p - 2));
+    return true;
+}
+
 bool isMachineWord(const std::string &upperTok) {
     return machineWords().count(upperTok) != 0;
 }
@@ -99,6 +152,55 @@ std::string reservedName(const std::string &name, const std::string &position) {
     if (!kind) return {};
     return "'" + name + "' is " + kind + " and cannot name " + position +
            ": reserved words are reserved — rename it";
+}
+
+size_t findAssign(const std::string &s) {
+    bool inStr = false; char q = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (inStr) { if (c == q) inStr = false; continue; }
+        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
+        if (c == '=') {
+            char prev = i > 0 ? s[i - 1] : 0, next = i + 1 < s.size() ? s[i + 1] : 0;
+            if (prev == '<' || prev == '>' || prev == '!' || prev == '=') continue;
+            if (next == '=') continue;
+            return i;
+        }
+    }
+    return std::string::npos;
+}
+
+const std::vector<BlockKind> &blockKinds() {
+    static const std::vector<BlockKind> t = {
+        {"IF",      {"IF", "IFDEF", "IFNDEF"}, {"ENDIF"}},
+        {"REPEAT",  {"REPEAT"},                {"ENDREPEAT", "REND"}},
+        {"WHILE",   {"WHILE"},                 {"ENDWHILE", "WEND"}},
+        {"FOR",     {"FOR"},                   {"ENDFOR"}},
+        {"MACRO",   {"MACRO"},                 {"ENDMACRO", "ENDM", "MEND"}},
+        {"STRUCT",  {"STRUCT"},                {"ENDSTRUCT", "ENDS"}},
+    };
+    return t;
+}
+
+// Le bloc qu'ouvre ce mot-clé, ou "".
+std::string blockOfOpener(const std::string &kw) {
+    for (const auto &b : blockKinds())
+        for (const char *o : b.openers) if (kw == o) return b.kind;
+    return "";
+}
+
+// Le bloc que ferme ce mot-clé, "*" pour `END` qui ferme n'importe lequel, ou "".
+std::string blockOfCloser(const std::string &kw) {
+    if (kw == "END") return "*";
+    for (const auto &b : blockKinds())
+        for (const char *c : b.closers) if (kw == c) return b.kind;
+    return "";
+}
+
+// La fermeture canonique d'un bloc, pour les diagnostics.
+std::string canonicalCloser(const std::string &kind) {
+    for (const auto &b : blockKinds()) if (kind == b.kind) return b.closers.front();
+    return "END";
 }
 
 bool isReservedWord(const std::string &upperTok, Phase ph) {

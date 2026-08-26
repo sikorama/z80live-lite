@@ -1,7 +1,7 @@
 // asm_main.cpp - end-to-end CLI: .asm source -> preprocessor -> assembler -> .bin
 //
 //   fantams file.asm [-o out] [-s] [-E] [--strict] [--beautify] [--normalize]
-//           [--no-detach-labels] [--base base.sna]
+//           [--no-detach-labels] [--no-indent-blocks] [--base base.sna]
 //     -o : output binary file (default: <source>.bin)
 //     -s : print the symbol table
 //     --base : reference snapshot the assembled bytes are laid onto (ADR 0012).
@@ -20,8 +20,17 @@
 //          un-vers-plusieurs et orthographes obsoletes (ADR 0017). N'ajoute rien,
 //          refuse. C'est le drapeau du PIPELINE, pas d'une couche.
 //     --no-detach-labels : garder « label: instruction » sur une seule ligne.
+//     --no-indent-blocks : ne pas indenter le corps des blocs (repeat, macro,
+//          if, while, for, struct). Comme le detachement, c'est un STYLE et non
+//          un canon, d'ou l'opt-out (ADR 0013, regle 4).
 //          Le beautify detache par defaut (regle 3) : l'indentation fixe aligne
 //          tous les opcodes, un label de longueur variable ne les aligne pas.
+//     --sym[=fichier] : ecrire la TABLE DES SYMBOLES (ADR 0019) : un CSV d'une
+//          ligne par label et par constante, avec type, adresse logique, banque et
+//          adresse de rangement, fichier et ligne D'ORIGINE (avant preprocesseur).
+//          Destinee a un desassembleur ou un emulateur, pas a un humain — pour
+//          l'humain, c'est « -s ». Sans « = », le chemin est derive de -o : le
+//          fichier voyage a cote du binaire qu'il decrit.
 //     --normalize : canoniser le source SANS le derouler (ADR 0017) : orthographes
 //          obsoletes et opcodes composes. Change deliberement le nombre de lignes.
 //          Transformation INDEPENDANTE du beautify, composable avec lui — les deux
@@ -31,6 +40,7 @@
 #include "beautify.h"
 #include "pp.h"
 #include "sna.h"
+#include "sym.h"
 
 #include <cstdio>
 #include <fstream>
@@ -52,8 +62,11 @@ int main(int argc, char **argv) {
     bool dumpOnly = false;
     bool beautifyOnly = false;
     bool normalizeOnly = false;
+    bool wantSym = false;
+    std::string symPath;
     bool strict = false;
     bool detachLabels = true;
+    bool indentBlocks = true;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-o" && i + 1 < argc) outPath = argv[++i];
@@ -62,17 +75,40 @@ int main(int argc, char **argv) {
         else if (a == "-E") dumpOnly = true;
         else if (a == "--beautify") beautifyOnly = true;
         else if (a == "--normalize") normalizeOnly = true;
+        // « --sym » ne prend pas d'argument positionnel : « fantams --sym src.asm »
+        // serait ambigu (chemin de sortie, ou source ?). Le chemin explicite passe
+        // par « --sym=... », le defaut se derive de -o.
+        else if (a == "--sym") wantSym = true;
+        else if (a.rfind("--sym=", 0) == 0) { wantSym = true; symPath = a.substr(6); }
         else if (a == "--strict") strict = true;
         else if (a == "--no-detach-labels") detachLabels = false;
+        else if (a == "--no-indent-blocks") indentBlocks = false;
         else path = a;
     }
-    if (path.empty()) { fprintf(stderr, "usage: fantams file.asm [-o out] [-s] [-E] [--strict] [--beautify] [--normalize] [--no-detach-labels] [--base base.sna]\n"); return 2; }
+    if (path.empty()) { fprintf(stderr, "usage: fantams file.asm [-o out] [-s] [-E] [--strict] [--beautify] [--normalize] [--no-detach-labels] [--no-indent-blocks] [--base base.sna] [--sym[=out.sym]]\n"); return 2; }
     // Le mode « la sortie est un source » : l'un ou l'autre des deux drapeaux suffit.
     const bool sourceOut = beautifyOnly || normalizeOnly;
     if (outPath.empty()) {
         size_t dot = path.find_last_of('.');
         std::string stem = (dot == std::string::npos ? path : path.substr(0, dot));
         outPath = stem + (sourceOut ? ".fmt.asm" : dumpOnly ? ".pp.asm" : ".bin");
+    }
+
+    // Le .sym decrit le BINAIRE, pas la source : il se derive de -o pour se poser
+    // a cote de lui, la ou un emulateur ira le chercher.
+    if (wantSym && symPath.empty()) {
+        size_t dot = outPath.find_last_of('.');
+        size_t slash = outPath.find_last_of('/');
+        std::string stem = (dot == std::string::npos || (slash != std::string::npos && dot < slash))
+                               ? outPath : outPath.substr(0, dot);
+        symPath = stem + ".sym";
+    }
+    // Ni --beautify ni --normalize ne passent par l'assembleur : il n'y a pas de
+    // table de symboles sans assemblage. -E, lui, assemble — il est autorise.
+    if (wantSym && sourceOut) {
+        fprintf(stderr, "error: --sym demande un assemblage ; %s ne passe pas par l'assembleur (il transforme du texte en texte)\n",
+                beautifyOnly ? "--beautify" : "--normalize");
+        return 2;
     }
 
     if (beautifyOnly && dumpOnly) {
@@ -112,8 +148,14 @@ int main(int argc, char **argv) {
     std::string content;
     if (!readFile(path, content)) { fprintf(stderr, "error: file not found: %s\n", path.c_str()); return 2; }
 
-    // --beautify : mise en forme SEULE. Ni preprocesseur ni assemblage — c'est
-    // tout l'interet : le source de l'editeur garde ses macros et ses includes.
+    // --beautify : la mise en forme rend le source de l'AUTEUR — ses macros, ses
+    // includes et ses boucles restent ou ils sont, rien n'est deroule.
+    //
+    // Le preprocesseur tourne quand meme, mais on ne garde de lui que sa TABLE DE
+    // MACROS : c'est la seule chose qui voie a l'interieur des `include`, et sans
+    // elle la mise en forme ne peut pas distinguer « fill_screen » appele de
+    // « fill_screen » declare. Ses erreurs sont ignorees — la mise en forme doit
+    // tourner sur un source casse, c'est meme la qu'on la demande le plus.
     //
     // Temps PREPROCESSEUR : ce texte est celui que le preprocesseur va lire, ses
     // mots-cles y sont donc vivants. Au temps d'assemblage, « MEND » n'est pas
@@ -125,7 +167,11 @@ int main(int argc, char **argv) {
         // la canonisation allait couper.
         std::string text = content;
         if (normalizeOnly) text = pp::normalize(text);
-        if (beautifyOnly) text = beautify::apply(text, kw::Phase::Preprocess, detachLabels);
+        if (beautifyOnly) {
+            const pp::Result probe = pp::preprocess(content, path, readFile, /*strict=*/false);
+            text = beautify::apply(text, kw::Phase::Preprocess, detachLabels, indentBlocks,
+                                   probe.macroNames);
+        }
         std::ofstream f(outPath, std::ios::binary);
         if (!f) { fprintf(stderr, "error: cannot write: %s\n", outPath.c_str()); return 2; }
         f.write(text.data(), (std::streamsize)text.size());
@@ -149,7 +195,7 @@ int main(int argc, char **argv) {
     // traiter comme reserves ferait indenter un label nomme « read » au lieu de
     // lui donner son deux-points.
     if (dumpOnly) {
-        std::string text = beautify::apply(pre.dump(), kw::Phase::Assembly, detachLabels);
+        std::string text = beautify::apply(pre.dump(), kw::Phase::Assembly, detachLabels, indentBlocks);
         std::ofstream f(outPath, std::ios::binary);
         if (!f) { fprintf(stderr, "error: cannot write: %s\n", outPath.c_str()); return 2; }
         f.write(text.data(), (std::streamsize)text.size());
@@ -160,7 +206,9 @@ int main(int argc, char **argv) {
         for (char c : text) if (c == '\n') ++written;
         if (!text.empty() && text.back() == '\n') --written;
         fprintf(stderr, "%s: unrolled source (%zu lines)\n", outPath.c_str(), written);
-        return 0;
+        // --sym exige d'assembler, on continue donc. Aucun binaire ne sera ecrit :
+        // -E a pris `-o`, et l'ecraser detruirait la sortie demandee.
+        if (!wantSym) return 0;
     }
 
     // 2) assembler (2 passes) on the flat text
@@ -177,14 +225,49 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // La table des symboles sort ICI : apres le refus sur erreur d'assemblage — un
+    // .sym partiel qu'un debogueur charge sans le savoir est pire que pas de .sym —
+    // mais AVANT le refus des banques >= 8, ou l'assemblage a reussi et ou seul
+    // l'export a plat echoue. C'est justement la que les adresses sont utiles.
+    if (wantSym) {
+        const std::string table = sym::format(out);
+        std::ofstream f(symPath, std::ios::binary);
+        if (!f) { fprintf(stderr, "error: cannot write: %s\n", symPath.c_str()); return 2; }
+        f.write(table.data(), (std::streamsize)table.size());
+        fprintf(stderr, "%s: %zu symboles\n", symPath.c_str(), out.symbolTable.size());
+    }
+    if (dumpOnly) return 0;   // -E --sym : les deux sorties demandees sont ecrites
+
+    // Le dump est PLAT : 64 Ko s'il ne sort pas des banques 0..3, 128 Ko pour le
+    // 6128 complet. Au-dela de la banque 7, aucun dump plat ne peut porter les
+    // octets : il faudrait les chunks MEM du v3 (ADR 0006). On le dit en nommant
+    // les banques, plutot que d'ecrire un fichier ampute qui aurait l'air correct.
+    int dumpKo = 64;
+    std::string tooHigh;
+    for (int b : out.banksWritten) {
+        if (b >= 8) tooHigh += (tooHigh.empty() ? "" : ", ") + std::to_string(b);
+        else if (b >= 4) dumpKo = 128;
+    }
+    if (!tooHigh.empty()) {
+        fprintf(stderr, "error: bank(s) %s written, beyond bank 7: a flat dump stops at 128K. "
+                        "Assembling there works, exporting does not yet — it needs the chunked v3 "
+                        "snapshot.\n", tooHigh.c_str());
+        return 1;
+    }
+
     // 3) write out : .sna -> snapshot ; otherwise raw binary
     bool asSna = wantSna;
     std::vector<uint8_t> data;
     if (asSna) {
         sna::Options o; o.pc = out.runAddress;
         data = sna::build(out.image, o, hasBase ? &base : nullptr,
-                          hasBase ? &out.coverage : nullptr);
+                          hasBase ? &out.coverage : nullptr, dumpKo);
     } else {
+        // Le binaire brut est un intervalle contigu d'adresses logiques : il n'a
+        // pas de place pour dire « et ces octets-la sont en banque 5 ».
+        if (dumpKo > 64)
+            fprintf(stderr, "warning: banks beyond the base 64K were written; a raw binary cannot "
+                            "carry them — export a .sna to keep them\n");
         data = out.bin;
     }
     std::ofstream f(outPath, std::ios::binary);

@@ -140,7 +140,20 @@ struct Parser {
         if (eat("+")) return unary();
         if (eat("~") || eatWord("not")) return (double)(~toInt(unary()));
         if (eat("!")) return unary() == 0 ? 1 : 0;
-        return primary();
+        return power();
+    }
+    // Puissance. Plus liante que les unaires — `-2**2` vaut -4, comme partout —
+    // et associative à DROITE : `2**3**2` vaut 2**9. L'exposant passe par unary()
+    // pour que `2**-1` s'écrive.
+    //
+    // La graphie est `**` et non `^`, déjà pris par le ou exclusif. term() n'y voit
+    // que du feu : unary() consomme `2**3` en entier avant que sa boucle ne cherche
+    // un `*`.
+    double power() {
+        double v = primary();
+        skip();
+        if (eat("**")) return std::pow(v, unary());
+        return v;
     }
     double primary() {
         skip();

@@ -14,6 +14,7 @@ A évolué vers un périmètre éloigné, puisque l'assembleur est en 2 passes, 
 | `asm` (`asm.cpp`) | assembleur 2 passes (ORG, symboles, refs avant) |
 | `beautify` (`beautify.cpp`) | mise en forme du source, texte→texte |
 | `sna` (`sna.cpp`) | export snapshot CPC `.sna` |
+| `sym` (`sym.cpp`) | table des symboles en CSV, pour un désassembleur (ADR 0019) |
 
 Outils : `fantams` (`asm_main.cpp`, `.asm → .bin/.sna`) et `ppdump`
 (`pp_main.cpp`, équivalent `-E` : export de la source préprocessée).

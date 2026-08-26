@@ -8,8 +8,11 @@
 // expressions résolubles au préprocesseur (constantes, variables PP, arguments
 // de macro). Une référence à un label temps-assemblage est une erreur.
 //
-// Scope « auto-local » : tout label défini dans un corps de macro (ou une
-// itération de REPEAT) est rendu unique par expansion, sauf @@export.
+// Scope « auto-local » : dans un corps de macro (ou une itération de REPEAT), un
+// label PRÉFIXÉ PAR '@' est rendu unique par expansion — convention rasm, cf.
+// `collectLabels(..., onlyAtPrefixed)`. Un label ordinaire réutilisé entre deux
+// expansions reste une vraie collision (« duplicate symbol »), comme chez rasm.
+// MODULE, lui, renomme tout. @@export sort du renommage.
 #pragma once
 
 #include <functional>
@@ -42,6 +45,13 @@ struct Result {
     std::vector<Diagnostic> errors;
     std::vector<Diagnostic> warnings; // bonnes pratiques (non bloquant), ex: "ei:ret" collé
     std::string dump() const;         // texte pour -E (lignes jointes par \n)
+    // Les macros collectées, en MAJUSCULES, `include` compris. Exposées pour la
+    // mise en forme : c'est la seule source qui voie au-delà du fichier courant,
+    // et sans elle le beautify ne peut pas distinguer un appel de macro d'un
+    // label (ADR 0013, amendements). Renseignée même quand `ok` est faux — ce
+    // qui a pu être collecté vaut mieux que rien, et le beautify doit tourner
+    // sur un source qui ne s'assemble pas.
+    std::vector<std::string> macroNames;
 };
 
 // `strict` (ADR 0017) : refuse tout ce qui n'est pas du Z80 canonique — le sucre

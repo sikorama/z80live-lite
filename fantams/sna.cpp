@@ -48,8 +48,10 @@ bool parseBase(const std::vector<uint8_t> &snapshot, Base &out, std::string &err
     return true;
 }
 
-std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &opt,
-                           const Base *base, const std::vector<uint8_t> *coverage) {
+std::vector<uint8_t> build(const std::vector<uint8_t> &image, const Options &opt,
+                           const Base *base, const std::vector<uint8_t> *coverage,
+                           int dumpKo) {
+    const size_t dump = (size_t)dumpKo * 1024;
     // Avec une base, son en-tete fait foi : l'etat materiel post-boot (ROM basse
     // activee, I, IM, SP dans la pile firmware, gate array) est coherent par
     // construction, et le recomposer a la main creerait une seconde verite.
@@ -59,14 +61,20 @@ std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &
         h[0x23] = (uint8_t)(opt.pc & 0xFF);
         h[0x24] = (uint8_t)((opt.pc >> 8) & 0xFF);
 
-        std::vector<uint8_t> mem = base->memory;
-        bool hasCov = coverage && coverage->size() >= 65536;
-        size_t n = image64k.size() < 65536 ? image64k.size() : 65536;
-        for (size_t a = 0; a < n; ++a)
-            if (!hasCov || (*coverage)[a]) mem[a] = image64k[a];
+        // La base ne peuple que les 64 K de base ; au-dela, l'image fait foi
+        // directement — il n'y a pas de « fond » a preserver.
+        std::vector<uint8_t> mem(dump, 0);
+        const bool hasCov = coverage && coverage->size() >= 65536;
+        for (size_t a = 0; a < dump; ++a) {
+            const bool written = a < image.size() && (!hasCov || a >= coverage->size() || (*coverage)[a]);
+            if (a < base->memory.size() && !written) mem[a] = base->memory[a];
+            else if (a < image.size()) mem[a] = image[a];
+        }
+        h[0x6B] = (uint8_t)(dumpKo & 0xFF);
+        h[0x6C] = (uint8_t)((dumpKo >> 8) & 0xFF);
 
         std::vector<uint8_t> out;
-        out.reserve(256 + 65536);
+        out.reserve(256 + dump);
         out.insert(out.end(), h.begin(), h.end());
         out.insert(out.end(), mem.begin(), mem.end());
         return out;
@@ -110,9 +118,9 @@ std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &
     // PSG : tous canaux audio coupés
     h[0x5B + 7] = 0x3F;
 
-    // taille du dump mémoire (en Ko)
-    h[0x6B] = 64;
-    h[0x6C] = 0;
+    // taille du dump mémoire (en Ko) : 64 ou 128
+    h[0x6B] = (uint8_t)(dumpKo & 0xFF);
+    h[0x6C] = (uint8_t)((dumpKo >> 8) & 0xFF);
 
     h[0x6D] = opt.cpcType;
 
@@ -120,16 +128,13 @@ std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &
     h[0xA4] = 0;      // model : CRTC 0
     h[0xB2] = 2;      // vsyncdelay
 
-    // assemblage : en-tête + 64K mémoire
+    // assemblage : en-tête + dump mémoire
     std::vector<uint8_t> out;
-    out.reserve(256 + 65536);
+    out.reserve(256 + dump);
     out.insert(out.end(), h.begin(), h.end());
-    if (image64k.size() >= 65536)
-        out.insert(out.end(), image64k.begin(), image64k.begin() + 65536);
-    else {
-        out.insert(out.end(), image64k.begin(), image64k.end());
-        out.resize(256 + 65536, 0);
-    }
+    const size_t n = image.size() < dump ? image.size() : dump;
+    out.insert(out.end(), image.begin(), image.begin() + n);
+    out.resize(256 + dump, 0);
     return out;
 }
 

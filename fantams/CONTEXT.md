@@ -128,6 +128,17 @@ de rasm.
 
 ### Mémoire
 
+**Adresse logique** :
+L'adresse pour laquelle le code est assemblé : celle que prennent les labels et que
+`$` rend. C'est elle qu'un désassembleur substitue.
+_Éviter_ : adresse d'assemblage, adresse virtuelle
+
+**Adresse de rangement** :
+L'adresse où l'octet est réellement écrit. Elle ne diffère de l'adresse logique que
+dans un bloc `org <logique>,<rangement>`, où le code attend d'être recopié à son
+adresse logique avant de tourner.
+_Éviter_ : adresse de sortie, adresse physique, offset (qui localise dans une banque)
+
 **Banque** :
 Bloc physique de 16 K de la mémoire de la machine, numéroté à partir de 0. Les
 banques 0 à 3 forment les 64 K de base, les suivantes l'extension du 6128.
@@ -168,11 +179,22 @@ _Éviter_ : couverture, masque, plage écrite (qui désigne l'intervalle lo..hi,
 plus grossier)
 
 **Provenance** :
-Le site d'émission auquel chaque octet écrit est attribué — une ligne de la
+Le site d'émission auquel chaque **octet** écrit est attribué — une ligne de la
 source déroulée, et non un numéro de ligne d'origine, que deux expansions d'une
 même macro rendraient indiscernables. C'est ce qui permet de nommer les deux
 lignes en conflit lors d'un chevauchement.
-_Éviter_ : origine, numéro de ligne
+Elle ne répond pas à « où l'auteur a-t-il écrit ce **nom** ? » : cette question-là
+attend un fichier ouvrable dans un éditeur, et c'est l'**origine** qu'on lui donne.
+La désambiguïsation entre deux expansions y est portée par le nom manglé, pas par
+le numéro de ligne.
+_Éviter_ : origine (qui désigne l'autre notion), numéro de ligne
+
+**Origine** :
+Le fichier et la ligne où l'auteur a écrit un nom, **avant** préprocesseur. C'est
+ce que porte la table des symboles, et ce sur quoi un clic dans un débogueur doit
+pouvoir ouvrir un éditeur. Plusieurs noms peuvent la partager : trois expansions
+d'une même macro donnent trois symboles et une seule origine.
+_Éviter_ : provenance (qui désigne l'attribution d'un octet)
 
 **Configuration RAM** :
 L'une des huit combinaisons de pagination du gate array, sélectionnée par
@@ -213,7 +235,9 @@ l'assemblage. Hors d'une base, ces zones valent zéro.
 _Éviter_ : socle, overlay (qui désigne ce qu'on pose, soit l'inverse), dump firmware
 
 **Artefact** :
-Un fichier produit par un backend. Un backend en rend un ensemble, pas un seul.
+Un fichier produit par l'assemblage. Un backend en rend un ensemble, pas un seul ;
+mais tous ne viennent pas d'un backend — la source déroulée, le source mis en forme
+et la table des symboles en sont aussi.
 _Éviter_ : sortie, output, binaire
 
 ### Diagnostics
@@ -222,7 +246,15 @@ _Éviter_ : sortie, output, binaire
 La correspondance, ligne de source par ligne de source, entre banque, adresse
 logique et octets produits. C'est ce qui rend consultable ce que l'assembleur a
 réellement décidé.
-_Éviter_ : dump, trace
+_Éviter_ : dump, trace, table des symboles (une ligne par nom, pas par ligne de
+source, et sans un octet)
+
+**Table des symboles** :
+Un artefact d'une ligne par **nom** : les labels et les constantes, avec leur type,
+leur adresse logique, leur banque et leur adresse de rangement, et leur origine.
+Destinée à un désassembleur ou un émulateur, jamais à un humain qui lit son
+terminal. Ne contient ni variable ni octet.
+_Éviter_ : listing, map, .lst
 
 ### Architecture
 

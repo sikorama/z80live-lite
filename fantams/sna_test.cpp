@@ -98,6 +98,43 @@ int main() {
         ok("base : l'octet ecrit gagne", s2[256 + 0x8000] == 0xC9);
         ok("base : un ZERO ecrit gagne aussi", s2[256 + 0x8001] == 0x00);
         ok("base : hors coverage, la memoire vient de la base", s2[256 + 0x4000] == 0xAA);
+
+        // --- dump de 128 K (ADR 0006) ---------------------------------------
+        // Le dump reste PLAT : 131 072 octets, banques 0..7 dans l'ordre. Ce que
+        // lit un dump de 64 K lit celui-la, ce que des chunks ne garantissent pas.
+        {
+            std::vector<uint8_t> big(131072, 0);
+            big[0x8000] = 0xC9;
+            big[5 * 0x4000] = 0xAB;      // banque 5, offset 0
+            big[7 * 0x4000 + 3] = 0xCD;  // banque 7, offset 3
+            sna::Options o3; o3.pc = 0x8000;
+            std::vector<uint8_t> s3 = sna::build(big, o3, nullptr, nullptr, 128);
+
+            ok("128K : taille = 256 + 128K", s3.size() == 256 + 131072);
+            ok("128K : l'en-tete annonce 128 Ko", s3[0x6B] == 128 && s3[0x6C] == 0);
+            ok("128K : banque 1 a sa place", s3[256 + 0x8000] == 0xC9);
+            ok("128K : banque 5 a sa place", s3[256 + 5 * 0x4000] == 0xAB);
+            ok("128K : banque 7 a sa place", s3[256 + 7 * 0x4000 + 3] == 0xCD);
+
+            // 64 Ko reste le defaut, et n'emporte que les banques 0..3.
+            std::vector<uint8_t> s4 = sna::build(big, o3);
+            ok("64K : taille inchangee", s4.size() == 256 + 65536);
+            ok("64K : l'en-tete annonce 64 Ko", s4[0x6B] == 64 && s4[0x6C] == 0);
+            ok("64K : la banque 5 n'y est pas", s4.size() == 256 + 65536);
+        }
+
+        // Une base de 64 K sert de fond aux 64 K de base ; au-dela, l'image fait
+        // foi seule — le firmware ne vit pas dans l'extension.
+        {
+            std::vector<uint8_t> img2(131072, 0), cov2(65536, 0);
+            img2[0x8000] = 0xC9; cov2[0x8000] = 1;
+            img2[6 * 0x4000] = 0xEE;
+            sna::Options o4; o4.pc = 0x8000;
+            std::vector<uint8_t> s5 = sna::build(img2, o4, &base, &cov2, 128);
+            ok("base + 128K : taille", s5.size() == 256 + 131072);
+            ok("base + 128K : hors coverage, la base gagne dans les 64K", s5[256 + 0x4000] == 0xAA);
+            ok("base + 128K : la banque 6 vient de l'image", s5[256 + 6 * 0x4000] == 0xEE);
+        }
         ok("base : le vecteur d'indirection survit", s2[256 + 0xBD00] == 0x55);
     }
 

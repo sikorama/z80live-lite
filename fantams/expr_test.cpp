@@ -35,6 +35,19 @@ int main() {
     g_syms["start"] = 0x8000;
 
     // --- de base (préservé du comportement historique) ---
+    // --- puissance (ADR 0008) ----------------------------------------------
+    chk("puissance", "2**3", 8);
+    chk("puissance, grands nombres", "2**10", 1024);
+    // Plus liante que l'unaire : -(2**2), comme partout ailleurs.
+    chk("l'unaire moins s'applique APRÈS", "-2**2", -4);
+    // Associative à DROITE : 2**(3**2) = 2**9, et non (2**3)**2 = 64.
+    chk("associative à droite", "2**3**2", 512);
+    chk("exposant négatif", "4**-1 * 4", 1);
+    chk("'*' simple n'est pas touché", "2*3", 6);
+    chk("'^' reste le ou exclusif", "3^2", 1);
+    chk("espaces autour de **", "2 ** 3", 8);
+    chkErr("'***' n'est pas un opérateur", "2***3");
+
     chk("entier décimal", "42", 42);
     chk("hexa #", "#1234", 0x1234);
     chk("hexa 0x", "0x1234", 0x1234);

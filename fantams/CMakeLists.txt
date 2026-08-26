@@ -32,7 +32,9 @@ target_link_libraries(beautify PUBLIC keywords)
 add_library(sna STATIC sna.cpp)
 target_include_directories(sna PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
-add_library(asmlib STATIC asm.cpp)
+# sym.cpp : le format de la table des symboles (ADR 0019), fonction pure —
+# il vit avec l'assembleur parce qu'il ne rend que son Output.
+add_library(asmlib STATIC asm.cpp sym.cpp)
 target_include_directories(asmlib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(asmlib PUBLIC parser z80 pp sna keywords)
 

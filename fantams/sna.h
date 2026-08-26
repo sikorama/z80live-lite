@@ -33,14 +33,24 @@ struct Base {
 // de 64K : refuse le reste en nommant le remplaçant, plutôt que de deviner.
 bool parseBase(const std::vector<uint8_t> &snapshot, Base &out, std::string &error);
 
-// `image64k` doit faire 65536 octets. Renvoie l'en-tête (256o) + le dump 64K.
+// `image` porte les banques 0..7 à plat. `dumpKo` vaut 64 (banques 0..3) ou 128
+// (le 6128 complet) : c'est l'appelant qui tranche, à partir des banques que le
+// source a réellement écrites. Renvoie l'en-tête (256o) + le dump.
 //
-// Avec une base, `coverage` (65536 octets, non nul là où le source a écrit — cf.
+// Le dump reste PLAT dans les deux cas. Les chunks `MEM0`/`MEM1` du v3 ne
+// deviennent nécessaires qu'au-delà de 128 K, ou pour la compression ; un dump
+// plat de 128 K est lu par tout ce qui lit un dump de 64 K, ce que des chunks ne
+// garantissent pas.
+//
+// Avec une base, `coverage` (non nul là où le source a écrit — cf.
 // `asmb::Output::coverage`) départage : hors coverage, l'octet vient de la base.
 // Une coverage absente ferait écraser toute la base par l'image, ce qui vide la
-// base de son sens : l'appelant doit la fournir.
-std::vector<uint8_t> build(const std::vector<uint8_t> &image64k, const Options &opt,
+// base de son sens : l'appelant doit la fournir. La base ne couvre que les 64 K
+// de base — le firmware ne vit pas dans l'extension — donc les banques hautes
+// viennent toujours de l'image.
+std::vector<uint8_t> build(const std::vector<uint8_t> &image, const Options &opt,
                            const Base *base = nullptr,
-                           const std::vector<uint8_t> *coverage = nullptr);
+                           const std::vector<uint8_t> *coverage = nullptr,
+                           int dumpKo = 64);
 
 } // namespace sna

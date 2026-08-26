@@ -114,17 +114,50 @@ int main() {
     keep("label déjà pourvu", "start:\n    ld a,1\n");
     keep("label avec ':' détaché", "start :\n    ld a,1\n");
     chk("label local", ".loop\n    nop\n", ".loop:\n    nop\n");
-    chk("label indenté : le ':' oui, l'indentation non",
-        "  start\n    nop\n", "  start:\n    nop\n");
+    // Un nom INDENTÉ et seul ne reçoit rien : c'est la forme d'un appel de macro
+    // sans argument, et un `include` peut apporter la macro sans que le prescan la
+    // voie. L'assembleur avertit déjà que seuls les labels commencent en colonne 1 ;
+    // le beautify s'appuie sur cette convention plutôt que de deviner.
+    chk("nom indenté et seul : pas de ':', mais indenté comme du code",
+        "  start\n    nop\n", "    start\n    nop\n");
     chk("commentaire de fin conservé (décalé d'un cran)",
         "start ; entree\n", "start: ; entree\n");
 
     // Ce que la règle 1 REFUSE de faire : deviner.
-    keep("appel de macro laissé intact", "sprite 4,12\n");
-    keep("appel de macro sans argument laissé intact", "cls 0\n");
-    keep("constante EQU", "ecran EQU #C000\n");
-    keep("variable '='", "compteur = 3\n");
-    keep("label sans ':' + instruction : intact, le doute est justifié", "start ld a,1\n");
+    chk("appel de macro : pas de ':', mais indenté", "sprite 4,12\n", "    sprite 4,12\n");
+    chk("nom + argument non réservé : pas de ':'", "cls 0\n", "    cls 0\n");
+    // Une définition est du CODE : jamais de ':', mais indentée comme le reste du
+    // bloc où elle vit (« v=v-1 » dans un REPEAT est une étape de calcul).
+    chk("constante EQU", "ecran EQU #C000\n", "    ecran EQU #C000\n");
+    chk("variable '='", "compteur = 3\n", "    compteur = 3\n");
+    // Ce qui SUIT lève le doute quand il est réservé : aucun appel de macro ne
+    // commence par `ld` ni par `dw`. C'est le seul cas où un nom sans deux-points
+    // suivi de code est décidable — et il l'est complètement.
+    chk("nom + mot réservé : c'est un label, donc ':' et détachement",
+        "start ld a,1\n", "start:\n    ld a,1\n");
+    chk("nom + directive de données", "pcoltab dw coltab\n", "pcoltab:\n    dw coltab\n");
+
+    // --- règle 1 : le prescan des macros (ADR 0013 amendé) ------------------
+    // Un appel SANS ARGUMENT est un nom seul sur sa ligne : sans le prescan il
+    // recevrait un deux-points et l'appel disparaîtrait.
+    // (`macro`/`endm` sont réservés à cette phase : la règle 2 les indente. Ce que
+    // ces cas vérifient est la DERNIÈRE ligne — l'appel, laissé intact.)
+    chk("appel sans argument, macro définie « macro nom »",
+        "macro fill_screen\n    ret\nendm\nfill_screen\n",
+        "    macro fill_screen\n        ret\n    endm\n    fill_screen()\n", kw::Phase::Preprocess);
+    chk("appel sans argument, macro définie « nom macro »",
+        "fill_screen macro\n    ret\nendm\nfill_screen\n",
+        "    macro fill_screen\n        ret\n    endm\n    fill_screen()\n", kw::Phase::Preprocess);
+    chk("le ':' de « macro nom: » n'appartient pas au nom",
+        "macro fill_screen:\n    ret\nendm\nfill_screen\n",
+        "    macro fill_screen:\n        ret\n    endm\n    fill_screen()\n", kw::Phase::Preprocess);
+    chk("appel AVANT la définition : le prescan lit tout le texte d'abord",
+        "fill_screen\nmacro fill_screen\nret\nendm\n",
+        "    fill_screen()\n    macro fill_screen\n        ret\n    endm\n", kw::Phase::Preprocess);
+    // Le prescan ne doit pas neutraliser un VRAI label homonyme d'aucune macro.
+    chk("nom qui n'est aucune macro : label comme avant",
+        "macro autre\nendm\nstart\n", "    macro autre\n    endm\nstart:\n",
+        kw::Phase::Preprocess);
 
     // --- règle 3 : détachement des labels (ADR 0017) ------------------------
     chk("label détaché de son instruction", "start: ld a,1\n", "start:\n    ld a,1\n");
@@ -133,7 +166,64 @@ int main() {
     chk("label local détaché aussi", ".loop: djnz .loop\n", ".loop:\n    djnz .loop\n");
     okc("opt-out : la ligne reste entière",
         beautify::apply("start: ld a,1\n", kw::Phase::Assembly, /*detach=*/false) == "start: ld a,1\n");
-    keep("sans ':' rien n'est détaché : ce peut être un appel de macro", "sprite 4,12\n");
+    chk("sans ':' ni mot réservé, rien n'est détaché", "sprite 4,12\n", "    sprite 4,12\n");
+
+    // --- appel parenthésé (ADR 0018) ---------------------------------------
+    // `nom(` se lit SANS connaître les macros : c'est la seule graphie qui vaille
+    // pour une macro pas encore écrite. Jamais un label, donc jamais de ':'.
+    chk("appel parenthésé : jamais un label, indenté comme du code",
+        "DBPIXM0(v,v)\n", "    DBPIXM0(v,v)\n");
+    chk("appel parenthésé sans argument", "fill_screen()\n", "    fill_screen()\n");
+    // Une macro CONNUE appelée nue reçoit ses parenthèses : l'assembleur avertit
+    // désormais sur la forme nue, donc le beautify a le droit de l'éteindre.
+    chk("macro connue appelée nue : les parenthèses sont posées",
+        "macro cls\nnop\nendm\ncls\n",
+        "    macro cls\n        nop\n    endm\n    cls()\n", kw::Phase::Preprocess);
+    chk("macro connue avec arguments",
+        "macro spr p,q\nnop\nendm\nspr 4,12\n",
+        "    macro spr p,q\n        nop\n    endm\n    spr(4,12)\n", kw::Phase::Preprocess);
+    chk("définition parenthésée : le prescan retient le NOM, pas la liste",
+        "macro spr(p,q)\nnop\nendm\nspr 4,12\n",
+        "    macro spr(p,q)\n        nop\n    endm\n    spr(4,12)\n", kw::Phase::Preprocess);
+    chk("commentaire conservé quand les parenthèses sont posées",
+        "macro cls\nnop\nendm\ncls ; efface\n",
+        "    macro cls\n        nop\n    endm\n    cls() ; efface\n", kw::Phase::Preprocess);
+    // Un nom INCONNU reste intouché : c'est tout le sens de l'asymétrie.
+    chk("nom inconnu : pas de parenthèses inventées", "sprite 4,12\n", "    sprite 4,12\n");
+    // La table fournie par l'appelant (préprocesseur, includes lus) complète le
+    // prescan textuel.
+    okc("macros connues de l'appelant : traitées comme le prescan",
+        beautify::apply("depuis_include\n", kw::Phase::Preprocess, true, true, {"DEPUIS_INCLUDE"})
+            == "    depuis_include()\n");
+    okc("sans cette table, le même texte reste un label",
+        beautify::apply("depuis_include\n", kw::Phase::Preprocess) == "depuis_include:\n");
+
+    // --- règle 4 : colonne 1 pour les labels, un cran par bloc --------------
+    chk("label indenté ramené en colonne 1", "  start:\n  nop\n", "start:\n    nop\n");
+    chk("label dans un bloc : colonne 1 quand même",
+        "repeat 2\n  boucle:\n  nop\nrend\n",
+        "    repeat 2\nboucle:\n        nop\n    rend\n", kw::Phase::Preprocess);
+    chk("repeat imbriqués",
+        "repeat 3\nv=15\nrepeat 14\nnop\nv=v-1\nrend\nrend\n",
+        "    repeat 3\n        v=15\n        repeat 14\n            nop\n"
+        "            v=v-1\n        rend\n    rend\n", kw::Phase::Preprocess);
+    chk("la fermeture s'aligne sur son ouvreur, pas sur le corps",
+        "if 1\nnop\nendif\n", "    if 1\n        nop\n    endif\n", kw::Phase::Preprocess);
+    chk("'end' polyvalent ferme aussi un cran",
+        "while 1\nnop\nend\n", "    while 1\n        nop\n    end\n", kw::Phase::Preprocess);
+    chk("bloc ouvert ET fermé sur une ligne : la profondeur ne dérive pas",
+        "repeat 3 : dw 1 : rend\nnop\n", "    repeat 3 : dw 1 : rend\n    nop\n",
+        kw::Phase::Preprocess);
+    chk("fermeture orpheline : pas de dérive vers la gauche",
+        "rend\nnop\n", "    rend\n    nop\n", kw::Phase::Preprocess);
+    chk("MODULE n'ouvre pas de bloc (ADR 0016)",
+        "module gfx\nnop\n", "    module gfx\n    nop\n", kw::Phase::Preprocess);
+    okc("opt-out : sans indentation de bloc, un seul cran",
+        beautify::apply("repeat 2\nnop\nrend\n", kw::Phase::Preprocess, true, /*indentBlocks=*/false)
+            == "    repeat 2\n    nop\n    rend\n");
+    chk("commentaire seul : son alignement appartient à l'auteur",
+        "repeat 2\n  ; a la main\nrend\n",
+        "    repeat 2\n  ; a la main\n    rend\n", kw::Phase::Preprocess);
 
     // --- règle 2 : quatre espaces ------------------------------------------
     chk("instruction en colonne 1", "start:\nnop\n", "start:\n    nop\n");
@@ -157,13 +247,15 @@ int main() {
     // `LET` n'est un mot réservé qu'au temps préprocesseur. Au temps
     // d'assemblage il n'existe plus, donc `let` y est lu comme un label — et la
     // ligne est laissée intacte, faute de savoir.
-    keep("LET au temps d'assemblage : inconnu, donc intact", "let n = 3\n");
+    chk("LET au temps d'assemblage : pas de ':', mais indenté",
+        "let n = 3\n", "    let n = 3\n");
     chk("LET au temps préprocesseur : c'est une directive",
         "let n = 3\n", "    let n = 3\n", kw::Phase::Preprocess);
-    chk("REPEAT au temps préprocesseur", "repeat 3\nnop\nrend\n",
-        "    repeat 3\n    nop\n    rend\n", kw::Phase::Preprocess);
-    keep("déclaration « nom MACRO params » : ce n'est pas un label",
-         "cls MACRO couleur\n", kw::Phase::Preprocess);
+    chk("REPEAT au temps préprocesseur : le corps prend un cran",
+        "repeat 3\nnop\nrend\n",
+        "    repeat 3\n        nop\n    rend\n", kw::Phase::Preprocess);
+    chk("déclaration « nom MACRO params » : ce n'est pas un label, et elle est réécrite",
+        "cls MACRO couleur\n", "    MACRO cls couleur\n", kw::Phase::Preprocess);
     chk("mnémonique reconnu aux deux phases", "nop\n", "    nop\n", kw::Phase::Preprocess);
     // Les mots-clés de FIN de bloc sont seuls sur leur ligne : au mauvais cran
     // ils seraient lus comme un label seul et recevraient un deux-points, ce qui
@@ -174,16 +266,29 @@ int main() {
     chk("ENDM, REND, WEND, ENDIF : idem",
         "endm\nrend\nwend\nendif\n", "    endm\n    rend\n    wend\n    endif\n",
         kw::Phase::Preprocess);
-    chk("macro complète : rien de détruit",
-        "cls MACRO c\nld a,{c}\nMEND\n", "cls MACRO c\n    ld a,{c}\n    MEND\n",
+    // « nom MACRO p » est une graphie héritée, avertie par l'assembleur — donc que
+    // le beautify a le droit de réécrire, comme les parenthèses d'appel.
+    chk("macro complète : rien de détruit, le corps prend un cran",
+        "cls MACRO c\nld a,{c}\nMEND\n", "    MACRO cls c\n        ld a,{c}\n    MEND\n",
         kw::Phase::Preprocess);
+    chk("« nom macro » minuscule : la casse du mot-clé est épousée",
+        "cls macro c\nnop\nendm\n", "    macro cls c\n        nop\n    endm\n",
+        kw::Phase::Preprocess);
+    chk("« nom macro » sans paramètre", "foo macro\nnop\nendm\n",
+        "    macro foo\n        nop\n    endm\n", kw::Phase::Preprocess);
+    keep("« macro nom » est déjà canonique", "    macro cls c\n        nop\n    endm\n",
+         kw::Phase::Preprocess);
+
+    // --- ld pc,rr (ADR 0017 : une orthographe) ------------------------------
+    keep("« ld pc,hl » n'est pas de la mise en forme : le beautify n'y touche pas",
+         "    ld pc,hl\n");
 
     // --- préservation du texte --------------------------------------------
     keep("pas de saut de ligne final : rien n'est ajouté", "start:\n    nop");
     chk("saut de ligne final unique conservé", "nop\n", "    nop\n");
     chk("fin de ligne Windows conservée", "nop\r\n", "    nop\r\n");
     chk("texte vide", "", "");
-    keep("espaces de fin conservés", "    nop   \n");
+chk("espaces de fin retirés", "    nop   \n", "    nop\n");
     keep("espacement interne des opérandes non touché", "    ld  a ,  1\n");
 
     {

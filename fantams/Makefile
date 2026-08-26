@@ -4,7 +4,7 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -O2
 
 .PHONY: all test clean
 
-CORE = z80.cpp expr.cpp keywords.cpp parser.cpp pp.cpp asm.cpp beautify.cpp sna.cpp
+CORE = z80.cpp expr.cpp keywords.cpp parser.cpp pp.cpp asm.cpp beautify.cpp sna.cpp sym.cpp
 
 all: z80_test expr_test pp_test parser_test asm_test beautify_test sna_test ppdump fantams
 
@@ -22,8 +22,8 @@ pp_test: pp.cpp expr.cpp z80.cpp keywords.cpp pp_test.cpp pp.h expr.h z80.h keyw
 parser_test: parser.cpp z80.cpp keywords.cpp parser_test.cpp parser.h z80.h keywords.h
 	$(CXX) $(CXXFLAGS) parser.cpp z80.cpp keywords.cpp parser_test.cpp -o $@
 
-asm_test: asm.cpp parser.cpp z80.cpp expr.cpp keywords.cpp asm_test.cpp asm.h keywords.h
-	$(CXX) $(CXXFLAGS) asm.cpp parser.cpp z80.cpp expr.cpp keywords.cpp asm_test.cpp -o $@
+asm_test: asm.cpp sym.cpp parser.cpp z80.cpp expr.cpp keywords.cpp asm_test.cpp asm.h sym.h keywords.h
+	$(CXX) $(CXXFLAGS) asm.cpp sym.cpp parser.cpp z80.cpp expr.cpp keywords.cpp asm_test.cpp -o $@
 
 # Le beautify n'a besoin que du parseur et du vocabulaire réservé : ni adresse,
 # ni octet, ni assemblage (ADR 0013).
@@ -38,7 +38,7 @@ sna_test: sna.cpp sna_test.cpp sna.h
 ppdump: pp.cpp expr.cpp z80.cpp keywords.cpp pp_main.cpp pp.h expr.h z80.h keywords.h
 	$(CXX) $(CXXFLAGS) pp.cpp expr.cpp z80.cpp keywords.cpp pp_main.cpp -o $@
 
-fantams: $(CORE) asm_main.cpp asm.h pp.h
+fantams: $(CORE) asm_main.cpp asm.h pp.h sym.h
 	$(CXX) $(CXXFLAGS) $(CORE) asm_main.cpp -o $@
 
 test: z80_test expr_test pp_test parser_test asm_test beautify_test sna_test

@@ -17,7 +17,9 @@
 #pragma once
 
 #include <functional>
+#include <cstddef>
 #include <string>
+#include <vector>
 
 namespace kw {
 
@@ -39,12 +41,76 @@ enum class Phase {
 // main au moment d'appeler, et le convertir ici le referait deux fois.
 bool isReservedWord(const std::string &upperTok, Phase ph);
 
+// Position d'un '=' d'ASSIGNATION (ni ==, <=, >=, !=), hors chaîne, ou npos.
+//
+// Vit ici parce que trois étages doivent s'accorder sur ce qui est une définition
+// — le préprocesseur, l'assembleur et la mise en forme. Deux lectures divergentes
+// de « nom = valeur » leur feraient voir des sources différentes : le beautify
+// ajouterait un deux-points là où l'assembleur voit une variable.
+size_t findAssign(const std::string &s);
+
+// --- Les blocs (ADR 0016) ------------------------------------------------
+//
+// `END` ferme le bloc ouvert le plus interne, quel qu'il soit.
+// MODULE n'y figure pas : il bascule le module actif, il n'ouvre pas un bloc —
+// deux MODULE pour un ENDMODULE est la forme normale.
+//
+// Vit ici, et non dans le préprocesseur, parce que la mise en forme en est le
+// second lecteur : elle indente les corps de bloc. Deux tables divergentes lui
+// feraient compter des crans sur des mots que le préprocesseur ne reconnaît pas.
+struct BlockKind {
+    const char *kind;                  // nom du bloc dans les diagnostics
+    std::vector<const char *> openers; // mots qui l'ouvrent
+    std::vector<const char *> closers; // canonique en tête, puis les tolérées
+};
+const std::vector<BlockKind> &blockKinds();
+
+// Le bloc qu'ouvre ce mot-clé (MAJUSCULES), ou "".
+std::string blockOfOpener(const std::string &kw);
+// Le bloc que ferme ce mot-clé, "*" pour `END` qui ferme n'importe lequel, ou "".
+std::string blockOfCloser(const std::string &kw);
+// La fermeture canonique d'un bloc, pour les diagnostics.
+std::string canonicalCloser(const std::string &kind);
+
 // Registres, paires et conditions du Z80. Contrairement aux mots ci-dessus, cet
 // ensemble n'est PAS indexé par phase : un registre est un mot de la machine à
 // toutes les phases. Il vivait dans `pp.cpp`, seul à le consulter, alors qu'il
 // décrit le vocabulaire de la machine — exactement la duplication que cet
 // en-tête a supprimée pour les labels (ADR 0015).
 bool isMachineWord(const std::string &upperTok);
+
+// « nom(args) » — appel de macro parenthésé (ADR 0018).
+//
+// La parenthèse est COLLÉE au nom et la fermeture est le DERNIER caractère. Les
+// deux conditions sont ce qui rend la forme non ambiguë : `sprite (4),12` garde
+// son sens d'appel nu dont le premier argument est parenthésé, et un premier
+// argument parenthésé s'écrit `sprite((4),12)`.
+//
+// C'est la seule graphie d'appel qui se reconnaît SANS savoir si le nom est une
+// macro — donc la seule qui survive à une macro pas encore écrite, ou apportée
+// par un `include` que le lecteur n'a pas sous les yeux.
+bool parenCall(const std::string &s, std::string &name, std::string &args);
+
+// « ld pc,hl » -> « jp (hl) » (idem ix, iy), ou la chaine inchangee.
+//
+// Une ORTHOGRAPHE, au sens de l'ADR 0017 : un pour un, un seul octet, aucune
+// adresse en jeu. L'assembleur la tolere donc de son cote, exactement comme
+// `defb`, et la canonisation la reecrit vers la forme standard.
+//
+// Le canon reste `jp (hl)` bien que la notation soit mauvaise — les parentheses
+// y suggerent une indirection qui n'existe pas. Mais `ld pc,hl` n'est du Z80
+// standard pour personne, et un canon que les autres assembleurs refusent perd
+// ce qui fait sa valeur.
+std::string canonicalJump(const std::string &stmt);
+
+// « b12 » : une reference de banque, telle qu'elle prefixe une adresse dans
+// « org b4:0x4000 » (ADR 0005). Le numero n'est pas borne ici — c'est a
+// l'assembleur de dire si la banque existe.
+//
+// Vit ici parce que le DECOUPAGE des instructions en depend : le ':' d'un prefixe
+// de banque n'est pas un separateur, et le preprocesseur doit le savoir avant que
+// l'assembleur ait la moindre chance de voir la ligne.
+bool isBankRef(const std::string &tok);
 
 // Un identifiant utilisateur ne porte pas un nom du langage ni de la machine
 // (ADR 0015). Rend le diagnostic à émettre, ou "" si le nom est libre.
@@ -102,5 +168,8 @@ inline std::string stripComment(const std::string &s) {
 }
 
 bool isIdentChar(char c);
+// Un identifiant complet : au moins un caractère, ne commençant pas par un
+// chiffre, tous acceptés par `isIdentChar`.
+bool isIdentifier(const std::string &s);
 
 } // namespace kw

@@ -1,6 +1,8 @@
 // asm.cpp - Assembleur 2 passes (voir asm.h)
 #include "asm.h"
 
+#include <map>
+
 #include <cmath>
 #include "expr.h"
 #include "keywords.h"
@@ -49,22 +51,6 @@ std::vector<std::string> splitTopLevel(const std::string &s, char delim) {
     out.push_back(trim(cur));
     return out;
 }
-// Position d'un '=' d'assignation (pas ==, <=, >=, !=), hors chaîne.
-size_t findAssign(const std::string &s) {
-    bool inStr = false; char q = 0;
-    for (size_t i = 0; i < s.size(); ++i) {
-        char c = s[i];
-        if (inStr) { if (c == q) inStr = false; continue; }
-        if (c == '"' || c == '\'') { inStr = true; q = c; continue; }
-        if (c == '=') {
-            char prev = i > 0 ? s[i - 1] : 0, next = i + 1 < s.size() ? s[i + 1] : 0;
-            if (prev == '<' || prev == '>' || prev == '!' || prev == '=') continue;
-            if (next == '=') continue;
-            return i;
-        }
-    }
-    return std::string::npos;
-}
 // Texte d'un littéral, ou l'argument tel quel s'il n'en est pas un — pour les
 // messages (ASSERT), où un argument non quoté reste lisible.
 std::string literalText(const std::string &s) {
@@ -88,14 +74,14 @@ std::string formatValue(int64_t v, const std::string &fmt) {
 class Assembler : public z80::IAsmContext {
 public:
     Output run(const std::vector<SourceLine> &lines) {
-        image_.assign(65536, 0);
-        prov_.assign(65536, 0);
+        spaces_.clear();
         sites_.clear();
         ov_.active = false;
         symbols_.clear();
         ciIndex_.clear();
+        symInfo_.clear();
 
-        pass_ = 1; pc_ = 0; lo_ = 0x10000; hi_ = 0; definedP1_.clear(); equDefs_.clear(); currentGlobal_.clear();
+        pass_ = 1; pc_ = 0; lo_ = 0x10000; hi_ = 0; orgBank_ = -1; displacement_ = 0; definedP1_.clear(); equDefs_.clear(); currentGlobal_.clear();
         badNames_.clear();
         for (const auto &l : lines) process(l);
 
@@ -112,38 +98,91 @@ public:
             if (!changed) break;
         }
 
-        pass_ = 2; pc_ = 0; lo_ = 0x10000; hi_ = 0; currentGlobal_.clear();
+        pass_ = 2; pc_ = 0; lo_ = 0x10000; hi_ = 0; orgBank_ = -1; displacement_ = 0;
+        displacedRanges_.clear(); currentGlobal_.clear();
         for (const auto &l : lines) process(l);
         flushOverlap();   // le dernier chevauchement accumulé doit sortir avant les diagnostics
+        warnRunDisplaced();
 
         Output o;
         // Output.symbols reste entier : c'est une table d'ADRESSES destinee aux
         // outils et aux humains. La precision reelle n'a d'interet qu'a
         // l'interieur du calcul d'expressions.
         for (const auto &kv : symbols_) o.symbols[kv.first] = (int64_t)std::llround(kv.second);
+        // La table exportable : la VALEUR vient de `symbols_`, pour qu'un EQU
+        // resolu a point fixe porte sa valeur finale et non sa premiere lecture.
+        for (const auto &kv : symInfo_) {
+            auto v = symbols_.find(kv.first);
+            if (v == symbols_.end()) continue;   // nom refuse en cours de route
+            Symbol sy = kv.second;
+            sy.value = (int64_t)std::llround(v->second);
+            o.symbolTable.push_back(sy);
+        }
         o.errors = errors_;
         o.warnings = warnings_;
         o.prints = prints_;
         o.ok = errors_.empty();
-        o.image = image_;
-        o.coverage.assign(65536, 0);
-        for (int a = 0; a < 65536; ++a) o.coverage[a] = prov_[a] ? 1 : 0;
+        // L'image plate est RECONSTITUEE depuis les banques de base, pour que
+        // `sna::build` et le harnais de comparaison restent inchangés tant que le
+        // format de sortie est plat.
+        o.image.assign(kFlatBanks * 0x4000, 0);
+        o.coverage.assign(kFlatBanks * 0x4000, 0);
+        for (const auto &kv : spaces_) {
+            o.banksWritten.push_back(kv.first);
+            if (kv.first >= kFlatBanks) continue;   // hors de portée d'un dump plat
+            const int base = kv.first * 0x4000;
+            for (int k = 0; k < 0x4000; ++k) {
+                o.image[base + k] = kv.second.bytes[k];
+                o.coverage[base + k] = kv.second.prov[k] ? 1 : 0;
+            }
+        }
         if (hi_ > lo_) {
             o.loadAddress = (uint16_t)lo_;
-            o.bin.assign(image_.begin() + lo_, image_.begin() + hi_);
+            o.bin.assign(o.image.begin() + lo_, o.image.begin() + hi_);
         }
         o.runAddress = hasRun_ ? (uint16_t)run_ : o.loadAddress;
         return o;
     }
 
+    // Un RUN qui tombe dans un bloc deplace fait demarrer le PC sur de la memoire
+    // vide : les octets sont ranges ailleurs, en attente d'etre recopies. Le PC
+    // reste celui que la source a demande — « run label » doit valoir ce que vaut
+    // « label », sinon plus rien n'est previsible — mais le silence laisserait une
+    // panne a l'execution sans diagnostic, la meme raison qui fait avertir sur une
+    // banque remanente (ADR 0005).
+    void warnRunDisplaced() {
+        if (!hasRun_) return;
+        const int r = run_ & 0xFFFF;
+        for (const auto &g : displacedRanges_) {
+            if (r < g.first || r >= g.second) continue;
+            char msg[192];
+            snprintf(msg, sizeof msg,
+                     "RUN &%04X falls inside a displaced ORG block: the bytes are stored elsewhere, "
+                     "so nothing is at this address until a loader copies them there", r);
+            warnings_.push_back({runFile_, runLine_, msg});
+            return;
+        }
+    }
+
     // --- IAsmContext ---
     void emit(uint8_t b) override {
-        int a = pc_ & 0xFFFF;
         if (pass_ == 2) {
-            noteWrite(a);
-            image_[a] = b;
-            if (a < lo_) lo_ = a;
-            if (a + 1 > hi_) hi_ = a + 1;
+            // L'octet va a l'adresse de RANGEMENT ; l'adresse logique, elle, ne
+            // sert qu'aux labels et aux expressions. Hors bloc deplace les deux
+            // coincident, `displacement_` valant zero.
+            const int st = (pc_ + displacement_) & 0xFFFF;
+            const int bank = bankOf(st);
+            const int off = st & 0x3FFF;   // ADR 0005 : l'offset est le masquage
+            Space &sp = spaceFor(bank);
+            noteWrite(bank, off, st, sp);
+            sp.bytes[off] = b;
+            // lo_/hi_ ne decrivent que le binaire plat des 64 K de base.
+            if (bank < 4) {
+                const int flat = bank * 0x4000 + off;
+                if (flat < lo_) lo_ = flat;
+                if (flat + 1 > hi_) hi_ = flat + 1;
+            }
+            if (displacement_) noteDisplaced(pc_ & 0xFFFF);
         }
         ++pc_;
     }
@@ -152,6 +191,33 @@ public:
     int64_t eval(const std::string &e) override { return evalExpr(e); }
 
 private:
+    // --- Le modele memoire (ADR 0006) --------------------------------------
+    // Une collection d'espaces de 16 K indexee par banque, et non un tableau plat
+    // de 64 K : le masquage 16 bits ne laissait aucun endroit ou loger une banque.
+    // Les banques 0..3 forment les 64 K de base, les suivantes l'extension.
+    //
+    // Chaque espace porte SA coverage : elle est allouee a la premiere ecriture,
+    // si bien qu'un source qui n'ecrit qu'en banque 4 ne paie pas les 64 K de base.
+    // Les banques 0..7 : les 64 K de base plus l'extension du 6128, soit ce qu'un
+    // dump plat de 128 K sait porter.
+    static const int kFlatBanks = 8;
+
+    struct Space {
+        std::vector<uint8_t> bytes;
+        std::vector<uint16_t> prov;   // 0 = jamais ecrit, sinon 1+index dans sites_
+        Space() : bytes(0x4000, 0), prov(0x4000, 0) {}
+    };
+    std::map<int, Space> spaces_;
+
+    Space &spaceFor(int bank) { return spaces_[bank]; }
+
+    // La banque ou ranger l'octet d'adresse logique `pc`.
+    //
+    // Sans prefixe rencontre, elle SUIT l'adresse — c'est le comportement
+    // historique, et il reste juste : les 64 K de base sont les banques 0..3.
+    // Apres un « org b<n>: », elle est REMANENTE jusqu'au prochain ORG (ADR 0005).
+    int bankOf(int pc) const { return orgBank_ < 0 ? ((pc >> 14) & 3) : orgBank_; }
+
     // --- coverage et provenance (ADR 0012) ---------------------------------
     // prov_[a] : 0 = jamais écrit, sinon 1+index dans sites_, ou kUnknownSite.
     // Deux octets par octet d'image, aujourd'hui sur une image plate de 64K ; le
@@ -164,9 +230,8 @@ private:
     // partagent le même couple (site écrasé, site écrasant) ne donnent qu'un
     // seul avertissement. C'est cette coalescence, et non un plafond, qui
     // empêche un bloc réécrit de produire un avertissement par octet.
-    struct Overlap { bool active = false; int start = 0, end = 0; uint16_t prev = 0, cur = 0; };
+    struct Overlap { bool active = false; int bank = 0, start = 0, end = 0; uint16_t prev = 0, cur = 0; };
 
-    std::vector<uint16_t> prov_;
     std::vector<Site> sites_;
     int curSite_ = -1;      // site de la ligne courante, alloué à sa 1re écriture
     Overlap ov_;
@@ -196,21 +261,38 @@ private:
         std::string where = (ov_.cur == 0 || ov_.cur == kUnknownSite)
                                 ? std::string() : sites_[ov_.cur - 1].file;
         int line = (ov_.cur == 0 || ov_.cur == kUnknownSite) ? 0 : sites_[ov_.cur - 1].line;
+        // La banque n'est nommee que si elle sort des 64 K de base : la mentionner
+        // partout ferait du bruit sur l'immense majorite des sources, qui n'en ont
+        // qu'une notion implicite.
+        char bk[24] = "";
+        if (ov_.bank >= 4) snprintf(bk, sizeof bk, "banque %d, ", ov_.bank);
         warnings_.push_back({where, line,
-            std::string("chevauchement : ") + range + " deja ecrit par " + siteLabel(ov_.prev)});
+            std::string("chevauchement : ") + bk + range + " deja ecrit par " + siteLabel(ov_.prev)});
     }
 
-    void noteWrite(int a) {
+    // `off` localise l'octet DANS sa banque (c'est la que le recouvrement se
+    // produit) ; `addr` est l'adresse de RANGEMENT, celle ou les octets s'ecrasent
+    // reellement et donc celle que le diagnostic doit nommer. Hors bloc deplace
+    // elle est aussi l'adresse logique.
+    void noteWrite(int bank, int off, int addr, Space &sp) {
         uint16_t site = siteId();
-        uint16_t prev = prov_[a];
-        prov_[a] = site;
+        uint16_t prev = sp.prov[off];
+        sp.prov[off] = site;
         if (prev == 0 || prev == site) return;   // écrire sur du vierge, ou se relire soi-même
-        if (ov_.active && ov_.end == a && ov_.prev == prev && ov_.cur == site) { ov_.end = a + 1; return; }
+        if (ov_.active && ov_.bank == bank && ov_.end == addr &&
+            ov_.prev == prev && ov_.cur == site) { ov_.end = addr + 1; return; }
         flushOverlap();
-        ov_ = {true, a, a + 1, prev, site};
+        ov_ = {true, bank, addr, addr + 1, prev, site};
     }
 
-    std::vector<uint8_t> image_;
+    void noteDisplaced(int a) {
+        if (!displacedRanges_.empty() && displacedRanges_.back().second == a) {
+            displacedRanges_.back().second = a + 1;
+            return;
+        }
+        displacedRanges_.push_back({a, a + 1});
+    }
+
     std::vector<Diagnostic> prints_;
     double lastReal_ = 0;
     bool evalRealLast_ = false;
@@ -218,13 +300,22 @@ private:
     bool inInstruction_ = false;
     std::map<std::string, double> symbols_;   // exact ; arrondi seulement a la sortie
     std::map<std::string, std::string> ciIndex_; // MAJUSCULES(nom) -> nom exact, pour le repli insensible à la casse
+    std::map<std::string, Symbol> symInfo_;      // type, rangement et provenance, pour la table exportable
     std::set<std::string> definedP1_;
     std::vector<std::pair<std::string, std::string>> equDefs_; // (nom, texte expr) pour la résolution
     std::set<std::string> badNames_;          // noms refusés déjà signalés (ADR 0015)
     std::vector<Diagnostic> errors_;
     std::vector<Diagnostic> warnings_;
     int pass_ = 1, pc_ = 0, lo_ = 0, hi_ = 0;
+    int orgBank_ = -1;   // -1 : aucun prefixe rencontre, la banque suit l'adresse
+    // Ecart entre l'adresse de rangement et l'adresse logique, pose par le second
+    // parametre d'ORG. Zero hors bloc deplace, remis a zero par tout ORG nu.
+    int displacement_ = 0;
+    // Les plages d'adresses LOGIQUES couvertes par un bloc deplace. Elles seules
+    // permettent de dire qu'un RUN tombe sur du code qui n'est pas encore la.
+    std::vector<std::pair<int, int>> displacedRanges_;
     int run_ = 0; bool hasRun_ = false;
+    std::string runFile_; int runLine_ = 0;   // provenance du RUN, pour son avertissement
     SourceLine cur_;
     bool evalOk_ = true;
     // dernier label "global" (non local) rencontré : contexte de qualification des
@@ -243,6 +334,32 @@ private:
         return (!n.empty() && n[0] == '.') ? currentGlobal_ + n : n;
     }
     void setSymbol(const std::string &n, double v) { symbols_[n] = v; ciIndex_[upper(n)] = n; }
+
+    // Note ce que la table exportable a besoin de savoir et que `symbols_` ne
+    // porte pas (ADR 0019) : le type, le rangement et la PROVENANCE — fichier et
+    // ligne d'ORIGINE, avant preprocesseur, seule reponse a « ou l'auteur a-t-il
+    // ecrit ce nom ? ».
+    //
+    // En passe 1 seulement : les adresses y sont deja definitives, et les valeurs
+    // sont relues de `symbols_` a la sortie, ce qui donne aux EQU leur valeur
+    // resolue a point fixe plutot que celle de leur premiere lecture.
+    //
+    // Une redefinition ecrase : elle a deja son erreur pour une constante, et pour
+    // une variable il n'y a rien a noter — elles n'entrent pas dans la table.
+    void noteSymbol(const std::string &qn, bool isConst) {
+        if (pass_ != 1) return;
+        Symbol s;
+        s.name = qn;
+        s.isConst = isConst;
+        s.file = cur_.file;
+        s.line = cur_.line;
+        if (!isConst) {
+            const int st = (pc_ + displacement_) & 0xFFFF;
+            s.bank = bankOf(st);
+            s.store = st;
+        }
+        symInfo_[qn] = s;
+    }
 
     // Deux lectures d'une même expression : `evalExpr` pour émettre des octets,
     // `evalExprReal` pour DÉFINIR un symbole. Stocker l'arrondi ferait perdre
@@ -293,6 +410,7 @@ private:
         std::string qn = qualify(n);
         if (pass_ == 1) { if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; } }
         setSymbol(qn, (double)(pc_ & 0xFFFF));
+        noteSymbol(qn, /*isConst=*/false);
     }
     // `reassignable` : une VARIABLE ('=') peut être redéfinie, une CONSTANTE
     // ('EQU') non. Cf. ADR 0003 — "angle = i - 1" dans un "repeat 256,i" est
@@ -304,6 +422,9 @@ private:
             if (!definedP1_.insert(qn).second) { structErr("duplicate symbol: '" + qn + "'"); return; }
         } else if (pass_ == 1) definedP1_.insert(qn);
         setSymbol(qn, v);
+        // Une variable ne va pas dans la table exportable : sa valeur n'est celle
+        // d'aucun point precis du programme, et un desassembleur n'en ferait rien.
+        if (!reassignable) noteSymbol(qn, /*isConst=*/true);
     }
 
     // Un élément de « db » : soit une expression, soit un littéral de chaîne,
@@ -353,6 +474,91 @@ private:
         auto parts = splitTopLevel(ops, ','); dropTrailingEmpty(parts);
         for (auto &p : parts) { int64_t v = evalExpr(p); emit((uint8_t)(v & 0xFF)); emit((uint8_t)((v >> 8) & 0xFF)); }
     }
+    // « org [b<n>:]adresse » (ADR 0005). Le prefixe designe l'emplacement de
+    // RANGEMENT, le nombre qui suit reste l'adresse LOGIQUE — celle que prennent
+    // les labels. L'offset dans la banque vaut « adresse & 0x3FFF ».
+    //
+    // Rien n'est deduit : une banque n'a pas de slot naturel, les configurations
+    // RAM du gate array paginant toute banque supplementaire dans le slot 1. Un
+    // offset derive du numero donnerait des labels faux trois fois sur quatre.
+    // Detache un eventuel prefixe de banque « b<n>: » de `arg`. Renvoie false sur
+    // refus, le message etant deja pousse.
+    bool peelBank(std::string &arg, int &bank) {
+        const size_t colon = arg.find(':');
+        if (colon == std::string::npos) return true;
+        const std::string pfx = trim(arg.substr(0, colon));
+        if (!kw::isBankRef(pfx)) {
+            structErr("ORG: '" + pfx + "' is not a bank reference — write 'org b<n>:<address>'");
+            return false;
+        }
+        const long n = strtol(pfx.c_str() + 1, nullptr, 10);
+        if (n < 0 || n > 255) { structErr("ORG: bank " + std::to_string(n) + " is out of range"); return false; }
+        arg = trim(arg.substr(colon + 1));
+        if (arg.empty()) { structErr("ORG: missing address after the bank prefix"); return false; }
+        bank = (int)n;
+        return true;
+    }
+
+    // ORG prend un ou DEUX parametres, a la semantique rasm (ADR 0005) :
+    //
+    //     org <logique>[,<rangement>]
+    //
+    // Le premier est l'adresse LOGIQUE : celle que prennent les labels, celle
+    // pour laquelle le code est assemble. Le second est l'adresse de RANGEMENT :
+    // la ou les octets sont reellement ecrits, en attendant qu'un chargeur les
+    // recopie a l'adresse logique. Un bloc « org #A600,#100 » est donc du code
+    // ecrit en #100 et destine a tourner en #A600.
+    //
+    // Le prefixe de banque qualifie le RANGEMENT (ADR 0005), il se porte donc sur
+    // le parametre de rangement — le DERNIER. En forme a un parametre, l'unique
+    // adresse fait les deux offices et le prefixe s'y porte, comme avant. Le
+    // prefixe sur le premier parametre d'une forme a deux est REFUSE : le
+    // rangement serait decrit de part et d'autre de l'adresse logique.
+    //
+    // Le deplacement N'EST PAS REMANENT : un ORG sans second parametre le remet a
+    // zero. C'est le comportement de rasm, et c'est le comportement SUR — la
+    // remise a zero remet le bloc la ou son ORG le dit. La banque, elle, reste
+    // remanente et AVERTIT : c'est l'heritage silencieux qui est risque, pas la
+    // remise a zero, d'ou l'asymetrie entre les deux.
+    void doOrg(const std::string &ops) {
+        auto parts = splitTopLevel(ops, ',');
+        dropTrailingEmpty(parts);
+        if (parts.empty()) { structErr("ORG: missing address"); return; }
+        if (parts.size() > 2) {
+            structErr("ORG: too many parameters — write 'org <address>[,<storage address>]'");
+            return;
+        }
+        const bool displaced = parts.size() == 2;
+        std::string logical = trim(parts[0]);
+        std::string storage = displaced ? trim(parts[1]) : std::string();
+
+        const size_t colon = logical.find(':');
+        if (displaced && colon != std::string::npos) {
+            const std::string pfx = trim(logical.substr(0, colon));
+            const std::string addr = trim(logical.substr(colon + 1));
+            if (storage.find(':') != std::string::npos)
+                structErr("ORG: two bank prefixes — the bank qualifies the storage address only, "
+                          "so it belongs on the last parameter");
+            else
+                structErr("ORG: the bank prefix qualifies the STORAGE address, which is the last "
+                          "parameter — write 'org " + addr + "," + pfx + ":" + storage + "'");
+            return;
+        }
+
+        int bank = -1;
+        if (!peelBank(displaced ? storage : logical, bank)) return;
+        if (bank >= 0) orgBank_ = bank;
+        else if (orgBank_ >= 4) {
+            // La banque est REMANENTE, mais un ORG nu qui en herite une hors des
+            // 64 K de base deplacerait silencieusement le bloc si le prefixe a
+            // simplement ete oublie — panne a l'execution, sans diagnostic.
+            warn("ORG without a bank prefix inherits bank " + std::to_string(orgBank_) +
+                 " (write 'org b" + std::to_string(orgBank_) + ":...' to confirm, or 'org b0:...' to leave it)");
+        }
+        pc_ = (int)evalExpr(logical);
+        displacement_ = displaced ? (int)evalExpr(storage) - pc_ : 0;
+    }
+
     void emitDS(const std::string &ops) {
         auto parts = splitTopLevel(ops, ',');
         dropTrailingEmpty(parts);
@@ -381,14 +587,22 @@ private:
         // avertir dessus noierait les vrais cas (un label d'adresse sans ':').
         const bool isDefinition =
             upper(firstToken(rest)) == "EQU" ||
-            (findAssign(rest) != std::string::npos && trim(rest.substr(0, findAssign(rest))).empty());
+            (kw::findAssign(rest) != std::string::npos && trim(rest.substr(0, kw::findAssign(rest))).empty());
         if (!label.empty() && !labelHasColon && !isDefinition)
             warn("label without ':': '" + label + "' (best practice: write '" + label + ":')");
         // contexte de qualification pour les labels locaux ".nom" sur les lignes suivantes
         // (un label local ne change pas le contexte : qualify() ne modifie que ceux en '.').
-        if (!label.empty() && label[0] != '.') currentGlobal_ = label;
+        //
+        // Une DÉFINITION ne le change pas non plus : « delta equ 4 » au milieu d'une
+        // routine nomme une constante, pas une adresse, et les « .x: » qui suivent
+        // appartiennent toujours à la routine. Sans ça, ils devenaient « delta.x » et
+        // « ld (plot.x+1),a » ne trouvait plus rien.
+        if (!label.empty() && label[0] != '.' && !isDefinition) currentGlobal_ = label;
 
-        parser::Result pr = parser::parseLine(code);
+        // L'assembleur TOLÈRE des orthographes, jamais des structures (ADR 0017) :
+        // « ld pc,hl » est acceptée ici au même titre que « defb », sans que la
+        // canonisation ait eu à passer. Un pour un, un octet, aucune adresse.
+        parser::Result pr = parser::parseLine(kw::canonicalJump(code));
         if (pr.isInstruction) {
             if (!label.empty()) defineLabel(label);
             else if (cur_.col0)
@@ -415,8 +629,8 @@ private:
         if (W0 == "BUILDSNA" || W0 == "BANKSET") { if (!label.empty()) defineLabel(label); return; }
 
         // directives d'émission / contrôle
-        if (W0 == "ORG") { pc_ = (int)evalExpr(after0); if (!label.empty()) defineLabel(label); return; }
-        if (W0 == "RUN") { run_ = (int)evalExpr(after0); hasRun_ = true; if (!label.empty()) defineLabel(label); return; }
+        if (W0 == "ORG") { doOrg(after0); if (!label.empty()) defineLabel(label); return; }
+        if (W0 == "RUN") { run_ = (int)evalExpr(after0); hasRun_ = true; runFile_ = cur_.file; runLine_ = cur_.line; if (!label.empty()) defineLabel(label); return; }
         if (W0 == "ALIGN") {
             int64_t n = evalExpr(after0);
             if (n > 0) pc_ = (int)((pc_ + n - 1) & ~(n - 1));
@@ -474,7 +688,13 @@ private:
                 std::string fmt = upper(firstToken(a));
                 if (fmt == "HEX" || fmt == "BIN" || fmt == "CHAR" || fmt == "INT") a = restAfterFirst(a);
                 else fmt = "INT";
-                out += formatValue(evalExpr(a), fmt);
+                const int64_t v = evalExpr(a);
+                // Une expression qui n'a pas pu être évaluée a DÉJÀ produit son
+                // erreur (evalExpr pousse en passe 2). Afficher « 0 » à côté
+                // ajouterait une valeur fabriquée à un diagnostic — le lecteur
+                // croirait à un résultat, alors qu'il n'y en a pas.
+                if (!evalOk_) return;
+                out += formatValue(v, fmt);
             }
             prints_.push_back({cur_.file, cur_.line, out});
             return;
@@ -506,7 +726,7 @@ private:
             if (pass_ == 1) equDefs_.push_back({qualify(w0), e});
             return;
         }
-        size_t eq = findAssign(rest);
+        size_t eq = kw::findAssign(rest);
         if (eq != std::string::npos) {
             std::string lhs = trim(rest.substr(0, eq));
             std::string rhs = trim(rest.substr(eq + 1));
