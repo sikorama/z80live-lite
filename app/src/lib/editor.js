@@ -26,14 +26,35 @@ const z80Strings = {
       }
       return 'string'; // non termine compris : la couleur montre l'oubli
     }
+    // Le mode amont ne reconnait pas les flottants (fantams, si) : sans ce garde,
+    // "3.14" tokenise "3" en NOMBRE puis, au '.', bascule en etiquette locale —
+    // les chiffres apres la virgule heritent alors de la couleur des labels.
+    if (/\d/.test(q) && stream.match(/^\d+\.\d+([eE][+-]?\d+)?/)) return 'number';
     return z80.token(stream, state);
   },
 };
 import { keymap } from '@codemirror/view';
 import { insertTab, indentLess } from '@codemirror/commands';
+import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
+import { tags } from '@lezer/highlight';
 
 // basicSetup ne lie pas Tab : on l'ajoute pour insérer une tabulation (au lieu de sortir du focus).
 const tabKeymap = keymap.of([{ key: 'Tab', run: insertTab }, { key: 'Shift-Tab', run: indentLess }]);
+
+// Le style de coloration syntaxique PAR DEFAUT de CodeMirror (utilise en repli par
+// basicSetup) est calibre pour un fond clair : certaines couleurs (ex. #00f sur les
+// definitions, dont les nombres a virgule mal tokenises ci-dessus heritaient) sont
+// illisibles sur notre fond sombre. On le remplace entierement plutot que de compter
+// sur le fallback.
+const z80Highlight = HighlightStyle.define([
+  { tag: tags.keyword, color: '#ff9d5c' },
+  { tag: [tags.number, tags.atom, tags.bool], color: '#a5d6ff' },
+  { tag: [tags.string, tags.special(tags.string)], color: '#9fd88f' },
+  { tag: tags.comment, color: '#6d7880', fontStyle: 'italic' },
+  { tag: [tags.variableName, tags.definition(tags.variableName)], color: '#cfe3ff' },
+  { tag: tags.special(tags.variableName), color: '#7cc9ff' },
+  { tag: tags.invalid, color: '#ff6b6b' },
+]);
 
 const dark = EditorView.theme({
   '&': { color: '#cfe3ff', backgroundColor: '#0d0f10', height: '100%' },
@@ -54,6 +75,7 @@ export function makeEditor(parent, doc, onChange) {
       tabKeymap,
       StreamLanguage.define(z80Strings),
       dark,
+      syntaxHighlighting(z80Highlight),
       EditorView.updateListener.of((u) => { if (u.docChanged && onChange) onChange(view.state.doc.toString()); }),
     ],
   });
@@ -87,6 +109,7 @@ export function makeViewer(parent, doc) {
       basicSetup,
       StreamLanguage.define(z80Strings),
       dark,
+      syntaxHighlighting(z80Highlight),
       EditorState.readOnly.of(true),
       EditorView.editable.of(false),
     ],
