@@ -60,3 +60,6 @@ coverage/
 # ROMs Amstrad (droits reserves) - presentes localement pour une evolution
 # a venir (injection de l etat RAM post-boot dans un SNA), jamais versionnees.
 app/public/*.rom
+
+# Rapport de comparaison fantams/rasm (regenere par npm run compare, ~11 Mo)
+scripts/compare/last-report.json

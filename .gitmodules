@@ -1,0 +1,3 @@
+[submodule "fantams"]
+	path = fantams
+	url = git@github.com:sikorama/fantams.git

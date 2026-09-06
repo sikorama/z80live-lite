@@ -17,14 +17,20 @@ Functional scope kept: **online editing / forking**. Dropped: accounts/login, no
 z80next/
 ├── db/          schema.sql · import.mjs · classify.mjs · z80live.sqlite (generated, ~39 MB)
 ├── server/      api.mjs  — REST CRUD/fork + serves the SPA (node:http + node:sqlite, 0 dependencies)
-├── wasm/        rasm.mjs+.wasm · sjasmplus.mjs+.wasm · assemble.mjs (isomorphic module)
+├── fantams/     git submodule -> github:sikorama/fantams — the Z80 assembler (C++ -> WASM)
+├── wasm/        fantams · rasm · sjasmplus (.mjs+.wasm) · assemble.mjs (isomorphic module)
 ├── client/      store.mjs  — unified access layer (API or local SQLite/sql.js)
 ├── emu/         tiny8bit/  — CPC emulator (WASM)
 ├── emu-sw.js    Service Worker: serves the assembled .sna at /build/<name>.sna (no server needed)
 ├── vendor/      sqljs/     — SQLite WASM for browser reads (lite mode)
 ├── app/         Vite + Svelte SPA (UI) — builds -> app/dist/
-└── scripts/     export-lite.mjs  — generates the distributable static bundle
+└── scripts/     export-lite.mjs (distributable static bundle) · test-fantams-wasm.mjs · compare/
 ```
+
+`fantams/` is a submodule: clone with `--recurse-submodules`, or run
+`git submodule update --init` in an existing checkout. `npm run build:wasm`
+compiles it and drops `fantams.mjs`/`fantams.wasm` into `wasm/` and
+`app/public/wasm/`; the committed artifacts mean the SPA builds without it.
 
 ## Usage (full mode: editing)
 
@@ -64,6 +70,7 @@ npm run serve            # API + static files (demo, wasm, emulator) on a single
 editor → `rasm`/`sjasmplus` assembly in WASM (`wasm/assemble.mjs`) → the `.sna` (Uint8Array) is
 passed as a **blob** to the tiny8bit emulator (`emu/tiny8bit/cpc.html?file=<blob>`), same origin.
 
+- `wasm/fantams.mjs` + `fantams.wasm` — fantams in WASM (built from the `fantams/` submodule).
 - `wasm/rasm.mjs` + `rasm.wasm` — rasm in WASM (byte-correct output; minor documented memory discrepancy).
 - `wasm/sjasmplus.mjs` + `sjasmplus.wasm` — sjasmplus in WASM (output identical to native).
 - `wasm/assemble.mjs` — isomorphic module: header/footer per buildOptions, defaults to rasm, falls back to sjasmplus.

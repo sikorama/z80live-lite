@@ -6,7 +6,9 @@
   "scripts": {
     "import": "node --experimental-sqlite db/import.mjs",
     "classify": "node --experimental-sqlite db/classify.mjs",
-    "build:wasm": "bash fantams/build-wasm.sh",
+    "build:wasm": "FANTAMS_OUT_DIR=wasm FANTAMS_PUB_DIR=app/public/wasm bash fantams/build-wasm.sh && cp -f wasm/assemble.mjs app/public/wasm/assemble.mjs",
+    "test:wasm": "node scripts/test-fantams-wasm.mjs",
+    "compare": "node --experimental-sqlite scripts/compare/compare.mjs",
     "build:app": "npm --prefix app run build",
     "build": "npm run build:wasm && npm run build:app",
     "serve": "node --experimental-sqlite server/api.mjs",

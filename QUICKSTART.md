@@ -7,12 +7,18 @@ des sources compilables.
 
 - Node ≥ 22.5 (utilise `node:sqlite`, expérimental — compatible aussi Bun `bun:sqlite`).
 - La base `db/z80live.sqlite` présente (générée via `npm run import`, ou déjà fournie dans le repo).
+- Le submodule `fantams/` initialisé — l'assembleur vit dans son propre repo
+  (`github:sikorama/fantams`). Les artefacts WASM étant commités, la SPA se build
+  sans lui ; il n'est requis que pour recompiler l'assembleur.
+- `podman` (ou `docker`, via `CONTAINER=docker`) pour ce rebuild WASM : il passe
+  par l'image `emscripten/emsdk`, pas par un `emcc` local.
 
 Vérifier :
 
 ```bash
-node --version                # >= v22.5
-ls db/z80live.sqlite          # doit exister
+node --version                     # >= v22.5
+ls db/z80live.sqlite               # doit exister
+git submodule update --init        # peuple fantams/ (ou: clone --recurse-submodules)
 ```
 
 ## Lancer en local (mode dev)
@@ -59,6 +65,9 @@ Points d'attention en prod :
 - Rebuild (`npm run build`, à la racine) à chaque changement du front **ou de `fantams/*.cpp`** avant
   de redéployer. Depuis la racine seulement : `cd app && npm run build` ne reconstruit que la SPA et
   laisse `wasm/fantams.wasm` en arrière, si bien qu'on teste un assembleur périmé sans le voir.
+- Un changement dans `fantams/` se commite **deux fois** : dans le repo fantams,
+  puis ici (le submodule est un pointeur de commit) — accompagné des artefacts
+  `wasm/` régénérés, qui sont ce que le navigateur charge.
 
 Exemple d'unité systemd minimale :
 
