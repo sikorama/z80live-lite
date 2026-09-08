@@ -1,7 +1,7 @@
 // Test d'intégration : fantams WASM via wasm/assemble.mjs (Node).
 //   node test-wasm.mjs
 import createFantams from '../wasm/fantams.mjs';
-import { assemble, beautifySource } from '../wasm/assemble.mjs';
+import { assemble, beautifySource, fantamsVersion } from '../wasm/assemble.mjs';
 
 const SNA_MAGIC = 'MV - SNA';
 
@@ -119,6 +119,18 @@ total++;
   const bad = pre.split('\n').filter((l) => /^\t/.test(l) || /^(ld|jp|nop|ret|call)\b/i.test(l));
   if (r4.ok && pre.includes('start:') && bad.length === 0) { pass++; console.log('[OK] source deroulee mise en forme'); }
   else console.log('[FAIL] source deroulee —', JSON.stringify(pre), bad);
+}
+
+// 8) la version : l'artefact sait dire qui il est.
+// On verifie la FORME, jamais le contenu — aucun ordre entre versions n'est
+// defini, et la chaine est faite pour etre lue par un humain. Ce que ce cas
+// attrape, c'est un artefact d'avant l'option : il ne rend rien d'utile.
+{
+  total++;
+  const v = await fantamsVersion({ createFantams });
+  if (v.ok && /^fantams \d{4}-\d{2}-\d{2} \(compile \d{4}-\d{2}-\d{2}\)$/.test(v.version)) {
+    pass++; console.log(`[OK] version — ${v.version}`);
+  } else console.log('[FAIL] version —', JSON.stringify(v));
 }
 
 console.log(`\n${pass}/${total} réussis`);

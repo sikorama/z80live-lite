@@ -1,7 +1,7 @@
 <script>
   import { onMount, tick } from 'svelte';
   import { openStore } from '../../client/store.mjs';
-  import { assemble, beautifySource, parseDirectives, upsertDirectives, includePath } from '../../wasm/assemble.mjs';
+  import { assemble, beautifySource, fantamsVersion, parseDirectives, upsertDirectives, includePath } from '../../wasm/assemble.mjs';
   import { makeEditor, makeViewer } from './lib/editor.js';
   import { ANSI, severity, parseSourceRef, matchInclude } from './lib/diagnostics.js';
   import { ping as pingAmspirit, injectSna } from './lib/amspirit.js';
@@ -180,6 +180,16 @@
     createSjasm: async (o) => (await loadWasm('sjasmplus.mjs')).default(o),
     createFantams: async (o) => (await loadWasm('fantams.mjs')).default(o),
   };
+
+  // La version de fantams que CET artefact-la porte. Quand une verification
+  // echouera, la premiere question sera « quel fantams ? », et elle se posera
+  // depuis le navigateur — c'est la que la peremption a dure trois etages sans
+  // etre vue.
+  //
+  // Elle est affichee TELLE QUELLE : rien ne la decoupe, rien ne la compare,
+  // aucun ordre entre versions n'est defini. Un changement de sa forme ne doit
+  // rien casser ici.
+  let fantamsVer = $state('');
 
   // Traduit le fichier cité par un diagnostic en SOURCE de la base. Les librairies sont
   // écrites dans le FS wasm sous includePath(), le fichier principal sous '/in.asm' — c'est
@@ -483,6 +493,11 @@
     mode = store.mode; count = await store.count();
     await refreshList();
     log(`Store: ${mode} mode — ${count} sources.`, 'muted');
+    // Sans action de l'utilisateur : la version doit etre la AVANT qu'on en ait
+    // besoin, sinon elle ne sert a rien le jour ou on en a besoin.
+    fantamsVersion(factories)
+      .then((v) => { fantamsVer = v.ok ? v.version : 'fantams: version inconnue'; })
+      .catch(() => { fantamsVer = 'fantams: version inconnue'; });
     return () => { editor?.destroy(); clearInterval(amspiritTimer); };
   });
 
@@ -538,6 +553,9 @@
   <button class="ico" class:active={showList} onclick={() => showList = !showList}
     title={showList ? 'Hide the source list' : 'Show the source list'}>{@render icon('sidebar')}</button>
   <strong>z80live</strong>
+  {#if fantamsVer}
+    <span class="ver" title="Version date (what the maintainer meant to ship) and build date of this very artifact. A gap between them means the artifact is behind the sources.">{fantamsVer}</span>
+  {/if}
   <span class="mode" class:lite={mode === 'local'}
     title={mode === 'local' ? 'Offline mode: static catalog, no saving possible' : mode === 'api' ? 'Connected to the server: saving and creating sources is possible' : ''}>
     {mode === 'local' ? '○ offline' : mode === 'api' ? '● connected' : '…'}
@@ -788,6 +806,7 @@
   header { display: flex; align-items: center; gap: .6rem; padding: .5rem .8rem; background: #111; border-bottom: 1px solid #333; }
   header strong { color: #7cf; }
   .mode { font-size: 11px; padding: .1rem .4rem; border: 1px solid #375; color: #7d9; border-radius: 4px; }
+  .ver { font-size: 11px; color: #889; font-family: ui-monospace, monospace; white-space: nowrap; }
   .mode.lite { border-color: #a83; color: #db8; }
   .search { flex: 0 1 260px; padding: .3rem .5rem; background: #22262a; color: #eee; border: 1px solid #444; border-radius: 5px; }
   .grow { flex: 1; }
