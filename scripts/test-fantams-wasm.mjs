@@ -97,12 +97,24 @@ total++;
 
   // Le refus de deviner : un appel de macro n'est pas un label. Et les mots-cles
   // du preprocesseur ne recoivent jamais de deux-points.
+  //
+  // Deux choses ont change pendant les etages A/B/C1, et l'attente d'ici datait
+  // d'avant :
+  //   - « nom MACRO params » est une graphie HERITEE, que fantams reecrit en
+  //     « MACRO nom params » (beautify_test.cpp : « ce n'est pas un label, et
+  //     elle est reecrite ») ;
+  //   - un appel de macro est indente comme du code, faute de quoi il aurait la
+  //     colonne 1, qui est la place d'un label — deviner dans l'autre sens.
+  // La propriete que ce cas garde, elle, n'a pas bouge : AUCUN deux-points n'est
+  // ajoute. On l'affirme separement, pour que la regle survive au prochain
+  // changement de mise en page.
   total++;
   const src2 = 'cls MACRO c\nld a,{c}\nMEND\nsprite 4,12\n';
   const r2 = await beautifySource(src2, { createFantams });
-  const want2 = 'cls MACRO c\n    ld a,{c}\n    MEND\nsprite 4,12\n';
-  if (r2.ok && r2.code === want2) { pass++; console.log('[OK] mise en forme : refus de deviner'); }
-  else console.log('[FAIL] refus de deviner —', JSON.stringify(r2.code));
+  const want2 = '    MACRO cls c\n        ld a,{c}\n    MEND\n    sprite 4,12\n';
+  const aucunDeuxPoints = r2.ok && !r2.code.includes(':');
+  if (r2.ok && r2.code === want2 && aucunDeuxPoints) { pass++; console.log('[OK] mise en forme : refus de deviner'); }
+  else console.log('[FAIL] refus de deviner —', JSON.stringify(r2.code), aucunDeuxPoints ? '' : '(un ":" a ete ajoute)');
 
   // Idempotence de bout en bout.
   total++;
