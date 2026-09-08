@@ -199,6 +199,34 @@ async function runModule(factory, args, sourceText, expectedOut, includes, dump,
   return { log, data, ext, exitCode, error, dumped };
 }
 
+// ---- La version de fantams ----
+// « fantams --version » rend deux dates accolees : celle, portee dans l'arbre
+// des sources, de ce qui a ete VOULU comme livraison, et celle, prise a
+// __DATE__, de la production de CET artefact-la. C'est l'ECART entre les deux
+// qui repond a « cet artefact est-il a jour ».
+//
+// L'option vit sur la surface argv, comme toute autre invocation : cet
+// adaptateur n'a rien a exporter de plus pour la servir.
+//
+// La chaine est rendue TELLE QUELLE. Rien ne la decoupe, rien ne la compare,
+// aucun ordre entre versions n'est defini — un changement de sa forme ne doit
+// rien casser. L'hote l'affiche, un humain la lit.
+export async function fantamsVersion(factories) {
+  const out = [];
+  try {
+    const Module = await factories.createFantams(
+      { print: (s) => out.push(s), printErr: (s) => out.push(s), noExitRuntime: true });
+    try { Module.callMain(['--version']); } catch (e) { if (typeof e?.status !== 'number') throw e; }
+  } catch (e) {
+    return { ok: false, version: null, error: e?.message || String(e) };
+  }
+  const version = out.join('\n').trim();
+  // Un artefact d'avant l'option repond « file not found: --version » : on ne
+  // l'interprete pas, on constate seulement qu'il n'a rien rendu d'utile.
+  return version ? { ok: true, version, error: null }
+                 : { ok: false, version: null, error: 'aucune version rendue' };
+}
+
 // ---- Mise en forme du source (ADR 0013) ----
 // Appelle « fantams --beautify » : rien n'est deroule, le tampon de l'editeur
 // garde ses macros, ses includes et sa ligne « ; z80: ».
