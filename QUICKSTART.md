@@ -69,6 +69,27 @@ Points d'attention en prod :
   puis ici (le submodule est un pointeur de commit) — accompagné des artefacts
   `wasm/` régénérés, qui sont ce que le navigateur charge.
 
+## La comparaison sur le corpus
+
+L'instrument de mesure : chaque source du corpus est assemblée par l'assembleur
+de référence *et* par fantams, puis les deux images mémoire sont comparées octet
+à octet. Il ne dit pas ce qu'il faut corriger — il dit où on en est.
+
+```bash
+npm run build:native     # construit fantams/fantams (binaire natif, non versionné)
+npm run compare          # assemble le corpus des deux côtés et compare
+```
+
+Deux choses à savoir :
+
+- le binaire natif est un **produit**, que le submodule ne versionne pas et que
+  rien ne reconstruit tout seul. `npm run compare` sans lui s'arrête en le
+  nommant ;
+- le rapport détaillé va dans `scripts/compare/last-report.json`, **exclu du
+  suivi de version** : il porte les noms des sources du corpus et le texte des
+  diagnostics, qui cite les sources. Voir l'ADR 0029 de fantams — *le corpus ne
+  se publie que pièce par pièce*. Ne jamais le `git add -f`.
+
 Exemple d'unité systemd minimale :
 
 ```ini

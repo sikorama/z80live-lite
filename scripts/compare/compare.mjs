@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { writeFileSync, readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdtempSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
 import createRasm from '../../wasm/rasm.mjs';
@@ -26,6 +26,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..', '..');
 const DB_PATH = process.env.DB || join(ROOT, 'db', 'z80live.sqlite');
 const FANTAMS_BIN = join(ROOT, 'fantams', 'fantams');
+
+// Le binaire natif est un PRODUIT : le submodule ne le versionne pas, et rien
+// ne le construit tout seul. Son absence arretait la comparaison sur un ENOENT
+// d'execFileSync, qui ne nommait ni la cause ni le remede — c'est comme cela
+// que l'instrument est reste a l'arret. On le dit ici, une fois, clairement.
+if (!existsSync(FANTAMS_BIN)) {
+  console.error(`fantams natif introuvable : ${FANTAMS_BIN}`);
+  console.error('   le construire dans le repertoire du submodule : npm run build:native');
+  process.exit(2);
+}
 
 const argv = process.argv.slice(2);
 const opt = { limit: Infinity, id: null, verbose: argv.includes('--verbose') };
