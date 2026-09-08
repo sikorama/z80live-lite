@@ -38,4 +38,17 @@ chantier n'est pas tenu.
 
 | Date | Par | Version fantams affichée | Résultat |
 |---|---|---|---|
-| _(à remplir)_ | | | |
+| 2026-09-08 | mainteneur | `fantams 2026-09-08 (compile 2026-09-08)` | **7/7** — voir les notes ci-dessous |
+
+Notes du passage du 2026-09-08 :
+
+- source d'essai portant macro, boucle `for`, `org`, `run` et `equ` ; snapshot
+  de 65 792 octets, accepté et exécuté par l'émulateur ;
+- **le point 6 est redondant avec plus fort que lui.** L'émulateur autodétecte
+  le conteneur par ses octets magiques : un snapshot qu'il accepte *et exécute*
+  a forcément un en-tête recevable. Le `head -c 8` reste dans la liste parce
+  qu'il se vérifie sans machine, mais ce n'est pas lui qui fait la preuve ;
+- **le point 4 a une réserve** : la source déroulée perd les lignes vides et les
+  commentaires du source d'origine, ce qui la rend brute à relire. Les macros et
+  les boucles y sont correctement déroulées — le point passe. La lisibilité est
+  consignée à part (fantams, ticket 09 du chantier migration).
