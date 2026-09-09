@@ -21,6 +21,7 @@ db.exec('PRAGMA foreign_keys = ON;');
 // Colonnes exposées en liste (léger, sans le code).
 const LIST_COLS = `id, name, slugname, author, owner, description, category, genre, group_name,
   assembler, buildmode, entry_point, start_point, end_point, command, filename, is_include,
+  profile, ld_filename, container,
   build_status, compilable, fork_parent, created_at, updated_at`;
 const FULL_COLS = `${LIST_COLS}, code`;
 const LIST_COLS_S = LIST_COLS.replace(/\b(\w+)\b/g, 's.$1'); // colonnes qualifiées pour les jointures FTS
@@ -54,7 +55,8 @@ const q = {
 // Champs modifiables par l'API.
 const WRITABLE = ['name', 'slugname', 'author', 'owner', 'description', 'category', 'genre',
   'group_name', 'code', 'assembler', 'buildmode', 'entry_point', 'start_point',
-  'end_point', 'command', 'filename', 'output_type', 'is_include', 'build_status', 'compilable'];
+  'end_point', 'command', 'filename', 'output_type', 'is_include', 'profile', 'ld_filename',
+  'container', 'build_status', 'compilable'];
 
 function insertSource(data, { fork_parent = null } = {}) {
   const id = randomUUID();

@@ -94,6 +94,10 @@ export function wrapRasm(code, opts = {}) {
 // la syntaxe lite (`org`/`run`), pas les directives rasm (`BUILDSNA`). Le CLI
 // écrit un .sna quand le -o se termine par .sna (PC = adresse RUN).
 export function wrapFantams(code, opts = {}) {
+  // Un script de lien (-T) place les sections lui-meme (ADR 0030 fantams) : une source
+  // banquee n'a par construction AUCUN `org`, et lui en injecter un casserait ce que le
+  // linker doit calculer. On rend le texte tel quel.
+  if (opts.ldFile) return code;
   const start = opts.startPoint || opts.entryPoint || detectOrg(code) || DEFAULT_ORG;
   const entry = opts.entryPoint;
   const run = !entry || entry === 'none' || !String(entry).startsWith('#') ? null : entry;
@@ -294,12 +298,29 @@ export async function assemble(source, factories) {
   }
 
   if (assembler === 'fantams') {
+    // Conteneur (CONTEXT.md/fantams) : seul 'sna' est livre a ce stade (dsk/cdt/cpr sont
+    // hors perimetre, docs/spec-etage-c1.md). fantams n'ecrit qu'un blob brut sous le nom
+    // qu'on lui donne, sans valider le format visé : lui laisser passer un ".dsk" rendrait
+    // un fichier qui SE FAIT PASSER pour une image DSK sans en etre une. On refuse tot.
+    const container = opts.container || 'sna';
+    if (container !== 'sna') {
+      return { ok: false, assembler, ext: null, output: null,
+               log: [`conteneur "${container}" pas encore livre par fantams (seul sna est actif)`],
+               error: 'conteneur non supporte', preprocessed: code, lineOffset: 0 };
+    }
     const wrapped = wrapFantams(code, opts);
+    const outPath = OUT + '.' + container;
+    const args = ['/in.asm', '-o', outPath, ...baseArgs];
+    // Profil (--target) et script de lien (-T) : reglages de Projet (CONTEXT.md), jamais
+    // reflete dans la directive ;z80: (docs/adr/0001-...). Le .ld lui-meme est deja ecrit
+    // dans le FS wasm comme n'importe quel include ; on ne fait ici que le DESIGNER a fantams.
+    if (opts.profile) args.push('--target', opts.profile);
+    if (opts.ldFile) args.push('-T', includePath({ filename: opts.ldFile }));
     // fantams a un vrai preprocesseur : `preprocessed` porte la SOURCE DEROULEE
     // (macros expansees, boucles deroulees, includes inseres), pas la source
     // d'entree. Pour rasm et sjasmplus, faute d'equivalent, elle reste l'entree.
     const r = await runModule(
-      factories.createFantams, ['/in.asm', '-o', OUT + '.sna', ...baseArgs], wrapped, OUT + '.sna', includes,
+      factories.createFantams, args, wrapped, outPath, includes,
       { args: ['/in.asm', '-E', '-o', '/out.pp'], path: '/out.pp' }, baseFiles);
     const ok = r.exitCode === 0 && !!r.data;
     return { ok, assembler, ext: r.ext, output: ok ? r.data : null,

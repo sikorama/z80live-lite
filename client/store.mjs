@@ -6,6 +6,7 @@
 
 const LIST_COLS = `id, name, slugname, author, owner, description, category, genre, group_name,
   assembler, buildmode, entry_point, start_point, end_point, command, filename, is_include,
+  profile, ld_filename, container,
   build_status, compilable, fork_parent, created_at, updated_at`;
 const LIST_COLS_S = LIST_COLS.replace(/\b(\w+)\b/g, 's.$1');
 

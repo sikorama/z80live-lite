@@ -29,6 +29,12 @@ CREATE TABLE IF NOT EXISTS sources (
                                             -- sous lequel ce fichier est injecté dans le FS wasm à l'assemblage
   output_type   TEXT,
 
+  -- Réglages fantams (profil/lien/conteneur, CONTEXT.md). Uniquement en base : pas reflétés
+  -- dans la directive `;z80:` (docs/adr/0001-profil-et-fichier-de-lien-restent-hors-directive.md).
+  profile       TEXT,                      -- 'cpc6128' | 'cpcplus' | NULL(=défaut fantams), passé en --target
+  ld_filename   TEXT,                      -- filename d'une source is_include=1 (un .ld) passée en -T
+  container     TEXT,                      -- 'sna' | 'dsk' | 'cdt' | 'cpr' | NULL(=sna) ; seul 'sna' est actif
+
   -- 1 = librairie/fichier à inclure (pas de point d'entrée) : injecté automatiquement dans le
   -- répertoire de travail wasm de chaque assemblage, sous le nom `filename` (défaut: slug(name)+'.asm').
   is_include    INTEGER,

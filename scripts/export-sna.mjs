@@ -13,13 +13,14 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import createRasm from '../wasm/rasm.mjs';
 import createSjasm from '../wasm/sjasmplus.mjs';
+import createFantams from '../wasm/fantams.mjs';
 import { assemble } from '../wasm/assemble.mjs';
 import { readFileSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '..');
 const DB_PATH = resolve(process.env.DB || join(ROOT, 'db', 'z80live.sqlite'));
-const factories = { createRasm, createSjasm };
+const factories = { createRasm, createSjasm, createFantams };
 const SNA = ['sna', 'sna_cpc6128', 'sna_cpc464'];
 
 const args = process.argv.slice(2);
@@ -97,9 +98,13 @@ function buildZip(entries) {
 
 const db = new DatabaseSync(DB_PATH);
 const rows = db.prepare(
-  `SELECT id, name, slugname, code, assembler, buildmode, entry_point, start_point, end_point
+  `SELECT id, name, slugname, code, assembler, buildmode, entry_point, start_point, end_point,
+          profile, ld_filename, container
    FROM sources WHERE buildmode IN (${SNA.map(() => '?').join(',')})`
 ).all(...SNA);
+// Librairies (is_include=1) : injectées dans le FS wasm de chaque assemblage, comme dans
+// l'app (App.svelte:run()) — un .ld référencé par ld_filename en fait partie.
+const includesAll = db.prepare(`SELECT id, name, filename, code FROM sources WHERE is_include = 1`).all();
 db.close();
 console.log(`Sources SNA candidates : ${rows.length}`);
 
@@ -128,7 +133,9 @@ for (const r of rows) {
   const opts = {
     code: r.code, assembler: r.assembler, buildmode: r.buildmode,
     entryPoint: r.entry_point, startPoint: r.start_point, endPoint: r.end_point,
-    resolveBase,
+    resolveBase, profile: r.profile || undefined, ldFile: r.ld_filename || undefined,
+    container: r.container || undefined,
+    includes: includesAll.filter((i) => i.id !== r.id),
   };
   let res = await assemble(opts, factories);
   if (!res.ok && !r.assembler) {

@@ -133,6 +133,64 @@ total++;
   else console.log('[FAIL] source deroulee —', JSON.stringify(pre), bad);
 }
 
+// 9) profil (--target) : cpc6128 et cpcplus sont tous deux des builtins valides.
+for (const profile of ['cpc6128', 'cpcplus']) {
+  total++;
+  const r = await assemble({ code: 'ld a,#ff\nret\n', assembler: 'fantams', entryPoint: '#8000', profile },
+                            { createFantams });
+  const magic = r.output ? Buffer.from(r.output.slice(0, 8)).toString('latin1') : '';
+  if (r.ok && magic === SNA_MAGIC) { pass++; console.log(`[OK] profil ${profile}`); }
+  else console.log(`[FAIL] profil ${profile} —`, r.log.join(' | '), r.error ?? '');
+}
+// Un profil qui n'existe pas doit remonter comme erreur : la seule façon de le
+// constater est que --target soit réellement transmis au CLI.
+{
+  total++;
+  const r = await assemble({ code: 'ld a,#ff\nret\n', assembler: 'fantams', entryPoint: '#8000', profile: 'doesnotexist' },
+                            { createFantams });
+  if (!r.ok) { pass++; console.log('[OK] profil inconnu refusé —', r.log.join(' | ') || r.error); }
+  else console.log('[FAIL] profil inconnu accepté (ok=true) — --target ne semble pas transmis');
+}
+
+// 10) script de lien (-T) : une source SANS org (le placement est delegue au linker,
+// ADR 0030 fantams), le .ld fourni comme un include ('ld_filename', CONTEXT.md).
+{
+  const code = '        SECTION main, "ro"\n        run    start\nstart:\n        ld     a,#ff\n        ret\n';
+  const ld = 'TARGET cpc6128\nMEMORY_MAP {\n    CONFIG linear {\n        w1 { SECTION main }\n    }\n}\n';
+  total++;
+  const r = await assemble(
+    { code, assembler: 'fantams', ldFile: 'min.ld', includes: [{ filename: 'min.ld', code: ld }] },
+    { createFantams });
+  const magic = r.output ? Buffer.from(r.output.slice(0, 8)).toString('latin1') : '';
+  if (r.ok && magic === SNA_MAGIC) { pass++; console.log('[OK] script de lien (-T)'); }
+  else console.log('[FAIL] script de lien (-T) —', r.log.join(' | '), r.error ?? '');
+
+  // Garde de non-regression : SANS `ldFile`, l'en-tete org/run habituel reste injecte (la
+  // branche « le linker place tout » de wrapFantams ne doit s'appliquer qu'avec -T).
+  total++;
+  const r2 = await assemble({ code, assembler: 'fantams', entryPoint: '#8000' }, { createFantams });
+  if (r2.ok && /^\s*org\b/im.test(r2.preprocessed || '')) { pass++; console.log('[OK] sans -T : org toujours injecte'); }
+  else console.log('[FAIL] sans -T : org non injecte —', JSON.stringify(r2.preprocessed));
+}
+
+// 11) conteneur : l'extension de sortie suit `container` (par defaut 'sna', seul actif).
+{
+  total++;
+  const r = await assemble({ code: 'ld a,#ff\nret\n', assembler: 'fantams', entryPoint: '#8000', container: 'sna' },
+                            { createFantams });
+  if (r.ok && r.ext === 'sna') { pass++; console.log('[OK] conteneur sna explicite'); }
+  else console.log('[FAIL] conteneur sna explicite —', r.log.join(' | '), r.error ?? '');
+
+  // Un conteneur pas encore implémenté côté fantams (docs/spec-etage-c1.md) ne doit PAS
+  // silencieusement retomber sur .sna : la seule façon de le constater est que la sortie
+  // demandée (-o out.dsk) suive vraiment `container`.
+  total++;
+  const r2 = await assemble({ code: 'ld a,#ff\nret\n', assembler: 'fantams', entryPoint: '#8000', container: 'dsk' },
+                            { createFantams });
+  if (!r2.ok) { pass++; console.log('[OK] conteneur dsk (pas encore livré) — aucun repli silencieux sur .sna'); }
+  else console.log('[FAIL] conteneur dsk aurait dû échouer (pas encore implémenté) ou a produit un .sna malgré tout');
+}
+
 // 8) la version : l'artefact sait dire qui il est.
 // On verifie la FORME, jamais le contenu — aucun ordre entre versions n'est
 // defini, et la chaine est faite pour etre lue par un humain. Ce que ce cas

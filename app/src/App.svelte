@@ -13,11 +13,22 @@
   let query = $state('');
   let selected = $state(null);
   let asm = $state(''), buildmode = $state('sna'), entry = $state('');
+  // Profil fantams (cpc6128/cpcplus), script de lien (.ld, reference vers un include) et
+  // conteneur : reglages de Projet (CONTEXT.md), jamais reflete dans la directive ;z80:
+  // (docs/adr/0001-...). '' = auto/absent.
+  let profile = $state(''), ldFilename = $state(''), container = $state('sna');
+  const isFantams = $derived(!asm || asm === 'fantams');
   // Base (ADR 0012) : le snapshot post-boot sur lequel l'assemblage est pose, pour
   // qu'un code appelant le firmware s'execute. '' = aucune (la memoire vaut zero).
   let base = $state(''), bases = $state([]);
   let isInclude = $state(false), incFilename = $state(''); // fichier librairie (sans point d'entrée), injecté dans le FS wasm des autres sources
-  let includeCache = null; // liste des sources is_include=1 ({id,name,filename,code}), rafraîchie à chaque run()
+  // Liste des sources is_include=1 ({id,name,filename,code}), rafraîchie à chaque run()/beautify().
+  // $state (et non une simple variable) : le sélecteur de script de lien (ldOptions,
+  // popup de réglages) doit se mettre à jour dès qu'elle est peuplée.
+  let includeCache = $state(null);
+  // Scripts de lien disponibles : les includes dont le nom finit en .ld (convention —
+  // les autres sont des librairies .asm).
+  const ldOptions = $derived((includeCache || []).filter((i) => /\.ld$/i.test(i.filename || '')));
   let logLines = $state([]);
   // Journal d'assemblage : logé sous l'éditeur par défaut, mais déplacé dans la colonne de
   // l'émulateur quand celle-ci est vide (échec d'assemblage) ou sur demande (bouton 🗒),
@@ -86,13 +97,19 @@
 
   // Popup de réglages de la source (libère la barre de l'éditeur).
   let showSettings = $state(false);
-  const openSettings = () => { showSettings = true; };
+  const openSettings = async () => {
+    showSettings = true;
+    // Le sélecteur de script de lien a besoin de la liste des includes : la charger ici
+    // couvre le cas où les réglages sont ouverts avant tout run()/beautify().
+    if (!includeCache) { try { includeCache = await store.listIncludes(); } catch { includeCache = []; } }
+  };
   async function applySettings() {
     showSettings = false;
     const it = selected?.id ? sources.find((s) => s.id === selected.id) : null;
     if (it && selected) {
       it.name = selected.name; it.author = selected.author; it.genre = selected.genre;
       it.assembler = asm || null; it.buildmode = buildmode; it.is_include = isInclude ? 1 : 0;
+      it.profile = profile || null; it.ld_filename = ldFilename || null; it.container = container || null;
     }
     if (canWrite && selected?.id) {
       try {
@@ -100,6 +117,9 @@
           name: selected.name, author: selected.author, description: selected.description,
           genre: selected.genre, assembler: asm || null, buildmode, entry_point: entry || null,
           is_include: isInclude ? 1 : null, filename: isInclude ? (incFilename || null) : null,
+          profile: isInclude ? null : (profile || null),
+          ld_filename: isInclude ? null : (ldFilename || null),
+          container: isInclude ? null : (container || null),
         });
       } catch {}
     }
@@ -278,6 +298,8 @@
     entry = d.entryPoint || s.entry_point || '';
     base = d.base && d.base !== 'none' ? d.base : '';
     isInclude = !!s.is_include; incFilename = s.filename || '';
+    // Profil/lien/conteneur : DB seule, jamais dans la directive ;z80: (docs/adr/0001-...).
+    profile = s.profile || ''; ldFilename = s.ld_filename || ''; container = s.container || 'sna';
     if (line != null) { await tick(); editor.gotoLine(line); }
     if (doRun) await run(); // charge -> assemble -> envoie à l'émulateur en un clic
   }
@@ -325,6 +347,7 @@
     dirty = false;
     asm = 'fantams'; buildmode = 'sna'; entry = '#8000'; base = '';
     isInclude = false; incFilename = '';
+    profile = ''; ldFilename = ''; container = 'sna';
   }
 
   // Redimensionnement du journal (quand il est sous l'éditeur) : on suit le pointeur.
@@ -341,7 +364,12 @@
     busy = true; logLines = []; log('Assembling…');
     mainId = selected?.id ?? null; mainName = selected?.name || 'current source';
     const cfg = { assembler: asm || undefined, buildmode, entryPoint: entry || undefined,
-                  base: base || undefined };
+                  base: base || undefined,
+                  // Profil/lien/conteneur : jamais dans la directive ;z80: (docs/adr/0001-...) —
+                  // upsertDirectives les ignore (hors de DIR_KEYS), c'est volontaire.
+                  profile: (!isInclude && profile) || undefined,
+                  ldFile: (!isInclude && ldFilename) || undefined,
+                  container: (!isInclude && container) || undefined };
     const up = upsertDirectives(editor.value, cfg);  // maintien de la ligne ;z80:
     if (up !== editor.value) setCode(up);            // n'écrit que si ça change (évite la boucle auto)
     try {
@@ -376,6 +404,12 @@
           amspiritConnected = false; // la sonde périodique retentera la connexion
           log('⚠ AMSpiriT injection failed: ' + (e?.message || e), 'fail');
         }
+      } else if (isFantams && profile === 'cpcplus') {
+        // tiny8bit (l'émulateur intégré) ne gère pas le CPC+ ; seul AMSpiriT le fait pour
+        // l'instant (Q7/Q5 du design). Pas de tentative vouée à l'échec : juste le journal
+        // et le téléchargement, déjà disponibles ci-dessus.
+        emuUrl = '';
+        log('cpcplus needs AMSpiriT (the built-in emulator has no CPC+ support) — enable it in Settings, or use the download.', 'fail');
       } else {
         const url = await feedEmulator(res.output, res.ext);
         if (url) emuUrl = `/emu/tiny8bit/cpc.html?file=${encodeURIComponent(url)}`;
@@ -389,7 +423,10 @@
   async function save() {
     const data = { name: selected?.name || 'untitled', code: editor.value, assembler: asm || null,
       buildmode, entry_point: entry || null, author: selected?.author || null, description: selected?.description || null,
-      is_include: isInclude ? 1 : null, filename: isInclude ? (incFilename || null) : null };
+      is_include: isInclude ? 1 : null, filename: isInclude ? (incFilename || null) : null,
+      profile: isInclude ? null : (profile || null),
+      ld_filename: isInclude ? null : (ldFilename || null),
+      container: isInclude ? null : (container || null) };
     const saved = selected?.id ? await store.update(selected.id, data) : await store.create(data);
     selected = saved; dirty = false; await refreshList(); log('💾 saved: ' + saved.name, 'ok');
   }
@@ -750,6 +787,29 @@
         </label>
       {:else}
         <label>Entry point <input bind:value={entry} placeholder="#8000" /></label>
+        {#if isFantams}
+          <label title="fantams --target: the CPC variant this source targets. Empty = fantams's own default.">Profile
+            <select bind:value={profile}>
+              <option value="">auto (fantams default)</option>
+              <option value="cpc6128">cpc6128</option>
+              <option value="cpcplus">cpcplus</option>
+            </select>
+          </label>
+          <label title="What fantams builds (-o extension). Only sna is implemented today; the others are fantams's next evolution.">Container
+            <select bind:value={container}>
+              <option value="sna">sna</option>
+              <option value="dsk" disabled>dsk (coming soon)</option>
+              <option value="cdt" disabled>cdt (coming soon)</option>
+              <option value="cpr" disabled>cpr (coming soon)</option>
+            </select>
+          </label>
+          <label class="wide" title="fantams -T: an included .ld file (a source flagged as library, named *.ld) that places this build's sections. Optional — leave empty to write org/placement by hand.">Linker script (.ld)
+            <select bind:value={ldFilename}>
+              <option value="">none</option>
+              {#each ldOptions as o}<option value={o.filename}>{o.filename}</option>{/each}
+            </select>
+          </label>
+        {/if}
       {/if}
       <label>Genre
         <select bind:value={selected.genre} disabled={!canWrite}>

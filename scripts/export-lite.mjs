@@ -24,6 +24,7 @@ const src = new DatabaseSync(SRC_DB);
 const lite = new DatabaseSync(TMP_DB);
 const cols = ['id','name','slugname','author','owner','description','category','genre','group_name','code',
   'assembler','buildmode','entry_point','start_point','end_point','command','filename','output_type','is_include',
+  'profile','ld_filename','container',
   'build_status','compilable','fork_parent','created_at','updated_at'];
 lite.exec(`CREATE TABLE sources (${cols.map(c => c + ' TEXT').join(', ')});`);
 lite.exec('CREATE INDEX idx_bm ON sources(buildmode);');
