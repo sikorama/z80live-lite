@@ -1,7 +1,7 @@
 // Test d'intégration : fantams WASM via wasm/assemble.mjs (Node).
 //   node test-wasm.mjs
 import createFantams from '../wasm/fantams.mjs';
-import { assemble, beautifySource, fantamsVersion } from '../wasm/assemble.mjs';
+import { assemble, beautifySource, fantamsVersion, listFiles } from '../wasm/assemble.mjs';
 
 const SNA_MAGIC = 'MV - SNA';
 
@@ -189,6 +189,90 @@ for (const profile of ['cpc6128', 'cpcplus']) {
                             { createFantams });
   if (!r2.ok) { pass++; console.log('[OK] conteneur dsk (pas encore livré) — aucun repli silencieux sur .sna'); }
   else console.log('[FAIL] conteneur dsk aurait dû échouer (pas encore implémenté) ou a produit un .sna malgré tout');
+}
+
+// 12) conteneur cpr : une banque physique par appel (fantams/cpr.h), accumulee via
+// `prevCpr` — c'est le meme geste que le Projet CPR d'App.svelte fera banque par banque.
+{
+  const RIFF_AMS = 'RIFF';
+  const cartAsm = (n) => `        SECTION cart, "ro"\ncart:\n        db ${n}, ${255 - n}\n`;
+  const ldFor = (window, axis) => `TARGET cpcplus\nMEMORY_MAP { CONFIG ${axis} { ${window} { SECTION cart } } }\n`;
+
+  // banque 0 (cart_rom, RMR2, 0..7) : premier appel, aucun conteneur existant.
+  total++;
+  const r0 = await assemble({
+    code: cartAsm(0), assembler: 'fantams', profile: 'cpcplus', container: 'cpr', cprBank: 0,
+    ldFile: 'b0.ld', includes: [{ filename: 'b0.ld', code: ldFor('w0', 'cart_rom.w0<0>') }],
+  }, { createFantams });
+  const magic0 = r0.output ? Buffer.from(r0.output.slice(0, 4)).toString('latin1') : '';
+  if (r0.ok && r0.ext === 'cpr' && magic0 === RIFF_AMS && r0.output.length === 8 + 4 + 8 + 16384) {
+    pass++; console.log('[OK] cpr banque 0 (nouveau conteneur)');
+  } else console.log('[FAIL] cpr banque 0 —', r0.log.join(' | '), r0.error ?? '', r0.output?.length);
+
+  // banque 19 (cart_rom_hi, Upper ROM, 8..31) : AJOUTEE au conteneur precedent.
+  total++;
+  const r1 = await assemble({
+    code: cartAsm(19), assembler: 'fantams', profile: 'cpcplus', container: 'cpr', cprBank: 19,
+    ldFile: 'b19.ld', includes: [{ filename: 'b19.ld', code: ldFor('w3', 'cart_rom_hi.on<19>') }],
+    prevCpr: r0.output,
+  }, { createFantams });
+  const magic1 = r1.output ? Buffer.from(r1.output.slice(0, 4)).toString('latin1') : '';
+  const wantLen = 8 + 4 + 2 * (8 + 16384);
+  if (r1.ok && r1.ext === 'cpr' && magic1 === RIFF_AMS && r1.output.length === wantLen) {
+    pass++; console.log('[OK] cpr banque 19 ajoutee (2 chunks, banque 0 conservee)');
+  } else console.log('[FAIL] cpr banque 19 —', r1.log.join(' | '), r1.error ?? '', r1.output?.length, 'attendu', wantLen);
+
+  // --cpr-bank absent ou hors bornes : refuse, sans repli silencieux sur sna.
+  total++;
+  const r2 = await assemble({ code: cartAsm(0), assembler: 'fantams', profile: 'cpcplus', container: 'cpr' },
+                             { createFantams });
+  if (!r2.ok) { pass++; console.log('[OK] cpr sans --cpr-bank refuse —', r2.error); }
+  else console.log('[FAIL] cpr sans --cpr-bank aurait du echouer');
+
+  total++;
+  const r3 = await assemble({ code: cartAsm(0), assembler: 'fantams', profile: 'cpcplus', container: 'cpr', cprBank: 99 },
+                             { createFantams });
+  if (!r3.ok) { pass++; console.log('[OK] cpr-bank hors 0..31 refuse —', r3.error); }
+  else console.log('[FAIL] cpr-bank 99 aurait du echouer');
+}
+
+// 13) listFiles() : la Fermeture (ADR 0002) via le pont WASM — le meme
+// pp::Result::files() que la CLI (--list-files), mais depuis JS, includes
+// injectes dans le FS virtuel comme pour assemble().
+{
+  total++;
+  const r = await listFiles('  nop\n  INCLUDE "lib.asm"\n', { createFantams },
+    [{ filename: 'lib.asm', code: '  inc a\n' }]);
+  // "lib.asm" telle quelle : la Fermeture enregistre le chemin LITTERAL de
+  // l'INCLUDE, pas le chemin (prefixe '/') sous lequel includePath() l'ecrit
+  // dans le FS virtuel — ils coincident par construction du CWD MEMFS ("/"),
+  // pas par une reecriture du chemin.
+  const want = ['/in.asm', 'lib.asm'];
+  if (r.ok && JSON.stringify(r.files) === JSON.stringify(want)) {
+    pass++; console.log('[OK] listFiles : principal + include');
+  } else console.log('[FAIL] listFiles : principal + include —', JSON.stringify(r), r.log?.join(' | '));
+
+  // Un avertissement de preprocesseur ne doit JAMAIS polluer la liste — c'est
+  // tout l'objet de ne pas reutiliser runModule (qui melange stdout/stderr).
+  total++;
+  const r2 = await listFiles('zorglub\n  nop\n', { createFantams });
+  if (r2.ok && r2.files.every((f) => f === '/in.asm')) {
+    pass++; console.log('[OK] listFiles : un avertissement ne pollue pas la liste');
+  } else console.log('[FAIL] listFiles : avertissement mele a la liste —', JSON.stringify(r2));
+
+  // Sans aucun include, juste le fichier principal.
+  total++;
+  const r3 = await listFiles('  ld a,1\n  ret\n', { createFantams });
+  if (r3.ok && JSON.stringify(r3.files) === JSON.stringify(['/in.asm'])) {
+    pass++; console.log('[OK] listFiles : sans include');
+  } else console.log('[FAIL] listFiles : sans include —', JSON.stringify(r3));
+
+  // Un include manquant : refuse, liste vide — jamais une Fermeture partielle.
+  total++;
+  const r4 = await listFiles('  INCLUDE "absent.asm"\n', { createFantams });
+  if (!r4.ok && r4.files.length === 0) {
+    pass++; console.log('[OK] listFiles : include manquant refuse, liste vide');
+  } else console.log('[FAIL] listFiles : include manquant —', JSON.stringify(r4));
 }
 
 // 8) la version : l'artefact sait dire qui il est.

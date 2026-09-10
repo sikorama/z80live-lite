@@ -17,6 +17,24 @@ const WRITE_TOKEN = process.env.Z80_WRITE_TOKEN || null; // null => écriture ou
 
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA foreign_keys = ON;');
+// Bootstrap idempotent (db/schema.sql en porte le texte canonique) : une base
+// z80live.sqlite deja en service n'a pas rejoue schema.sql depuis sa creation
+// (db/import.mjs, lui, le fait — mais reconstruit toute la base depuis un
+// export JSON, pas une simple mise a jour). CREATE TABLE IF NOT EXISTS est
+// deja l'idiome du reste du schema : le repeter ici evite une etape de
+// migration separee pour deux tables aussi petites.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER, updated_at INTEGER
+  );
+  CREATE TABLE IF NOT EXISTS project_banks (
+    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    bank INTEGER NOT NULL,
+    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    PRIMARY KEY (project_id, bank)
+  );
+  CREATE INDEX IF NOT EXISTS idx_project_banks_source ON project_banks(source_id);
+`);
 
 // Colonnes exposées en liste (léger, sans le code).
 const LIST_COLS = `id, name, slugname, author, owner, description, category, genre, group_name,
@@ -51,6 +69,26 @@ const q = {
   count: db.prepare(`SELECT COUNT(*) c FROM sources`),
   del: db.prepare(`DELETE FROM sources WHERE id = $id`),
 };
+
+const qp = {
+  list: db.prepare(`SELECT p.id, p.name, p.created_at, p.updated_at,
+      (SELECT COUNT(*) FROM project_banks b WHERE b.project_id = p.id) AS bank_count
+      FROM projects p ORDER BY p.updated_at DESC`),
+  get: db.prepare(`SELECT id, name, created_at, updated_at FROM projects WHERE id = $id`),
+  banks: db.prepare(`SELECT b.bank, b.source_id, s.name AS source_name
+      FROM project_banks b JOIN sources s ON s.id = b.source_id
+      WHERE b.project_id = $project_id ORDER BY b.bank`),
+  del: db.prepare(`DELETE FROM projects WHERE id = $id`),
+  setBank: db.prepare(`INSERT INTO project_banks (project_id, bank, source_id) VALUES ($project_id, $bank, $source_id)
+      ON CONFLICT(project_id, bank) DO UPDATE SET source_id = excluded.source_id`),
+  delBank: db.prepare(`DELETE FROM project_banks WHERE project_id = $project_id AND bank = $bank`),
+};
+
+function getProjectFull(id) {
+  const p = qp.get.get({ id });
+  if (!p) return null;
+  return { ...p, banks: qp.banks.all({ project_id: id }) };
+}
 
 // Champs modifiables par l'API.
 const WRITABLE = ['name', 'slugname', 'author', 'owner', 'description', 'category', 'genre',
@@ -192,6 +230,69 @@ const server = createServer(async (req, res) => {
       if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
       const r = q.del.run({ id: decodeURIComponent(mo[1]) });
       return json(res, r.changes ? 200 : 404, { deleted: r.changes });
+    }
+
+    // GET /api/projects
+    if (m === 'GET' && p === '/api/projects') return json(res, 200, { items: qp.list.all() });
+
+    // POST /api/projects  { name }
+    if (m === 'POST' && p === '/api/projects') {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const body = await readBody(req);
+      const id = randomUUID(), now = Date.now();
+      db.prepare(`INSERT INTO projects (id, name, created_at, updated_at) VALUES ($id, $name, $now, $now)`)
+        .run({ id, name: body.name || 'untitled project', now });
+      return json(res, 201, getProjectFull(id));
+    }
+
+    // GET /api/projects/:id  (avec ses banques, jointes au nom de la Source)
+    let mp = p.match(/^\/api\/projects\/([^/]+)$/);
+    if (m === 'GET' && mp) {
+      const proj = getProjectFull(decodeURIComponent(mp[1]));
+      return proj ? json(res, 200, proj) : json(res, 404, { error: 'not found' });
+    }
+
+    // PUT /api/projects/:id  { name }
+    if (m === 'PUT' && mp) {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const id = decodeURIComponent(mp[1]);
+      if (!qp.get.get({ id })) return json(res, 404, { error: 'not found' });
+      const body = await readBody(req);
+      if ('name' in body) db.prepare(`UPDATE projects SET name = $name, updated_at = $now WHERE id = $id`)
+        .run({ id, name: body.name, now: Date.now() });
+      return json(res, 200, getProjectFull(id));
+    }
+
+    // DELETE /api/projects/:id
+    if (m === 'DELETE' && mp) {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const r = qp.del.run({ id: decodeURIComponent(mp[1]) });
+      return json(res, r.changes ? 200 : 404, { deleted: r.changes });
+    }
+
+    // PUT /api/projects/:id/banks/:bank  { source_id }  — affecte (ou remplace) cette banque
+    let mb = p.match(/^\/api\/projects\/([^/]+)\/banks\/(\d+)$/);
+    if (m === 'PUT' && mb) {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const project_id = decodeURIComponent(mb[1]), bank = Number(mb[2]);
+      if (!qp.get.get({ id: project_id })) return json(res, 404, { error: 'project not found' });
+      if (bank < 0 || bank > 31) return json(res, 400, { error: 'bank hors de 0..31' });
+      const body = await readBody(req);
+      if (!body.source_id || !q.get.get({ id: body.source_id }))
+        return json(res, 400, { error: 'source_id manquant ou introuvable' });
+      qp.setBank.run({ project_id, bank, source_id: body.source_id });
+      db.prepare(`UPDATE projects SET updated_at = $now WHERE id = $id`).run({ id: project_id, now: Date.now() });
+      return json(res, 200, getProjectFull(project_id));
+    }
+
+    // DELETE /api/projects/:id/banks/:bank
+    if (m === 'DELETE' && mb) {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const project_id = decodeURIComponent(mb[1]), bank = Number(mb[2]);
+      qp.delBank.run({ project_id, bank });
+      db.prepare(`UPDATE projects SET updated_at = $now WHERE id = $id`).run({ id: project_id, now: Date.now() });
+      const proj = getProjectFull(project_id);
+      return proj ? json(res, 200, proj) : json(res, 404, { error: 'not found' });
     }
 
     // POST /api/scratch?ext=sna  (corps binaire) -> { url } avec extension pour l'émulateur

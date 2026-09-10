@@ -18,12 +18,13 @@ export async function ping(base, { timeoutMs = 800 } = {}) {
   }
 }
 
-// Envoie un .sna à AMSpiriT via /api/media : une seule requête, format autodétecté par la
-// signature "MV - SNA", état machine complet restauré côté serveur (registres + RAM). Remplace
+// Envoie un fichier media (.sna, .cpr, .dsk...) à AMSpiriT via /api/media : une seule
+// requête, format autodétecté par sa signature (« MV - SNA », « RIFF/AMS! »...), état
+// machine complet restauré côté serveur pour un .sna (registres + RAM). Remplace
 // l'ancienne approche pause + écriture RAM par blocs + redirection PC, qui butait sur le pause
 // côté AMSpiriT ne tenant pas de façon fiable.
-export async function injectSna(base, snaBytes, { name = 'z80next.sna', onLog } = {}) {
-  const bytes = snaBytes instanceof Uint8Array ? snaBytes : new Uint8Array(snaBytes);
+export async function injectMedia(base, bytes8, { name = 'z80next.bin', onLog } = {}) {
+  const bytes = bytes8 instanceof Uint8Array ? bytes8 : new Uint8Array(bytes8);
   const log = onLog || (() => {});
 
   log(`envoi de ${bytes.length} o vers /api/media…`);
@@ -37,3 +38,6 @@ export async function injectSna(base, snaBytes, { name = 'z80next.sna', onLog } 
   log('chargé');
   return json;
 }
+
+// Alias historique : un .sna est un media comme un autre pour /api/media.
+export const injectSna = (base, snaBytes, opts) => injectMedia(base, snaBytes, opts);

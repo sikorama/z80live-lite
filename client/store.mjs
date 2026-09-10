@@ -35,6 +35,21 @@ export function createApiStore(base = '..', { token } = {}) {
     update(id, data) { return send('PUT', '/api/sources/' + encodeURIComponent(id), data); },
     fork(id, overrides = {}) { return send('POST', '/api/sources/' + encodeURIComponent(id) + '/fork', overrides); },
     remove(id) { return send('DELETE', '/api/sources/' + encodeURIComponent(id)); },
+
+    // ---- Projets CPR (db/schema.sql : `projects` + `project_banks`) ----
+    // Une Source par banque physique (0..31) ; chaque banque reste liee
+    // SEPAREMENT (fantams/cpr.h), le Projet n'ordonne que l'affectation.
+    async listProjects() { return (await j('/api/projects')).items; },
+    getProject(id) { return j('/api/projects/' + encodeURIComponent(id)); },
+    createProject(data) { return send('POST', '/api/projects', data); },
+    updateProject(id, data) { return send('PUT', '/api/projects/' + encodeURIComponent(id), data); },
+    removeProject(id) { return send('DELETE', '/api/projects/' + encodeURIComponent(id)); },
+    setProjectBank(id, bank, sourceId) {
+      return send('PUT', `/api/projects/${encodeURIComponent(id)}/banks/${bank}`, { source_id: sourceId });
+    },
+    removeProjectBank(id, bank) {
+      return send('DELETE', `/api/projects/${encodeURIComponent(id)}/banks/${bank}`);
+    },
   };
 }
 

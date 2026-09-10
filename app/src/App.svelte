@@ -4,7 +4,7 @@
   import { assemble, beautifySource, fantamsVersion, parseDirectives, upsertDirectives, includePath } from '../../wasm/assemble.mjs';
   import { makeEditor, makeViewer } from './lib/editor.js';
   import { ANSI, severity, parseSourceRef, matchInclude } from './lib/diagnostics.js';
-  import { ping as pingAmspirit, injectSna } from './lib/amspirit.js';
+  import { ping as pingAmspirit, injectMedia } from './lib/amspirit.js';
 
   let store = $state(null);
   let mode = $state('…');
@@ -17,6 +17,11 @@
   // conteneur : reglages de Projet (CONTEXT.md), jamais reflete dans la directive ;z80:
   // (docs/adr/0001-...). '' = auto/absent.
   let profile = $state(''), ldFilename = $state(''), container = $state('sna');
+  // Banque physique de cartouche (0..31) qu'un export .cpr de CETTE source seule
+  // doit produire (fantams --cpr-bank). Ephemere (pas en base) : l'affectation
+  // qui compte pour un Projet CPR complet vit dans project_banks (voir plus bas) —
+  // ceci ne sert qu'a tester une banque isolement, sans Projet.
+  let cprBank = $state(0);
   const isFantams = $derived(!asm || asm === 'fantams');
   // Base (ADR 0012) : le snapshot post-boot sur lequel l'assemblage est pose, pour
   // qu'un code appelant le firmware s'execute. '' = aucune (la memoire vaut zero).
@@ -157,6 +162,107 @@
   }
   const openAppSettings = () => { showAppSettings = true; };
   function closeAppSettings() { showAppSettings = false; saveSettings(); syncAmspiritPolling(); }
+
+  // ---- Projets CPR (db/schema.sql : `projects` + `project_banks`) ----
+  // Un Projet regroupe des Sources, une par banque physique (0..31) de cartouche
+  // CPC+. Chaque banque reste liee SEPAREMENT (fantams/cpr.h) : "construire" un
+  // Projet, c'est rappeler assemble() une fois par banque, dans l'ordre, en
+  // faisant voyager le .cpr accumule d'un appel a l'autre (wasm/assemble.mjs,
+  // `prevCpr`) — exactement ce que `fantams -o x.cpr --cpr-bank n` fait sur la CLI.
+  let showProjects = $state(false);
+  let projects = $state([]);          // resume [{id,name,bank_count}]
+  let currentProject = $state(null);  // detail ouvert {id,name,banks:[{bank,source_id,source_name}]}
+  let newBankNumber = $state(0);
+  let projectBusy = $state(false);
+  let projectLog = $state([]);
+  let projectDlUrl = $state('');
+
+  async function openProjects() {
+    showProjects = true;
+    try { projects = await store.listProjects(); } catch { projects = []; }
+  }
+  function closeProjects() { showProjects = false; currentProject = null; projectLog = []; }
+  async function openProject(id) {
+    projectLog = []; if (projectDlUrl) URL.revokeObjectURL(projectDlUrl); projectDlUrl = '';
+    try { currentProject = await store.getProject(id); } catch { currentProject = null; }
+  }
+  async function createProjectPrompt() {
+    const p = await store.createProject({ name: 'untitled project' });
+    projects = await store.listProjects();
+    await openProject(p.id);
+  }
+  async function renameCurrentProject(name) {
+    if (!currentProject) return;
+    currentProject = await store.updateProject(currentProject.id, { name });
+    projects = await store.listProjects();
+  }
+  async function deleteProject(id) {
+    await store.removeProject(id);
+    if (currentProject?.id === id) currentProject = null;
+    projects = await store.listProjects();
+  }
+  // Affecte la source OUVERTE dans l'editeur a la banque `newBankNumber` du
+  // Projet courant : pas de second selecteur de source a maintenir, l'editeur
+  // en porte deja un.
+  async function addCurrentAsBank() {
+    if (!currentProject || !selected?.id) return;
+    currentProject = await store.setProjectBank(currentProject.id, Number(newBankNumber), selected.id);
+    projects = await store.listProjects();
+  }
+  async function removeBank(bank) {
+    if (!currentProject) return;
+    currentProject = await store.removeProjectBank(currentProject.id, bank);
+  }
+
+  // Construit le .cpr complet : une banque a la fois, dans l'ORDRE des numeros
+  // de banque, en faisant voyager les octets deja accumules (prevCpr). Une
+  // seule banque en echec arrete tout — un .cpr partiel qui SE FAIT PASSER pour
+  // complet serait pire que rien (meme raison que cpr.cpp cote CLI).
+  async function buildProject() {
+    if (!currentProject || currentProject.banks.length === 0) return;
+    projectBusy = true; projectLog = [];
+    if (projectDlUrl) URL.revokeObjectURL(projectDlUrl);
+    projectDlUrl = '';
+    const plog = (m) => { projectLog = [...projectLog, m]; };
+    try {
+      const includes = await store.listIncludes().catch(() => []);
+      let acc = null;
+      const banks = [...currentProject.banks].sort((a, b) => a.bank - b.bank);
+      for (const b of banks) {
+        const src = await store.get(b.source_id);
+        if (!src) { plog(`❌ bank ${b.bank}: source ${b.source_id} introuvable`); projectBusy = false; return; }
+        plog(`banque ${b.bank} (${src.name})…`);
+        const res = await assemble({
+          code: src.code, assembler: 'fantams', profile: src.profile || undefined,
+          ldFile: src.ld_filename || undefined, container: 'cpr', cprBank: b.bank,
+          prevCpr: acc || undefined, includes: includes.filter((i) => i.id !== src.id),
+        }, factories);
+        if (!res.ok || !res.output) {
+          plog(`❌ banque ${b.bank} (${src.name}) — echec`);
+          for (const l of res.log.slice(-12)) plog('   ' + l);
+          if (res.error) plog('   ⚠ ' + res.error);
+          projectBusy = false; return;
+        }
+        acc = res.output;
+        plog(`✔ banque ${b.bank} — ${acc.length} o au total`);
+      }
+      projectDlUrl = URL.createObjectURL(new Blob([acc], { type: 'application/octet-stream' }));
+      plog(`✔ ${currentProject.name}.cpr — ${banks.length} banque(s), ${acc.length} octets`);
+      if (amspiritEnabled && amspiritConnected) {
+        try {
+          const name = (currentProject.name || 'project').replace(/[^\w.-]+/g, '_') + '.cpr';
+          await injectMedia(amspiritUrl, acc, { name, onLog: plog });
+          plog('✔ injected into AMSpiriT');
+        } catch (e) {
+          amspiritConnected = false;
+          plog('⚠ AMSpiriT injection failed: ' + (e?.message || e));
+        }
+      }
+    } catch (e) {
+      plog('Error: ' + (e?.message || e));
+    }
+    projectBusy = false;
+  }
 
   // Réassemblage automatique à chaque modification (debounce 500 ms).
   let auto = $state(false);
@@ -369,7 +475,8 @@
                   // upsertDirectives les ignore (hors de DIR_KEYS), c'est volontaire.
                   profile: (!isInclude && profile) || undefined,
                   ldFile: (!isInclude && ldFilename) || undefined,
-                  container: (!isInclude && container) || undefined };
+                  container: (!isInclude && container) || undefined,
+                  cprBank: (!isInclude && container === 'cpr') ? cprBank : undefined };
     const up = upsertDirectives(editor.value, cfg);  // maintien de la ligne ;z80:
     if (up !== editor.value) setCode(up);            // n'écrit que si ça change (évite la boucle auto)
     try {
@@ -395,10 +502,10 @@
       if (dlUrl) URL.revokeObjectURL(dlUrl);
       dlExt = res.ext || 'sna';
       dlUrl = URL.createObjectURL(new Blob([res.output], { type: 'application/octet-stream' }));
-      if (amspiritEnabled && amspiritConnected && res.ext === 'sna') {
+      if (amspiritEnabled && amspiritConnected && (res.ext === 'sna' || res.ext === 'cpr')) {
         try {
-          const name = (selected?.name || 'z80next').replace(/[^\w.-]+/g, '_') + '.sna';
-          await injectSna(amspiritUrl, res.output, { name, onLog: (m) => log('AMSpiriT: ' + m, 'muted') });
+          const name = (selected?.name || 'z80next').replace(/[^\w.-]+/g, '_') + '.' + res.ext;
+          await injectMedia(amspiritUrl, res.output, { name, onLog: (m) => log('AMSpiriT: ' + m, 'muted') });
           log('✔ injected into AMSpiriT', 'ok');
         } catch (e) {
           amspiritConnected = false; // la sonde périodique retentera la connexion
@@ -614,6 +721,7 @@
       ● AMSpiriT
     </span>
   {/if}
+  {#if canWrite}<button class="ico" onclick={openProjects} title="CPR projects: build a multi-bank cartridge from several sources">CPR</button>{/if}
   <button class="ico" onclick={openAppSettings} title="Application settings">{@render icon('settings')}</button>
   {#if canWrite}<button class="ico" onclick={newSource} title="New source">{@render icon('plus', 14)} New</button>{/if}
 </header>
@@ -795,12 +903,12 @@
               <option value="cpcplus">cpcplus</option>
             </select>
           </label>
-          <label title="What fantams builds (-o extension). Only sna is implemented today; the others are fantams's next evolution.">Container
+          <label title="What fantams builds (-o extension). sna and cpr are implemented; dsk/cdt are fantams's next evolution.">Container
             <select bind:value={container}>
               <option value="sna">sna</option>
               <option value="dsk" disabled>dsk (coming soon)</option>
               <option value="cdt" disabled>cdt (coming soon)</option>
-              <option value="cpr" disabled>cpr (coming soon)</option>
+              <option value="cpr">cpr</option>
             </select>
           </label>
           <label class="wide" title="fantams -T: an included .ld file (a source flagged as library, named *.ld) that places this build's sections. Optional — leave empty to write org/placement by hand.">Linker script (.ld)
@@ -809,6 +917,11 @@
               {#each ldOptions as o}<option value={o.filename}>{o.filename}</option>{/each}
             </select>
           </label>
+          {#if container === 'cpr'}
+            <label title="fantams --cpr-bank: the physical cartridge ROM id (0..31) THIS source's build fills. This tests one bank in isolation — a full multi-bank cartridge is built from the CPR projects panel.">Physical bank (0..31)
+              <input type="number" min="0" max="31" bind:value={cprBank} />
+            </label>
+          {/if}
         {/if}
       {/if}
       <label>Genre
@@ -841,6 +954,65 @@
         {:else if amspiritConnected}✅ connected — the wasm panel is hidden, execution goes through RAM + PC injection via the AMSpiriT API.
         {:else}⏳ unreachable for now — falling back to the built-in wasm emulator until the connection is established.{/if}
       </div>
+    </div>
+  </div>
+</div>
+{/if}
+
+{#if showProjects}
+<div class="modal" onclick={closeProjects} role="presentation">
+  <div class="dialog" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
+    <div class="dhead"><span>CPR projects</span><span class="grow"></span><button onclick={closeProjects}>Close ✕</button></div>
+    <div class="form">
+      <div class="note wide">
+        A CPR cartridge is built one physical ROM bank (0..31) at a time (fantams/cpr.h : each
+        bank is linked separately). A project is just the ordered list of which source fills
+        which bank — each source still needs its own profile/container=cpr/linker script set
+        in its own settings.
+      </div>
+      <label class="wide">Project
+        <select value={currentProject?.id || ''} onchange={(e) => e.target.value ? openProject(e.target.value) : (currentProject = null)}>
+          <option value="">— choose —</option>
+          {#each projects as p}<option value={p.id}>{p.name} ({p.bank_count} bank{p.bank_count === 1 ? '' : 's'})</option>{/each}
+        </select>
+      </label>
+      <button onclick={createProjectPrompt}>+ New project</button>
+      {#if currentProject}
+        <label class="wide">Name
+          <input value={currentProject.name}
+                 onchange={(e) => renameCurrentProject(e.target.value)} />
+        </label>
+        <table class="wide banks">
+          <thead><tr><th>bank</th><th>source</th><th></th></tr></thead>
+          <tbody>
+            {#each [...currentProject.banks].sort((a, b) => a.bank - b.bank) as b}
+              <tr>
+                <td>{b.bank}</td>
+                <td>{b.source_name}</td>
+                <td><button onclick={() => removeBank(b.bank)} title="Remove this bank from the project">✕</button></td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+        <label title="Assigns the source currently open in the editor to this bank number.">Add current source as bank
+          <input type="number" min="0" max="31" bind:value={newBankNumber} />
+        </label>
+        <button disabled={!selected?.id} onclick={addCurrentAsBank}>
+          + add “{selected?.name || '(no source open)'}” as bank {newBankNumber}
+        </button>
+        <button class="primary wide" disabled={projectBusy || currentProject.banks.length === 0} onclick={buildProject}>
+          {projectBusy ? 'Building…' : `Build ${currentProject.name}.cpr (${currentProject.banks.length} bank${currentProject.banks.length === 1 ? '' : 's'})`}
+        </button>
+        {#if projectDlUrl}
+          <a class="wide" href={projectDlUrl} download={(currentProject.name || 'project').replace(/[^\w.-]+/g, '_') + '.cpr'}>⬇ download .cpr</a>
+        {/if}
+        {#if projectLog.length}
+          <div class="wide log" style="max-height:160px">
+            {#each projectLog as l}<div>{l}</div>{/each}
+          </div>
+        {/if}
+        <button class="wide" onclick={() => deleteProject(currentProject.id)}>Delete this project</button>
+      {/if}
     </div>
   </div>
 </div>

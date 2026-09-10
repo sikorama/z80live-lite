@@ -53,6 +53,26 @@ CREATE TABLE IF NOT EXISTS sources (
   legacy_json   TEXT
 );
 
+-- Un Projet CPR : regroupe des Sources en banques physiques (0..31) d'une
+-- cartouche CPC+. Chaque banque reste liee SEPAREMENT (fantams/cpr.h) — le
+-- Projet ne fait qu'ORDONNER l'affectation Source <-> banque ; c'est la
+-- Source elle-meme (son profile/ld_filename/container, deja en base) qui
+-- porte le script -T dont l'axe/etat doit nommer cette banque.
+CREATE TABLE IF NOT EXISTS projects (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  created_at    INTEGER,
+  updated_at    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS project_banks (
+  project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  bank          INTEGER NOT NULL,              -- id physique de cartouche, 0..31
+  source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  PRIMARY KEY (project_id, bank)
+);
+CREATE INDEX IF NOT EXISTS idx_project_banks_source ON project_banks(source_id);
+
 CREATE INDEX IF NOT EXISTS idx_sources_name      ON sources(name);
 CREATE INDEX IF NOT EXISTS idx_sources_buildmode ON sources(buildmode);
 CREATE INDEX IF NOT EXISTS idx_sources_updated   ON sources(updated_at DESC);

@@ -10,7 +10,7 @@
 //   // r = { ok, assembler, ext, output: Uint8Array|null, log: string[] }
 
 const OUT = '/out';
-const BIN_EXT = ['sna', 'dsk', 'tap', 'bin']; // extensions binaires produites
+const BIN_EXT = ['sna', 'dsk', 'tap', 'bin', 'cpr']; // extensions binaires produites
 const DEFAULT_ORG = '#8000'; // défaut CPC courant (au lieu de #1000)
 
 const hasRasmHeader = (c) => /\bbuildsna\b/i.test(c);
@@ -256,6 +256,34 @@ export async function beautifySource(code = '', factories, includes = []) {
   return { ok, code: ok ? text : null, log: r.log, error: r.error };
 }
 
+// ---- La Fermeture (z80live CONTEXT.md, ADR 0002) ----
+// `fantams --list-files` imprime le fichier principal, plus récursivement
+// chaque INCLUDE touché, sur stdout — une erreur de préprocesseur va sur
+// stderr. Les deux sont capturés SÉPARÉMENT (à la différence de `runModule`,
+// qui les mélange dans un seul `log`) : un avertissement ne doit jamais
+// pouvoir se glisser dans la Fermeture.
+export async function listFiles(code = '', factories, includes = []) {
+  const out = [], errLog = [];
+  let Module;
+  try {
+    Module = await factories.createFantams(
+      { print: (s) => out.push(s), printErr: (s) => errLog.push(s), noExitRuntime: true });
+  } catch (e) {
+    return { ok: false, files: [], log: [], error: 'init WASM: ' + (e?.message || e) };
+  }
+  writeIncludes(Module.FS, includes);
+  Module.FS.writeFile('/in.asm', code);
+  let exitCode = 0, error = null;
+  try {
+    Module.callMain(['/in.asm', '--list-files']);
+  } catch (e) {
+    if (typeof e?.status === 'number') exitCode = e.status;
+    else { exitCode = -1; error = e?.message || String(e); }
+  }
+  const ok = exitCode === 0;
+  return { ok, files: ok ? out.filter(Boolean) : [], log: errLog, error };
+}
+
 export async function assemble(source, factories) {
   const raw = source || {};
   const code = stripAccents(raw.code || '');
@@ -298,14 +326,23 @@ export async function assemble(source, factories) {
   }
 
   if (assembler === 'fantams') {
-    // Conteneur (CONTEXT.md/fantams) : seul 'sna' est livre a ce stade (dsk/cdt/cpr sont
-    // hors perimetre, docs/spec-etage-c1.md). fantams n'ecrit qu'un blob brut sous le nom
-    // qu'on lui donne, sans valider le format visé : lui laisser passer un ".dsk" rendrait
-    // un fichier qui SE FAIT PASSER pour une image DSK sans en etre une. On refuse tot.
+    // Conteneur (CONTEXT.md/fantams) : 'sna' et 'cpr' sont livres (dsk/cdt restent hors
+    // perimetre, docs/spec-etage-c1.md). fantams n'ecrit qu'un blob brut sous le nom qu'on
+    // lui donne, sans valider le format visé : lui laisser passer un ".dsk" rendrait un
+    // fichier qui SE FAIT PASSER pour une image DSK sans en etre une. On refuse tot.
     const container = opts.container || 'sna';
-    if (container !== 'sna') {
+    // `.cpr` : UNE banque physique (0..31) par appel (fantams/cpr.h — chaque banque est
+    // liee SEPAREMENT). `opts.cprBank` la nomme ; rien d'autre ne le sait (le script -T
+    // choisit l'axe/etat, l'image liee ne porte pas l'id physique — voir cpr.cpp).
+    const cprBank = Number(opts.cprBank);
+    if (container === 'cpr' && !(Number.isInteger(cprBank) && cprBank >= 0 && cprBank <= 31)) {
       return { ok: false, assembler, ext: null, output: null,
-               log: [`conteneur "${container}" pas encore livre par fantams (seul sna est actif)`],
+               log: ['cpr : --cpr-bank manquant ou hors de 0..31'],
+               error: 'cpr-bank invalide', preprocessed: code, lineOffset: 0 };
+    }
+    if (container !== 'sna' && container !== 'cpr') {
+      return { ok: false, assembler, ext: null, output: null,
+               log: [`conteneur "${container}" pas encore livre par fantams (sna/cpr actifs)`],
                error: 'conteneur non supporte', preprocessed: code, lineOffset: 0 };
     }
     const wrapped = wrapFantams(code, opts);
@@ -316,12 +353,19 @@ export async function assemble(source, factories) {
     // dans le FS wasm comme n'importe quel include ; on ne fait ici que le DESIGNER a fantams.
     if (opts.profile) args.push('--target', opts.profile);
     if (opts.ldFile) args.push('-T', includePath({ filename: opts.ldFile }));
+    if (container === 'cpr') args.push('--cpr-bank', String(cprBank));
+    // `opts.prevCpr` : le .cpr deja accumule par les banques precedentes (un Projet CPR,
+    // App.svelte) — pre-seme au chemin de sortie, fantams (asm_main.cpp) le relit, y AJOUTE
+    // cette banque et le reecrit. Absent (premier appel), fantams part d'un conteneur vide.
+    const extraFiles = container === 'cpr' && opts.prevCpr
+      ? [...baseFiles, { path: outPath, data: opts.prevCpr }]
+      : baseFiles;
     // fantams a un vrai preprocesseur : `preprocessed` porte la SOURCE DEROULEE
     // (macros expansees, boucles deroulees, includes inseres), pas la source
     // d'entree. Pour rasm et sjasmplus, faute d'equivalent, elle reste l'entree.
     const r = await runModule(
       factories.createFantams, args, wrapped, outPath, includes,
-      { args: ['/in.asm', '-E', '-o', '/out.pp'], path: '/out.pp' }, baseFiles);
+      { args: ['/in.asm', '-E', '-o', '/out.pp'], path: '/out.pp' }, extraFiles);
     const ok = r.exitCode === 0 && !!r.data;
     return { ok, assembler, ext: r.ext, output: ok ? r.data : null,
              log: baseLog ? [baseLog, ...r.log] : r.log, error: r.error,
