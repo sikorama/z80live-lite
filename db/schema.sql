@@ -29,11 +29,15 @@ CREATE TABLE IF NOT EXISTS sources (
                                             -- sous lequel ce fichier est injecté dans le FS wasm à l'assemblage
   output_type   TEXT,
 
-  -- Réglages fantams (profil/lien/conteneur, CONTEXT.md). Uniquement en base : pas reflétés
-  -- dans la directive `;z80:` (docs/adr/0001-profil-et-fichier-de-lien-restent-hors-directive.md).
-  profile       TEXT,                      -- 'cpc6128' | 'cpcplus' | NULL(=défaut fantams), passé en --target
-  ld_filename   TEXT,                      -- filename d'une source is_include=1 (un .ld) passée en -T
-  container     TEXT,                      -- 'sna' | 'dsk' | 'cdt' | 'cpr' | NULL(=sna) ; seul 'sna' est actif
+  -- Profil/Fichier de lien/Format ne sont plus des colonnes de la Source (docs/adr/0002,
+  -- tranche 2026-09-10) : ce sont des reglages de Cible/Membre. `default_target_id` designe
+  -- la Cible implicite d'une Source seule (ADR 0002, Q1 : "une Source seule EST un Projet a
+  -- un membre") — c'est elle qui porte desormais profil/format (Cible) et fichier de lien
+  -- (Membre). NULL avant la premiere sauvegarde de ces reglages (source neuve, ou source
+  -- jamais configuree). `sources.profile`/`ld_filename`/`container` ont existe (ADR 0001) et
+  -- ont ete retires : docs/adr/0001 reste valable sur la directive ;z80:, plus sur leur lieu
+  -- de stockage exact.
+  default_target_id TEXT REFERENCES targets(id) ON DELETE SET NULL,
 
   -- 1 = librairie/fichier à inclure (pas de point d'entrée) : injecté automatiquement dans le
   -- répertoire de travail wasm de chaque assemblage, sous le nom `filename` (défaut: slug(name)+'.asm').
@@ -53,11 +57,9 @@ CREATE TABLE IF NOT EXISTS sources (
   legacy_json   TEXT
 );
 
--- Un Projet CPR : regroupe des Sources en banques physiques (0..31) d'une
--- cartouche CPC+. Chaque banque reste liee SEPAREMENT (fantams/cpr.h) — le
--- Projet ne fait qu'ORDONNER l'affectation Source <-> banque ; c'est la
--- Source elle-meme (son profile/ld_filename/container, deja en base) qui
--- porte le script -T dont l'axe/etat doit nommer cette banque.
+-- Le Projet (CONTEXT.md, docs/adr/0002) : la portee d'un build, TOUJOURS.
+-- Regroupe des Sources point d'entree et porte une ou plusieurs Cibles
+-- d'export ; chaque Cible a ses Membres (ADR 0002 : Projet > Cible > Membre).
 CREATE TABLE IF NOT EXISTS projects (
   id            TEXT PRIMARY KEY,
   name          TEXT NOT NULL,
@@ -65,13 +67,33 @@ CREATE TABLE IF NOT EXISTS projects (
   updated_at    INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS project_banks (
+-- Une Cible d'export : ce qu'un Projet produit (un Artefact fantams — un
+-- Conteneur comme CPR, une Base comme SNA). `profile` est partage par tous
+-- ses Membres (un Conteneur cible une seule machine, ADR 0002).
+CREATE TABLE IF NOT EXISTS targets (
+  id            TEXT PRIMARY KEY,
   project_id    TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-  bank          INTEGER NOT NULL,              -- id physique de cartouche, 0..31
-  source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-  PRIMARY KEY (project_id, bank)
+  name          TEXT NOT NULL,
+  format        TEXT NOT NULL,                 -- 'sna' | 'cpr' (ADR 0002, Q2 : les seuls actifs)
+  profile       TEXT,                          -- 'cpc6128' | 'cpcplus' | NULL
+  created_at    INTEGER,
+  updated_at    INTEGER
 );
-CREATE INDEX IF NOT EXISTS idx_project_banks_source ON project_banks(source_id);
+CREATE INDEX IF NOT EXISTS idx_targets_project ON targets(project_id);
+
+-- Un Membre : une Source point d'entree affectee a UNE Cible, avec le role
+-- que son Format y demande — `bank` (0..31) pour un Conteneur CPR, rien de
+-- plus pour une Cible SNA (au plus un Membre, ADR 0002). `ld_filename` est
+-- propre a CE placement dans CETTE Cible (la meme Source peut etre Membre
+-- de deux Cibles avec deux scripts de lien differents).
+CREATE TABLE IF NOT EXISTS target_members (
+  target_id     TEXT NOT NULL REFERENCES targets(id) ON DELETE CASCADE,
+  source_id     TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+  bank          INTEGER,                        -- id physique de cartouche, 0..31 ; NULL hors CPR
+  ld_filename   TEXT,
+  PRIMARY KEY (target_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_target_members_source ON target_members(source_id);
 
 CREATE INDEX IF NOT EXISTS idx_sources_name      ON sources(name);
 CREATE INDEX IF NOT EXISTS idx_sources_buildmode ON sources(buildmode);

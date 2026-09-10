@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve, normalize, extname } from 'node:path';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
@@ -17,32 +17,25 @@ const WRITE_TOKEN = process.env.Z80_WRITE_TOKEN || null; // null => écriture ou
 
 const db = new DatabaseSync(DB_PATH);
 db.exec('PRAGMA foreign_keys = ON;');
-// Bootstrap idempotent (db/schema.sql en porte le texte canonique) : une base
-// z80live.sqlite deja en service n'a pas rejoue schema.sql depuis sa creation
-// (db/import.mjs, lui, le fait — mais reconstruit toute la base depuis un
-// export JSON, pas une simple mise a jour). CREATE TABLE IF NOT EXISTS est
-// deja l'idiome du reste du schema : le repeter ici evite une etape de
-// migration separee pour deux tables aussi petites.
-db.exec(`
-  CREATE TABLE IF NOT EXISTS projects (
-    id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER, updated_at INTEGER
-  );
-  CREATE TABLE IF NOT EXISTS project_banks (
-    project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-    bank INTEGER NOT NULL,
-    source_id TEXT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
-    PRIMARY KEY (project_id, bank)
-  );
-  CREATE INDEX IF NOT EXISTS idx_project_banks_source ON project_banks(source_id);
-`);
+// Bootstrap idempotent : rejoue db/schema.sql (CREATE TABLE/INDEX IF NOT
+// EXISTS partout) a chaque demarrage. Un seul texte canonique — celui que
+// db/import.mjs applique aussi — plutot qu'une copie a la main ici qui
+// pourrait diverger : une base deja en service ne perd rien (IF NOT EXISTS),
+// une base neuve (comme dans les tests) n'a pas besoin d'une etape d'import
+// separee pour exister.
+db.exec(readFileSync(join(__dirname, '../db/schema.sql'), 'utf8'));
 
-// Colonnes exposées en liste (léger, sans le code).
+// Colonnes exposées en liste (léger, sans le code). Profil/Fichier de lien/Format n'en font
+// plus partie (docs/adr/0002) : ce sont des réglages de Cible/Membre, pas de Source — voir
+// `q.get` plus bas, seul endroit qui les rejoint encore, pour que l'appelant (App.svelte,
+// `selectSource()`) n'ait RIEN à changer : la forme de la réponse ne bouge pas, seul son
+// stockage a changé de table.
 const LIST_COLS = `id, name, slugname, author, owner, description, category, genre, group_name,
   assembler, buildmode, entry_point, start_point, end_point, command, filename, is_include,
-  profile, ld_filename, container,
   build_status, compilable, fork_parent, created_at, updated_at`;
 const FULL_COLS = `${LIST_COLS}, code`;
 const LIST_COLS_S = LIST_COLS.replace(/\b(\w+)\b/g, 's.$1'); // colonnes qualifiées pour les jointures FTS
+const FULL_COLS_S = FULL_COLS.replace(/\b(\w+)\b/g, 's.$1');
 
 const q = {
   list: db.prepare(`SELECT ${LIST_COLS} FROM sources ORDER BY updated_at DESC LIMIT $limit OFFSET $offset`),
@@ -64,37 +57,108 @@ const q = {
   searchLike: db.prepare(`SELECT ${LIST_COLS} FROM sources
       WHERE name LIKE $like OR filename LIKE $like OR author LIKE $like OR description LIKE $like
       ORDER BY updated_at DESC LIMIT $limit OFFSET $offset`),
-  get: db.prepare(`SELECT ${FULL_COLS} FROM sources WHERE id = $id`),
+  // Profil/format/fichier de lien : rejoints depuis la Cible/le Membre IMPLICITE de cette
+  // Source (`default_target_id`), avec les memes noms que les anciennes colonnes — c'est
+  // volontaire (docs/adr/0002) : le contrat rendu a l'appelant ne change pas, seul l'endroit
+  // qui les porte a change. NULL des deux cotes si la Source n'en a pas encore (jamais
+  // sauvegardee avec ces reglages).
+  get: db.prepare(`SELECT ${FULL_COLS_S}, t.profile AS profile, t.format AS container, tm.ld_filename AS ld_filename
+      FROM sources s
+      LEFT JOIN targets t ON t.id = s.default_target_id
+      LEFT JOIN target_members tm ON tm.target_id = s.default_target_id AND tm.source_id = s.id
+      WHERE s.id = $id`),
   includes: db.prepare(`SELECT id, name, filename, code FROM sources WHERE is_include = 1 ORDER BY name`),
   count: db.prepare(`SELECT COUNT(*) c FROM sources`),
   del: db.prepare(`DELETE FROM sources WHERE id = $id`),
 };
 
+// Formats de Cible actifs (ADR 0002, Q2) : dsk/cdt/cro viendront quand
+// fantams les livrera reellement, pas avant (deviner leur forme n'aide pas).
+const TARGET_FORMATS = new Set(['sna', 'cpr']);
+
 const qp = {
   list: db.prepare(`SELECT p.id, p.name, p.created_at, p.updated_at,
-      (SELECT COUNT(*) FROM project_banks b WHERE b.project_id = p.id) AS bank_count
+      (SELECT COUNT(*) FROM targets t WHERE t.project_id = p.id) AS target_count
       FROM projects p ORDER BY p.updated_at DESC`),
   get: db.prepare(`SELECT id, name, created_at, updated_at FROM projects WHERE id = $id`),
-  banks: db.prepare(`SELECT b.bank, b.source_id, s.name AS source_name
-      FROM project_banks b JOIN sources s ON s.id = b.source_id
-      WHERE b.project_id = $project_id ORDER BY b.bank`),
   del: db.prepare(`DELETE FROM projects WHERE id = $id`),
-  setBank: db.prepare(`INSERT INTO project_banks (project_id, bank, source_id) VALUES ($project_id, $bank, $source_id)
-      ON CONFLICT(project_id, bank) DO UPDATE SET source_id = excluded.source_id`),
-  delBank: db.prepare(`DELETE FROM project_banks WHERE project_id = $project_id AND bank = $bank`),
 };
+
+const qt = {
+  listForProject: db.prepare(`SELECT id, project_id, name, format, profile, created_at, updated_at
+      FROM targets WHERE project_id = $project_id ORDER BY created_at`),
+  get: db.prepare(`SELECT id, project_id, name, format, profile, created_at, updated_at
+      FROM targets WHERE id = $id`),
+  members: db.prepare(`SELECT m.source_id, m.bank, m.ld_filename, s.name AS source_name
+      FROM target_members m JOIN sources s ON s.id = m.source_id
+      WHERE m.target_id = $target_id ORDER BY m.bank, s.name`),
+};
+
+function getTargetFull(id) {
+  const t = qt.get.get({ id });
+  if (!t) return null;
+  return { ...t, members: qt.members.all({ target_id: id }) };
+}
 
 function getProjectFull(id) {
   const p = qp.get.get({ id });
   if (!p) return null;
-  return { ...p, banks: qp.banks.all({ project_id: id }) };
+  const targets = qt.listForProject.all({ project_id: id })
+    .map((t) => ({ ...t, members: qt.members.all({ target_id: t.id }) }));
+  return { ...p, targets };
 }
 
-// Champs modifiables par l'API.
+// Champs modifiables par l'API — colonnes REELLES de `sources`. Profil/Fichier de
+// lien/Format n'y sont plus (docs/adr/0002) : voir TARGET_FIELDS et applyTargetFields().
 const WRITABLE = ['name', 'slugname', 'author', 'owner', 'description', 'category', 'genre',
   'group_name', 'code', 'assembler', 'buildmode', 'entry_point', 'start_point',
-  'end_point', 'command', 'filename', 'output_type', 'is_include', 'profile', 'ld_filename',
-  'container', 'build_status', 'compilable'];
+  'end_point', 'command', 'filename', 'output_type', 'is_include', 'build_status', 'compilable'];
+
+// L'appelant (App.svelte) envoie encore ces trois clefs dans le corps de la requete, comme
+// avant docs/adr/0002 : c'est INTENTIONNEL, pas une dette — seule leur DESTINATION a change.
+const TARGET_FIELDS = ['profile', 'ld_filename', 'container'];
+
+// La Cible implicite d'une Source seule (ADR 0002, Q1 : "une Source seule EST un Projet a
+// un membre") : creee a la premiere ecriture de profil/format/fichier de lien, jamais avant
+// (une Source qui ne configure jamais ces reglages n'accumule pas un Projet vide derriere elle).
+function ensureDefaultTarget(sourceId, sourceName) {
+  const row = db.prepare(`SELECT default_target_id FROM sources WHERE id = $id`).get({ id: sourceId });
+  if (row?.default_target_id) return row.default_target_id;
+  const now = Date.now();
+  const projectId = randomUUID(), targetId = randomUUID();
+  db.prepare(`INSERT INTO projects (id, name, created_at, updated_at) VALUES ($id, $name, $now, $now)`)
+    .run({ id: projectId, name: sourceName || 'untitled', now });
+  db.prepare(`INSERT INTO targets (id, project_id, name, format, profile, created_at, updated_at)
+      VALUES ($id, $project_id, $name, 'sna', NULL, $now, $now)`)
+    .run({ id: targetId, project_id: projectId, name: sourceName || 'untitled', now });
+  db.prepare(`INSERT INTO target_members (target_id, source_id, bank, ld_filename)
+      VALUES ($target_id, $source_id, NULL, NULL)`).run({ target_id: targetId, source_id: sourceId });
+  db.prepare(`UPDATE sources SET default_target_id = $target_id WHERE id = $source_id`)
+    .run({ target_id: targetId, source_id: sourceId });
+  return targetId;
+}
+
+// Route profil/format/fichier de lien vers la Cible/le Membre implicite (ADR 0002). Ne cree
+// RIEN si aucun des trois n'est present dans `data` : une simple mise a jour de nom ou de
+// description ne doit pas fabriquer une Cible.
+function applyTargetFields(sourceId, sourceName, data) {
+  if (!TARGET_FIELDS.some((k) => k in data)) return;
+  const targetId = ensureDefaultTarget(sourceId, sourceName);
+  const sets = [], params = { id: targetId, now: Date.now() };
+  if ('profile' in data) { sets.push('profile = $profile'); params.profile = data.profile || null; }
+  if ('container' in data) {
+    sets.push('format = $format');
+    params.format = TARGET_FORMATS.has(data.container) ? data.container : 'sna';
+  }
+  if (sets.length) {
+    sets.push('updated_at = $now');
+    db.prepare(`UPDATE targets SET ${sets.join(', ')} WHERE id = $id`).run(params);
+  }
+  if ('ld_filename' in data) {
+    db.prepare(`UPDATE target_members SET ld_filename = $ld WHERE target_id = $tid AND source_id = $sid`)
+      .run({ ld: data.ld_filename || null, tid: targetId, sid: sourceId });
+  }
+}
 
 function insertSource(data, { fork_parent = null } = {}) {
   const id = randomUUID();
@@ -105,6 +169,7 @@ function insertSource(data, { fork_parent = null } = {}) {
   row.code = row.code || '';
   const cols = ['id', ...WRITABLE, 'fork_parent', 'created_at', 'updated_at'];
   db.prepare(`INSERT INTO sources (${cols.join(',')}) VALUES (${cols.map((c) => '$' + c).join(',')})`).run(row);
+  if (!row.is_include) applyTargetFields(id, row.name, data);
   return q.get.get({ id });
 }
 
@@ -117,6 +182,7 @@ function updateSource(id, data) {
   }
   sets.push('updated_at = $updated_at');
   db.prepare(`UPDATE sources SET ${sets.join(', ')} WHERE id = $id`).run(params);
+  if (!existing.is_include) applyTargetFields(id, data.name ?? existing.name, data);
   return q.get.get({ id });
 }
 
@@ -245,7 +311,7 @@ const server = createServer(async (req, res) => {
       return json(res, 201, getProjectFull(id));
     }
 
-    // GET /api/projects/:id  (avec ses banques, jointes au nom de la Source)
+    // GET /api/projects/:id  (avec ses Cibles et leurs Membres)
     let mp = p.match(/^\/api\/projects\/([^/]+)$/);
     if (m === 'GET' && mp) {
       const proj = getProjectFull(decodeURIComponent(mp[1]));
@@ -270,29 +336,83 @@ const server = createServer(async (req, res) => {
       return json(res, r.changes ? 200 : 404, { deleted: r.changes });
     }
 
-    // PUT /api/projects/:id/banks/:bank  { source_id }  — affecte (ou remplace) cette banque
-    let mb = p.match(/^\/api\/projects\/([^/]+)\/banks\/(\d+)$/);
-    if (m === 'PUT' && mb) {
+    // POST /api/projects/:id/targets  { name, format, profile? } — une Cible
+    // (ADR 0002 : un Projet peut en porter plusieurs, y compris du meme Format).
+    let mt = p.match(/^\/api\/projects\/([^/]+)\/targets$/);
+    if (m === 'POST' && mt) {
       if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
-      const project_id = decodeURIComponent(mb[1]), bank = Number(mb[2]);
+      const project_id = decodeURIComponent(mt[1]);
       if (!qp.get.get({ id: project_id })) return json(res, 404, { error: 'project not found' });
-      if (bank < 0 || bank > 31) return json(res, 400, { error: 'bank hors de 0..31' });
+      const body = await readBody(req);
+      if (!TARGET_FORMATS.has(body.format))
+        return json(res, 400, { error: `format inconnu : '${body.format}' (au choix : ${[...TARGET_FORMATS].join(', ')})` });
+      const id = randomUUID(), now = Date.now();
+      db.prepare(`INSERT INTO targets (id, project_id, name, format, profile, created_at, updated_at)
+          VALUES ($id, $project_id, $name, $format, $profile, $now, $now)`)
+        .run({ id, project_id, name: body.name || 'untitled target', format: body.format, profile: body.profile || null, now });
+      db.prepare(`UPDATE projects SET updated_at = $now WHERE id = $id`).run({ id: project_id, now });
+      return json(res, 201, getTargetFull(id));
+    }
+
+    // POST /api/projects/:pid/targets/:tid/members { source_id, bank?, ld_filename? }
+    // Affecte un point d'entree a une Cible (ADR 0002). Le role qu'exige le
+    // Format de la Cible est verifie ICI, pas dans le schema : `bank` est
+    // OBLIGATOIRE et unique pour un Conteneur CPR (deux banques ne peuvent
+    // pas partager un numero), absent pour une Base SNA, qui ne compte
+    // qu'UN SEUL Membre (Q4).
+    let mm = p.match(/^\/api\/projects\/([^/]+)\/targets\/([^/]+)\/members$/);
+    if (m === 'POST' && mm) {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const project_id = decodeURIComponent(mm[1]), target_id = decodeURIComponent(mm[2]);
+      const target = qt.get.get({ id: target_id });
+      if (!target || target.project_id !== project_id) return json(res, 404, { error: 'target not found' });
       const body = await readBody(req);
       if (!body.source_id || !q.get.get({ id: body.source_id }))
         return json(res, 400, { error: 'source_id manquant ou introuvable' });
-      qp.setBank.run({ project_id, bank, source_id: body.source_id });
-      db.prepare(`UPDATE projects SET updated_at = $now WHERE id = $id`).run({ id: project_id, now: Date.now() });
-      return json(res, 200, getProjectFull(project_id));
+      let bank = null;
+      if (target.format === 'cpr') {
+        bank = Number(body.bank);
+        if (!Number.isInteger(bank) || bank < 0 || bank > 31)
+          return json(res, 400, { error: 'une Cible cpr exige "bank" entre 0 et 31' });
+        const clash = qt.members.all({ target_id }).find((mb) => mb.bank === bank && mb.source_id !== body.source_id);
+        if (clash) return json(res, 400, { error: `la banque ${bank} est deja prise par '${clash.source_name}'` });
+      } else {
+        if (body.bank !== undefined && body.bank !== null)
+          return json(res, 400, { error: `une Cible ${target.format} ne prend pas de "bank"` });
+        const existing = qt.members.all({ target_id });
+        if (existing.length >= 1 && existing[0].source_id !== body.source_id)
+          return json(res, 400, { error: `une Cible ${target.format} ne compte qu'un seul Membre` });
+      }
+      db.prepare(`INSERT INTO target_members (target_id, source_id, bank, ld_filename)
+          VALUES ($target_id, $source_id, $bank, $ld_filename)
+          ON CONFLICT(target_id, source_id) DO UPDATE SET bank = excluded.bank, ld_filename = excluded.ld_filename`)
+        .run({ target_id, source_id: body.source_id, bank, ld_filename: body.ld_filename || null });
+      db.prepare(`UPDATE targets SET updated_at = $now WHERE id = $id`).run({ id: target_id, now: Date.now() });
+      return json(res, 201, getTargetFull(target_id));
     }
 
-    // DELETE /api/projects/:id/banks/:bank
-    if (m === 'DELETE' && mb) {
+    // DELETE /api/projects/:pid/targets/:tid/members/:source_id
+    let md = p.match(/^\/api\/projects\/([^/]+)\/targets\/([^/]+)\/members\/([^/]+)$/);
+    if (m === 'DELETE' && md) {
       if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
-      const project_id = decodeURIComponent(mb[1]), bank = Number(mb[2]);
-      qp.delBank.run({ project_id, bank });
+      const [, pid, tid, sid] = md.map(decodeURIComponent);
+      const target = qt.get.get({ id: tid });
+      if (!target || target.project_id !== pid) return json(res, 404, { error: 'target not found' });
+      db.prepare(`DELETE FROM target_members WHERE target_id = $tid AND source_id = $sid`).run({ tid, sid });
+      db.prepare(`UPDATE targets SET updated_at = $now WHERE id = $id`).run({ id: tid, now: Date.now() });
+      return json(res, 200, getTargetFull(tid));
+    }
+
+    // DELETE /api/projects/:pid/targets/:tid  (ses Membres partent avec elle)
+    let mtd = p.match(/^\/api\/projects\/([^/]+)\/targets\/([^/]+)$/);
+    if (m === 'DELETE' && mtd) {
+      if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
+      const project_id = decodeURIComponent(mtd[1]), target_id = decodeURIComponent(mtd[2]);
+      const target = qt.get.get({ id: target_id });
+      if (!target || target.project_id !== project_id) return json(res, 404, { error: 'target not found' });
+      db.prepare(`DELETE FROM targets WHERE id = $id`).run({ id: target_id });
       db.prepare(`UPDATE projects SET updated_at = $now WHERE id = $id`).run({ id: project_id, now: Date.now() });
-      const proj = getProjectFull(project_id);
-      return proj ? json(res, 200, proj) : json(res, 404, { error: 'not found' });
+      return json(res, 200, getProjectFull(project_id));
     }
 
     // POST /api/scratch?ext=sna  (corps binaire) -> { url } avec extension pour l'émulateur

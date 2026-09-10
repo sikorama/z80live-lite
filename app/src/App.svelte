@@ -163,19 +163,22 @@
   const openAppSettings = () => { showAppSettings = true; };
   function closeAppSettings() { showAppSettings = false; saveSettings(); syncAmspiritPolling(); }
 
-  // ---- Projets CPR (db/schema.sql : `projects` + `project_banks`) ----
-  // Un Projet regroupe des Sources, une par banque physique (0..31) de cartouche
-  // CPC+. Chaque banque reste liee SEPAREMENT (fantams/cpr.h) : "construire" un
-  // Projet, c'est rappeler assemble() une fois par banque, dans l'ordre, en
+  // ---- Projet (db/schema.sql : `projects`/`targets`/`target_members`,
+  // docs/adr/0002) : un Projet regroupe des Sources point d'entree et porte
+  // une ou plusieurs Cibles d'export, chacune avec ses Membres. Une Cible CPR
+  // se construit une banque a la fois, dans l'ORDRE des numeros de banque, en
   // faisant voyager le .cpr accumule d'un appel a l'autre (wasm/assemble.mjs,
-  // `prevCpr`) — exactement ce que `fantams -o x.cpr --cpr-bank n` fait sur la CLI.
+  // `prevCpr`) — exactement ce que `fantams -o x.cpr --cpr-bank n` fait sur la
+  // CLI. Une Cible SNA n'a qu'un Membre : la construire est juste l'assemblage
+  // normal de cette Source.
   let showProjects = $state(false);
-  let projects = $state([]);          // resume [{id,name,bank_count}]
-  let currentProject = $state(null);  // detail ouvert {id,name,banks:[{bank,source_id,source_name}]}
-  let newBankNumber = $state(0);
-  let projectBusy = $state(false);
+  let projects = $state([]);          // resume [{id,name,target_count}]
+  let currentProject = $state(null);  // detail ouvert {id,name,targets:[{id,name,format,profile,members:[...]}]}
+  let newTargetName = $state(''), newTargetFormat = $state('sna'), newTargetProfile = $state('');
+  let newMemberBank = $state(0);
+  let projectBusy = $state(false);        // id de la Cible en construction, ou null
   let projectLog = $state([]);
-  let projectDlUrl = $state('');
+  let projectDlUrl = $state(''), builtTargetId = $state(null);
 
   async function openProjects() {
     showProjects = true;
@@ -183,7 +186,7 @@
   }
   function closeProjects() { showProjects = false; currentProject = null; projectLog = []; }
   async function openProject(id) {
-    projectLog = []; if (projectDlUrl) URL.revokeObjectURL(projectDlUrl); projectDlUrl = '';
+    projectLog = []; if (projectDlUrl) URL.revokeObjectURL(projectDlUrl); projectDlUrl = ''; builtTargetId = null;
     try { currentProject = await store.getProject(id); } catch { currentProject = null; }
   }
   async function createProjectPrompt() {
@@ -201,56 +204,78 @@
     if (currentProject?.id === id) currentProject = null;
     projects = await store.listProjects();
   }
-  // Affecte la source OUVERTE dans l'editeur a la banque `newBankNumber` du
-  // Projet courant : pas de second selecteur de source a maintenir, l'editeur
-  // en porte deja un.
-  async function addCurrentAsBank() {
-    if (!currentProject || !selected?.id) return;
-    currentProject = await store.setProjectBank(currentProject.id, Number(newBankNumber), selected.id);
+  async function addTarget() {
+    if (!currentProject) return;
+    await store.createTarget(currentProject.id, {
+      name: newTargetName || 'untitled target', format: newTargetFormat,
+      profile: newTargetFormat === 'cpr' ? (newTargetProfile || undefined) : undefined,
+    });
+    newTargetName = ''; newTargetProfile = '';
+    currentProject = await store.getProject(currentProject.id);
     projects = await store.listProjects();
   }
-  async function removeBank(bank) {
+  async function removeTarget(targetId) {
     if (!currentProject) return;
-    currentProject = await store.removeProjectBank(currentProject.id, bank);
+    currentProject = await store.removeTarget(currentProject.id, targetId);
+    projects = await store.listProjects();
+  }
+  // Affecte la Source OUVERTE dans l'editeur comme Membre de `target` : pas de
+  // second selecteur de source a maintenir, l'editeur en porte deja un.
+  async function addCurrentAsMember(target) {
+    if (!currentProject || !selected?.id) return;
+    const data = { source_id: selected.id };
+    if (target.format === 'cpr') data.bank = Number(newMemberBank);
+    currentProject = await store.setTargetMember(currentProject.id, target.id, data);
+  }
+  async function removeMember(targetId, sourceId) {
+    if (!currentProject) return;
+    currentProject = await store.removeTargetMember(currentProject.id, targetId, sourceId);
   }
 
-  // Construit le .cpr complet : une banque a la fois, dans l'ORDRE des numeros
-  // de banque, en faisant voyager les octets deja accumules (prevCpr). Une
-  // seule banque en echec arrete tout — un .cpr partiel qui SE FAIT PASSER pour
-  // complet serait pire que rien (meme raison que cpr.cpp cote CLI).
-  async function buildProject() {
-    if (!currentProject || currentProject.banks.length === 0) return;
-    projectBusy = true; projectLog = [];
+  // Construit UNE Cible : ses Membres, dans l'ordre de banque pour un
+  // Conteneur CPR (une banque a la fois, prevCpr accumule) ; un assemblage
+  // simple pour une Base SNA (un seul Membre). Un Membre en echec arrete tout
+  // — un .cpr partiel qui SE FAIT PASSER pour complet serait pire que rien
+  // (meme raison que cpr.cpp cote CLI).
+  async function buildTarget(target) {
+    if (!target.members.length) return;
+    projectBusy = target.id; projectLog = [];
     if (projectDlUrl) URL.revokeObjectURL(projectDlUrl);
-    projectDlUrl = '';
+    projectDlUrl = ''; builtTargetId = null;
     const plog = (m) => { projectLog = [...projectLog, m]; };
     try {
       const includes = await store.listIncludes().catch(() => []);
       let acc = null;
-      const banks = [...currentProject.banks].sort((a, b) => a.bank - b.bank);
-      for (const b of banks) {
-        const src = await store.get(b.source_id);
-        if (!src) { plog(`❌ bank ${b.bank}: source ${b.source_id} introuvable`); projectBusy = false; return; }
-        plog(`banque ${b.bank} (${src.name})…`);
+      const members = target.format === 'cpr'
+        ? [...target.members].sort((a, b) => a.bank - b.bank)
+        : target.members;
+      for (const mbr of members) {
+        const src = await store.get(mbr.source_id);
+        if (!src) { plog(`❌ ${mbr.source_name}: source introuvable`); projectBusy = false; return; }
+        const label = target.format === 'cpr' ? `banque ${mbr.bank} (${src.name})` : src.name;
+        plog(`${label}…`);
+        const cfg = target.format === 'cpr'
+          ? { container: 'cpr', cprBank: mbr.bank, prevCpr: acc || undefined, profile: target.profile || undefined }
+          : { container: 'sna' };
         const res = await assemble({
-          code: src.code, assembler: 'fantams', profile: src.profile || undefined,
-          ldFile: src.ld_filename || undefined, container: 'cpr', cprBank: b.bank,
-          prevCpr: acc || undefined, includes: includes.filter((i) => i.id !== src.id),
+          code: src.code, assembler: 'fantams', ldFile: mbr.ld_filename || undefined,
+          ...cfg, includes: includes.filter((i) => i.id !== src.id),
         }, factories);
         if (!res.ok || !res.output) {
-          plog(`❌ banque ${b.bank} (${src.name}) — echec`);
+          plog(`❌ ${label} — echec`);
           for (const l of res.log.slice(-12)) plog('   ' + l);
           if (res.error) plog('   ⚠ ' + res.error);
           projectBusy = false; return;
         }
         acc = res.output;
-        plog(`✔ banque ${b.bank} — ${acc.length} o au total`);
+        plog(`✔ ${label} — ${acc.length} o au total`);
       }
       projectDlUrl = URL.createObjectURL(new Blob([acc], { type: 'application/octet-stream' }));
-      plog(`✔ ${currentProject.name}.cpr — ${banks.length} banque(s), ${acc.length} octets`);
-      if (amspiritEnabled && amspiritConnected) {
+      builtTargetId = target.id;
+      plog(`✔ ${target.name}.${target.format} — ${members.length} membre(s), ${acc.length} octets`);
+      if (amspiritEnabled && amspiritConnected && (target.format === 'sna' || target.format === 'cpr')) {
         try {
-          const name = (currentProject.name || 'project').replace(/[^\w.-]+/g, '_') + '.cpr';
+          const name = (target.name || 'target').replace(/[^\w.-]+/g, '_') + '.' + target.format;
           await injectMedia(amspiritUrl, acc, { name, onLog: plog });
           plog('✔ injected into AMSpiriT');
         } catch (e) {
@@ -962,18 +987,18 @@
 {#if showProjects}
 <div class="modal" onclick={closeProjects} role="presentation">
   <div class="dialog" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
-    <div class="dhead"><span>CPR projects</span><span class="grow"></span><button onclick={closeProjects}>Close ✕</button></div>
+    <div class="dhead"><span>Projects</span><span class="grow"></span><button onclick={closeProjects}>Close ✕</button></div>
     <div class="form">
       <div class="note wide">
-        A CPR cartridge is built one physical ROM bank (0..31) at a time (fantams/cpr.h : each
-        bank is linked separately). A project is just the ordered list of which source fills
-        which bank — each source still needs its own profile/container=cpr/linker script set
-        in its own settings.
+        A Project groups sources and owns one or more export Targets (docs/adr/0002). A
+        <code>cpr</code> Target is built one physical ROM bank (0..31) at a time (fantams/cpr.h :
+        each bank is linked separately) ; a <code>sna</code> Target has a single member, built
+        like a normal single-source build.
       </div>
       <label class="wide">Project
         <select value={currentProject?.id || ''} onchange={(e) => e.target.value ? openProject(e.target.value) : (currentProject = null)}>
           <option value="">— choose —</option>
-          {#each projects as p}<option value={p.id}>{p.name} ({p.bank_count} bank{p.bank_count === 1 ? '' : 's'})</option>{/each}
+          {#each projects as p}<option value={p.id}>{p.name} ({p.target_count} target{p.target_count === 1 ? '' : 's'})</option>{/each}
         </select>
       </label>
       <button onclick={createProjectPrompt}>+ New project</button>
@@ -982,30 +1007,62 @@
           <input value={currentProject.name}
                  onchange={(e) => renameCurrentProject(e.target.value)} />
         </label>
-        <table class="wide banks">
-          <thead><tr><th>bank</th><th>source</th><th></th></tr></thead>
-          <tbody>
-            {#each [...currentProject.banks].sort((a, b) => a.bank - b.bank) as b}
-              <tr>
-                <td>{b.bank}</td>
-                <td>{b.source_name}</td>
-                <td><button onclick={() => removeBank(b.bank)} title="Remove this bank from the project">✕</button></td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-        <label title="Assigns the source currently open in the editor to this bank number.">Add current source as bank
-          <input type="number" min="0" max="31" bind:value={newBankNumber} />
-        </label>
-        <button disabled={!selected?.id} onclick={addCurrentAsBank}>
-          + add “{selected?.name || '(no source open)'}” as bank {newBankNumber}
-        </button>
-        <button class="primary wide" disabled={projectBusy || currentProject.banks.length === 0} onclick={buildProject}>
-          {projectBusy ? 'Building…' : `Build ${currentProject.name}.cpr (${currentProject.banks.length} bank${currentProject.banks.length === 1 ? '' : 's'})`}
-        </button>
-        {#if projectDlUrl}
-          <a class="wide" href={projectDlUrl} download={(currentProject.name || 'project').replace(/[^\w.-]+/g, '_') + '.cpr'}>⬇ download .cpr</a>
-        {/if}
+
+        {#each currentProject.targets as target (target.id)}
+          <fieldset class="wide target">
+            <legend>{target.name} — {target.format}{target.profile ? ` (${target.profile})` : ''}</legend>
+            <table class="wide banks">
+              <thead><tr>{#if target.format === 'cpr'}<th>bank</th>{/if}<th>source</th><th></th></tr></thead>
+              <tbody>
+                {#each (target.format === 'cpr' ? [...target.members].sort((a, b) => a.bank - b.bank) : target.members) as mbr}
+                  <tr>
+                    {#if target.format === 'cpr'}<td>{mbr.bank}</td>{/if}
+                    <td>{mbr.source_name}</td>
+                    <td><button onclick={() => removeMember(target.id, mbr.source_id)} title="Remove this member">✕</button></td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+            <div class="row">
+              {#if target.format === 'cpr'}
+                <label title="Physical cartridge bank (0..31) this member fills.">bank
+                  <input type="number" min="0" max="31" bind:value={newMemberBank} style="width:4em" />
+                </label>
+              {/if}
+              <button disabled={!selected?.id} onclick={() => addCurrentAsMember(target)}>
+                + add “{selected?.name || '(no source open)'}”
+              </button>
+              <span class="grow"></span>
+              <button class="primary" disabled={projectBusy || target.members.length === 0} onclick={() => buildTarget(target)}>
+                {projectBusy === target.id ? 'Building…' : `Build (${target.members.length} member${target.members.length === 1 ? '' : 's'})`}
+              </button>
+              <button onclick={() => removeTarget(target.id)} title="Delete this target">Delete target</button>
+            </div>
+            {#if projectDlUrl && builtTargetId === target.id}
+              <a href={projectDlUrl} download={(target.name || 'target').replace(/[^\w.-]+/g, '_') + '.' + target.format}>⬇ download .{target.format}</a>
+            {/if}
+          </fieldset>
+        {/each}
+
+        <fieldset class="wide">
+          <legend>+ New target</legend>
+          <div class="row">
+            <input placeholder="name" bind:value={newTargetName} />
+            <select bind:value={newTargetFormat}>
+              <option value="sna">sna</option>
+              <option value="cpr">cpr</option>
+            </select>
+            {#if newTargetFormat === 'cpr'}
+              <select bind:value={newTargetProfile}>
+                <option value="">profile…</option>
+                <option value="cpc6128">cpc6128</option>
+                <option value="cpcplus">cpcplus</option>
+              </select>
+            {/if}
+            <button onclick={addTarget}>+ add target</button>
+          </div>
+        </fieldset>
+
         {#if projectLog.length}
           <div class="wide log" style="max-height:160px">
             {#each projectLog as l}<div>{l}</div>{/each}
@@ -1086,6 +1143,9 @@
   .form label.chk { flex-direction: row; align-items: center; gap: .4rem; }
   .form input, .form select { font: inherit; background: #22262a; color: #eee; border: 1px solid #444; border-radius: 5px; padding: .35rem .5rem; }
   .form .note { font-size: 11px; color: #a76; }
+  .form fieldset.wide { grid-column: 1 / -1; border: 1px solid #444; border-radius: 6px; padding: .5rem .7rem; }
+  .form fieldset legend { font-size: 12px; color: #9aa; padding: 0 .3rem; }
+  .form .row { display: flex; align-items: center; gap: .5rem; margin-top: .4rem; flex-wrap: wrap; }
   .meta { background: #0d0f10; border: 1px solid #333; border-radius: 6px; padding: .4rem .6rem; font-size: 12px; }
   .meta .st { font-size: 11px; padding: .05rem .35rem; border: 1px solid #556; border-radius: 4px; color: #9aa; margin-right: .4rem; }
   .meta .st.ok { border-color: #375; color: #7d9; }

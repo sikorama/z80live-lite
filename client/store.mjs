@@ -36,19 +36,28 @@ export function createApiStore(base = '..', { token } = {}) {
     fork(id, overrides = {}) { return send('POST', '/api/sources/' + encodeURIComponent(id) + '/fork', overrides); },
     remove(id) { return send('DELETE', '/api/sources/' + encodeURIComponent(id)); },
 
-    // ---- Projets CPR (db/schema.sql : `projects` + `project_banks`) ----
-    // Une Source par banque physique (0..31) ; chaque banque reste liee
-    // SEPAREMENT (fantams/cpr.h), le Projet n'ordonne que l'affectation.
+    // ---- Projet (db/schema.sql : `projects` / `targets` / `target_members`,
+    // docs/adr/0002) : un Projet porte des Cibles d'export, chacune avec ses
+    // Membres (une Source point d'entree, + son role : `bank` pour un
+    // Conteneur CPR, rien de plus pour une Base SNA). ----
     async listProjects() { return (await j('/api/projects')).items; },
     getProject(id) { return j('/api/projects/' + encodeURIComponent(id)); },
     createProject(data) { return send('POST', '/api/projects', data); },
     updateProject(id, data) { return send('PUT', '/api/projects/' + encodeURIComponent(id), data); },
     removeProject(id) { return send('DELETE', '/api/projects/' + encodeURIComponent(id)); },
-    setProjectBank(id, bank, sourceId) {
-      return send('PUT', `/api/projects/${encodeURIComponent(id)}/banks/${bank}`, { source_id: sourceId });
+    createTarget(projectId, data) {
+      return send('POST', `/api/projects/${encodeURIComponent(projectId)}/targets`, data);
     },
-    removeProjectBank(id, bank) {
-      return send('DELETE', `/api/projects/${encodeURIComponent(id)}/banks/${bank}`);
+    removeTarget(projectId, targetId) {
+      return send('DELETE', `/api/projects/${encodeURIComponent(projectId)}/targets/${encodeURIComponent(targetId)}`);
+    },
+    setTargetMember(projectId, targetId, data) {
+      return send('POST',
+        `/api/projects/${encodeURIComponent(projectId)}/targets/${encodeURIComponent(targetId)}/members`, data);
+    },
+    removeTargetMember(projectId, targetId, sourceId) {
+      return send('DELETE',
+        `/api/projects/${encodeURIComponent(projectId)}/targets/${encodeURIComponent(targetId)}/members/${encodeURIComponent(sourceId)}`);
     },
   };
 }

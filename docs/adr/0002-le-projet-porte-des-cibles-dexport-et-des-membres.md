@@ -62,12 +62,19 @@ liste plate actuelle) — ces deux usages restent à construire.
 
 ## Conséquences
 
-- Migration des 426 Sources existantes vers un Projet à un point d'entrée
-  chacune (mécanique, mais à faire).
-- La table `project_banks` déjà livrée cette session (panneau « CPR
-  projects ») encode directement `bank` sur la paire (Projet, Source) : elle
-  précède ce modèle et devra être refondue vers Cible + Membre plutôt que
-  d'être considérée comme conforme.
-- `wasm/assemble.mjs` lit aujourd'hui `container`/`profile`/`ld_filename`
-  depuis les réglages passés par l'appelant, pas depuis `sources` directement
-  — la migration touche l'app et l'API, pas ce contrat-là.
+- **Fait (2026-09-10)** : `project_banks` refondu en `targets` + `target_members`
+  (`server/api.mjs`, `db/schema.sql`), testé (`scripts/test-server-api.mjs`).
+- **Fait (2026-09-10)** : migration des 424 Sources existantes (hors 2
+  librairies, qui n'ont pas de Cible) vers un Projet/Cible/Membre implicite
+  chacune (`db/migrate-0002-target-fields.mjs`, rejouable), puis retrait de
+  `profile`/`ld_filename`/`container` de `sources`. La Cible implicite d'une
+  Source neuve se crée à la première écriture de l'un de ces trois réglages
+  (`server/api.mjs`, `ensureDefaultTarget`/`applyTargetFields`) — jamais
+  avant, pour qu'une Source qui ne les configure jamais n'accumule pas un
+  Projet vide derrière elle. `sources.default_target_id` porte ce lien ;
+  `App.svelte`/`client/store.mjs` n'ont pas eu à changer, le contrat API
+  (`profile`/`container`/`ld_filename` dans le corps et la réponse JSON) est
+  resté identique — seul son stockage a bougé.
+- `wasm/assemble.mjs` lit `container`/`profile`/`ld_filename` depuis les
+  réglages passés par l'appelant, jamais depuis `sources` directement — non
+  affecté par cette migration.
