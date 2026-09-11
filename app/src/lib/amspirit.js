@@ -1,5 +1,5 @@
 // Client pour piloter un émulateur AMSpiriT-lite externe via son API HTTP locale
-// (par défaut http://127.0.0.1:8765), en alternative à l'émulateur wasm intégré.
+// (par défaut http://127.0.0.1:6128), en alternative à l'émulateur wasm intégré.
 // Doc de l'API : web_server_api.md (dépôt amspirit-lite).
 
 const trimBase = (base) => (base || '').replace(/\/+$/, '');

@@ -136,7 +136,7 @@
   const SETTINGS_KEY = 'z80live.settings';
   let showAppSettings = $state(false);
   let amspiritEnabled = $state(false);
-  let amspiritUrl = $state('http://127.0.0.1:8765');
+  let amspiritUrl = $state('http://127.0.0.1:6128');
   let amspiritConnected = $state(false);
   const emuCol = $derived(!(amspiritEnabled && amspiritConnected)); // la colonne de droite existe-t-elle ?
   const logAside = $derived(emuCol && (logBig || !emuUrl));  // journal déplacé à droite
@@ -972,7 +972,7 @@
         Drive AMSpiriT (external emulator) instead of the built-in wasm one
       </label>
       <label class="wide">AMSpiriT server URL
-        <input bind:value={amspiritUrl} placeholder="http://127.0.0.1:8765" disabled={!amspiritEnabled} onchange={syncAmspiritPolling} />
+        <input bind:value={amspiritUrl} placeholder="http://127.0.0.1:6128" disabled={!amspiritEnabled} onchange={syncAmspiritPolling} />
       </label>
       <div class="wide note">
         {#if !amspiritEnabled}Built-in wasm emulator (default).
