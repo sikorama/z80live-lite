@@ -218,6 +218,58 @@ async function main() {
     return got.profile === null && got.container === null && got.ld_filename === null;
   });
 
+  // --- Suppression d'une Source (CONTEXT.md, « Projet implicite »)
+  await check('supprimer une Source : 200 puis 404', async () => {
+    const s = await store.create({ name: 'del-simple', code: '' });
+    const r1 = await api('DELETE', '/api/sources/' + s.id);
+    const r2 = await api('DELETE', '/api/sources/' + s.id);
+    return r1.status === 200 && r2.status === 404;
+  });
+
+  await check('supprimer une Source : son Projet implicite vide disparait', async () => {
+    const s = await store.create({ name: 'del-implicit', code: '', container: 'cpr' });
+    const pid = (await api('GET', '/api/sources/' + s.id + '/usage').then((r) => r.json())).targets[0].project_id;
+    await store.remove(s.id);
+    return (await api('GET', '/api/projects/' + pid)).status === 404;
+  });
+
+  await check('supprimer une Source : un Projet explicite vide reste', async () => {
+    const pr = await store.createProject({ name: 'explicit-keep' });
+    const t = await store.createTarget(pr.id, { name: 'c', format: 'cpr' });
+    const s = await store.create({ name: 'del-member', code: '' });
+    await store.setTargetMember(pr.id, t.id, { source_id: s.id, bank: 1 });
+    await store.remove(s.id);
+    const p2 = await store.getProject(pr.id);
+    return p2 && p2.targets[0].members.length === 0;
+  });
+
+  await check('supprimer une Source : le Projet implicite partage garde ses autres Membres', async () => {
+    const a = await store.create({ name: 'del-a', code: '', container: 'cpr' });
+    const b = await store.create({ name: 'del-b', code: '' });
+    const u = await api('GET', '/api/sources/' + a.id + '/usage').then((r) => r.json());
+    await store.setTargetMember(u.targets[0].project_id, u.targets[0].target_id, { source_id: b.id, bank: 2 });
+    await store.remove(a.id);
+    const p2 = await store.getProject(u.targets[0].project_id);
+    return p2 && p2.targets[0].members.length === 1;
+  });
+
+  await check('supprimer une Source : fork_parent des forks passe a NULL', async () => {
+    const par = await store.create({ name: 'del-parent', code: '' });
+    const f = await store.fork(par.id, {});
+    const u = await api('GET', '/api/sources/' + par.id + '/usage').then((r) => r.json());
+    await store.remove(par.id);
+    return u.forks.length === 1 && (await store.get(f.id)).fork_parent == null;
+  });
+
+  await check('usage : Cibles, banque et lib', async () => {
+    const pr = await store.createProject({ name: 'usage-p' });
+    const t = await store.createTarget(pr.id, { name: 'c', format: 'cpr' });
+    const s = await store.create({ name: 'usage-lib', code: '', is_include: 1 });
+    await store.setTargetMember(pr.id, t.id, { source_id: s.id, bank: 4 });
+    const u = await store.usage(s.id);
+    return u.is_include === true && u.targets.length === 1 && u.targets[0].bank === 4;
+  });
+
   console.log(`\n${pass}/${total} reussis`);
   process.exitCode = pass === total ? 0 : 1;
   cleanup();

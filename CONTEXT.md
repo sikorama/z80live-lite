@@ -18,6 +18,14 @@ Projet à un seul point d'entrée, créé implicitement — il n'existe qu'une
 seule façon de construire, pas deux chemins parallèles à maintenir.
 _Éviter_ : build, configuration (trop vague)
 
+**Projet implicite** :
+Le Projet créé automatiquement pour une Source seule, à la première écriture
+de ses réglages de Cible. Il suit sa Source : quand la Source est supprimée et
+que le Projet n'a plus aucun Membre, il disparaît avec elle. Un Projet créé à
+la main (explicite) n'est jamais supprimé en conséquence de la suppression
+d'une Source, même s'il devient vide.
+_Éviter_ : projet par défaut, projet auto
+
 **Source point d'entrée** :
 Une Source explicitement ajoutée à un Projet — celle qui peut ensuite
 recevoir un rôle dans une Cible (une banque, la Source d'une Cible SNA...).

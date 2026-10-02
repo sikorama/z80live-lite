@@ -35,6 +35,7 @@ export function createApiStore(base = '..', { token } = {}) {
     update(id, data) { return send('PUT', '/api/sources/' + encodeURIComponent(id), data); },
     fork(id, overrides = {}) { return send('POST', '/api/sources/' + encodeURIComponent(id) + '/fork', overrides); },
     remove(id) { return send('DELETE', '/api/sources/' + encodeURIComponent(id)); },
+    usage(id) { return j('/api/sources/' + encodeURIComponent(id) + '/usage'); },
 
     // ---- Projet (db/schema.sql : `projects` / `targets` / `target_members`,
     // docs/adr/0002) : un Projet porte des Cibles d'export, chacune avec ses

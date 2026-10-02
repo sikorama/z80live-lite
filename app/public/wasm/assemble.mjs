@@ -273,14 +273,21 @@ export async function listFiles(code = '', factories, includes = []) {
   }
   writeIncludes(Module.FS, includes);
   Module.FS.writeFile('/in.asm', code);
-  let exitCode = 0, error = null;
+  let error = null;
   try {
     Module.callMain(['/in.asm', '--list-files']);
   } catch (e) {
-    if (typeof e?.status === 'number') exitCode = e.status;
-    else { exitCode = -1; error = e?.message || String(e); }
+    // `noExitRuntime` : un simple `return 1;` de main() ne lève PAS ici (a la
+    // difference d'un exit() explicite) — c'est deja pourquoi assemble() et
+    // beautifySource() ne se fient jamais a un exitCode seul, et verifient a
+    // la place que l'artefact attendu est bien apparu. Ici, sans fichier a
+    // lire, l'equivalent est : aucune ligne "error" sur stderr.
+    error = e?.message || String(e);
   }
-  const ok = exitCode === 0;
+  // Le CLI prefixe TOUJOURS une vraie erreur par "error" (jamais "warning"),
+  // que ce soit "error:" seul ou "<fichier>:<ligne>: error (preproc):".
+  const hasError = errLog.some((l) => /(^|:\s)error\b/.test(l));
+  const ok = !error && !hasError;
   return { ok, files: ok ? out.filter(Boolean) : [], log: errLog, error };
 }
 

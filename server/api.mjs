@@ -160,6 +160,39 @@ function applyTargetFields(sourceId, sourceName, data) {
   }
 }
 
+// Ce qu'emporterait la suppression d'une Source : ses appartenances de Membre (Cible, Projet,
+// banque), les forks qui perdraient leur parent, et si c'est une `lib` (is_include).
+function sourceUsage(id) {
+  const src = db.prepare(`SELECT id, name, is_include FROM sources WHERE id = $id`).get({ id });
+  if (!src) return null;
+  const targets = db.prepare(`SELECT t.id AS target_id, t.name AS target_name, t.format,
+      p.id AS project_id, p.name AS project_name, m.bank
+      FROM target_members m JOIN targets t ON t.id = m.target_id JOIN projects p ON p.id = t.project_id
+      WHERE m.source_id = $id ORDER BY p.name, t.name`).all({ id });
+  const forks = db.prepare(`SELECT id, name FROM sources WHERE fork_parent = $id ORDER BY name`).all({ id });
+  return { id: src.id, name: src.name, is_include: !!src.is_include, targets, forks };
+}
+
+// Supprime une Source ; si son Projet implicite (celui de `default_target_id`) n'a alors plus
+// aucun Membre, il disparait avec elle (CONTEXT.md, « Projet implicite »). Un Projet explicite
+// vide n'est jamais touche. Une seule transaction : pas de demi-etat.
+function deleteSource(id) {
+  db.exec('BEGIN');
+  try {
+    const row = db.prepare(`SELECT t.project_id FROM sources s JOIN targets t ON t.id = s.default_target_id
+        WHERE s.id = $id`).get({ id });
+    const r = q.del.run({ id });
+    let projects = 0;
+    if (r.changes && row) {
+      projects = db.prepare(`DELETE FROM projects WHERE id = $pid AND NOT EXISTS (
+          SELECT 1 FROM target_members m JOIN targets t ON t.id = m.target_id WHERE t.project_id = $pid)`)
+        .run({ pid: row.project_id }).changes;
+    }
+    db.exec('COMMIT');
+    return { changes: r.changes, projects };
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+
 function insertSource(data, { fork_parent = null } = {}) {
   const id = randomUUID();
   const now = Date.now();
@@ -283,6 +316,13 @@ const server = createServer(async (req, res) => {
       return json(res, 201, insertSource(data, { fork_parent: parent.id }));
     }
 
+    // GET /api/sources/:id/usage : ce qu'une suppression emporterait (confirmation cote UI)
+    mo = p.match(/^\/api\/sources\/([^/]+)\/usage$/);
+    if (m === 'GET' && mo) {
+      const u = sourceUsage(decodeURIComponent(mo[1]));
+      return u ? json(res, 200, u) : json(res, 404, { error: 'not found' });
+    }
+
     // PUT /api/sources/:id  (update)
     mo = p.match(/^\/api\/sources\/([^/]+)$/);
     if (m === 'PUT' && mo) {
@@ -294,8 +334,8 @@ const server = createServer(async (req, res) => {
     // DELETE /api/sources/:id
     if (m === 'DELETE' && mo) {
       if (!canWrite(req)) return json(res, 401, { error: 'write token required' });
-      const r = q.del.run({ id: decodeURIComponent(mo[1]) });
-      return json(res, r.changes ? 200 : 404, { deleted: r.changes });
+      const r = deleteSource(decodeURIComponent(mo[1]));
+      return json(res, r.changes ? 200 : 404, { deleted: r.changes, deleted_projects: r.projects });
     }
 
     // GET /api/projects

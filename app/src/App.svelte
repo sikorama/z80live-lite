@@ -567,6 +567,22 @@
     const f = await store.fork(selected.id, {}); selected = f; dirty = false; await refreshList(); log('⑂ forked: ' + f.name, 'ok');
   }
 
+  async function removeSource() {
+    if (!selected?.id) return;
+    const { id, name } = selected;
+    let u;
+    try { u = await store.usage(id); } catch { u = { targets: [], forks: [], is_include: false }; }
+    const lines = [`Delete "${name}"? This cannot be undone.`];
+    if (u.is_include) lines.push('It is a lib: sources that include it will no longer assemble.');
+    if (u.targets.length) lines.push('Removed from: ' + u.targets.map((t) =>
+      `${t.project_name} / ${t.target_name}` + (t.bank != null ? ` (bank ${t.bank})` : '')).join(', '));
+    if (u.forks.length) lines.push('Forks detached from it: ' + u.forks.map((f) => f.name).join(', '));
+    if (!confirm(lines.join('\n'))) return;
+    selected = null; setCode(''); dirty = false;
+    await store.remove(id);
+    await refreshList(); log('🗑 deleted: ' + name, 'ok');
+  }
+
   // Met à jour l'indicateur d'assemblage (✅/❌) après un build, sans attendre un re-classify.
   // Une librairie (is_include) n'a pas de point d'entrée : l'assembler seule échoue normalement,
   // ce n'est pas un statut à retenir.
@@ -681,6 +697,7 @@
     play: '<path d="M6 3.6v12.8L16 10Z"/>',
     refresh: '<path d="M16 6.5A6.4 6.4 0 0 0 4.2 8M4 13.5A6.4 6.4 0 0 0 15.8 12"/><path d="M16 3v3.5H12.5M4 17v-3.5H7.5"/>',
     save: '<path d="M4 3h9.5L16 5.5V17H4Z"/><path d="M6.5 3v4.5h6V3M6.5 17v-5.5h7V17"/>',
+    trash: '<path d="M4 6h12M8 6V4h4v2M6 6l.7 10h6.6L14 6M9 9v5M11 9v5"/>',
     fork: '<circle cx="6" cy="5" r="1.8"/><circle cx="14" cy="5" r="1.8"/><circle cx="10" cy="15" r="1.8"/><path d="M6 6.8v2.2c0 1.2 1 2 2.2 2h3.6c1.2 0 2.2-.8 2.2-2V6.8M10 11v2.2"/>',
     terminal: '<rect x="2.5" y="3.5" width="15" height="13" rx="1.4"/><path d="M5.5 8l2.6 2.2-2.6 2.2M10.5 12.6h4"/>',
     align: '<path d="M3 4.5h14M3 8.5h9M3 12.5h14M3 16.5h9"/>',
@@ -818,6 +835,7 @@
       <div class="tgrp">
         <button class="ico" class:dirty onclick={save} title={dirty ? 'Save (unsaved changes)' : 'Save'}>{@render icon('save')}{#if dirty} Save{/if}</button>
         {#if selected?.id}<button class="ico" onclick={fork} title="Fork">{@render icon('fork')}</button>{/if}
+        {#if selected?.id}<button class="ico" onclick={removeSource} title="Delete this source">{@render icon('trash')}</button>{/if}
       </div>
       {/if}
       <div class="tgrp">
